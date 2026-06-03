@@ -1330,6 +1330,7 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
     const platform = String(req.body?.platform ?? "unknown");
     const osRelease = typeof req.body?.osRelease === "string" ? req.body.osRelease : null;
     const clientVersion = typeof req.body?.clientVersion === "string" ? req.body.clientVersion : null;
+    const agents = normalizeEnrollmentAgents(req.body?.agents);
     const agentToken = `ol_${crypto.randomBytes(24).toString("base64url")}`;
     const user = await pool.query(
       `update users
@@ -1350,10 +1351,21 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
        returning id, hostname, platform, os_release, enrolled_at, last_seen_at`,
       [session.user.id, hostname, platform, osRelease]
     );
+    for (const agent of agents) {
+      await pool.query(
+        `insert into agent_runtimes (computer_id, kind, display_name, executable_path, last_seen_at)
+         values ($1, $2, $3, $4, now())
+         on conflict (computer_id, kind, executable_path_key) do update set
+           display_name = excluded.display_name,
+           last_seen_at = now()`,
+        [computer.rows[0].id, agent.kind, agent.displayName, agent.executablePath]
+      );
+    }
     res.status(201).json({
       token: agentToken,
       user: user.rows[0],
       computer: computer.rows[0],
+      agents,
       organization: session.organization,
       clientVersion,
       rulesManagedBy: "openleash-cloud"
@@ -1362,6 +1374,35 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
     next(error);
   }
 });
+
+function normalizeEnrollmentAgents(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.flatMap((item) => {
+    const kind = typeof item === "string" ? item : String((item as { kind?: unknown })?.kind ?? "");
+    const cleanKind = kind.trim().toLowerCase();
+    if (!cleanKind || seen.has(cleanKind)) return [];
+    seen.add(cleanKind);
+    const displayName = typeof item === "object" && item && typeof (item as { displayName?: unknown }).displayName === "string"
+      ? (item as { displayName: string }).displayName.trim()
+      : "";
+    const executablePath = typeof item === "object" && item && typeof (item as { executablePath?: unknown }).executablePath === "string"
+      ? (item as { executablePath: string }).executablePath.trim()
+      : "";
+    return [{ kind: cleanKind, displayName: displayName || enrollmentAgentDisplayName(cleanKind), executablePath }];
+  });
+}
+
+function enrollmentAgentDisplayName(kind: string) {
+  if (kind === "claude-code") return "Claude Code";
+  if (kind === "codex") return "OpenAI Codex";
+  if (kind === "cline") return "Cline";
+  if (kind === "opencode") return "opencode";
+  if (kind === "cursor") return "Cursor";
+  if (kind === "gemini") return "Google Gemini CLI";
+  if (kind === "windsurf") return "Windsurf";
+  return kind;
+}
 
 app.get("/v1/mobile/state", async (req, res, next) => {
   try {
