@@ -1351,16 +1351,7 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
        returning id, hostname, platform, os_release, enrolled_at, last_seen_at`,
       [session.user.id, hostname, platform, osRelease]
     );
-    for (const agent of agents) {
-      await pool.query(
-        `insert into agent_runtimes (computer_id, kind, display_name, executable_path, last_seen_at)
-         values ($1, $2, $3, $4, now())
-         on conflict (computer_id, kind, executable_path_key) do update set
-           display_name = excluded.display_name,
-           last_seen_at = now()`,
-        [computer.rows[0].id, agent.kind, agent.displayName, agent.executablePath]
-      );
-    }
+    await upsertDesktopAgentInventory(computer.rows[0].id, agents);
     res.status(201).json({
       token: agentToken,
       user: user.rows[0],
@@ -1374,6 +1365,45 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
     next(error);
   }
 });
+
+app.post("/v1/desktop/agents", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const hostname = String(req.body?.hostname ?? os.hostname()).trim() || os.hostname();
+    const platform = String(req.body?.platform ?? "unknown");
+    const osRelease = typeof req.body?.osRelease === "string" ? req.body.osRelease : null;
+    const agents = normalizeEnrollmentAgents(req.body?.agents);
+    const computer = await pool.query(
+      `insert into computers (user_id, hostname, platform, os_release, enrolled_at, last_seen_at)
+       values ($1, $2, $3, $4, now(), now())
+       on conflict (user_id, hostname) do update set
+         platform = excluded.platform,
+         os_release = excluded.os_release,
+         enrolled_at = coalesce(computers.enrolled_at, now()),
+         last_seen_at = now()
+       returning id, hostname, platform, os_release, enrolled_at, last_seen_at`,
+      [session.user.id, hostname, platform, osRelease]
+    );
+    await upsertDesktopAgentInventory(computer.rows[0].id, agents);
+    res.json({ ok: true, computer: computer.rows[0], agents });
+  } catch (error) {
+    next(error);
+  }
+});
+
+async function upsertDesktopAgentInventory(computerId: string, agents: ReturnType<typeof normalizeEnrollmentAgents>) {
+  for (const agent of agents) {
+    await pool.query(
+      `insert into agent_runtimes (computer_id, kind, display_name, executable_path, last_seen_at)
+       values ($1, $2, $3, $4, now())
+       on conflict (computer_id, kind, executable_path_key) do update set
+         display_name = excluded.display_name,
+         last_seen_at = now()`,
+      [computerId, agent.kind, agent.displayName, agent.executablePath]
+    );
+  }
+}
 
 function normalizeEnrollmentAgents(value: unknown) {
   if (!Array.isArray(value)) return [];
@@ -4524,6 +4554,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/v1/evaluate" ||
     /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath) ||
     requestPath === "/v1/desktop/enroll" ||
+    requestPath === "/v1/desktop/agents" ||
     requestPath === "/v1/skills/observations" ||
     /^\/v1\/decisions\/[^/]+$/.test(requestPath) ||
     /^\/admin\/decisions\/[^/]+\/resolve$/.test(requestPath) ||
@@ -4544,6 +4575,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (requestPath === "/health") return "health";
   if (verb === "POST" && requestPath === "/v1/enroll") return "tenantEnroll";
   if (verb === "POST" && requestPath === "/v1/desktop/enroll") return "desktopEnroll";
+  if (verb === "POST" && requestPath === "/v1/desktop/agents") return "desktopEnroll";
   if (verb === "POST" && requestPath === "/v1/evaluate") return "tenantEvaluate";
   if (verb === "POST" && /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath)) return "tenantHookEvaluate";
   if (verb === "POST" && requestPath === "/v1/skills/observations") return "tenantSkillObservation";
