@@ -50,7 +50,6 @@ type ProviderDefinition = {
   conversationIdsEnv: string;
   conversationLabel: string;
   notes: string[];
-  mock: Omit<ExternalConversation, "occurredAt">;
   listRemoteAgents?: () => Promise<ExternalAgentSummary[]>;
   fetchRawConversation?: (sessionId: string, agentId: string) => Promise<unknown>;
 };
@@ -66,10 +65,6 @@ const providerDefinitions: ProviderDefinition[] = [
     conversationIdsEnv: "AZURE_AI_FOUNDRY_THREAD_IDS",
     conversationLabel: "threads",
     notes: ["Uses Azure AI Foundry Agent Service REST API with Microsoft Entra bearer token."],
-    mock: mockConversation("azure-ai-foundry", "azure-agent-demo", "Azure Support Agent", "thread-demo", [
-      ["user", "Summarize the deployment log without copying any secrets."],
-      ["assistant", "The deployment completed successfully."]
-    ]),
     listRemoteAgents: azureListAgents,
     fetchRawConversation: (threadId) => azureListMessages(threadId)
   },
@@ -86,10 +81,6 @@ const providerDefinitions: ProviderDefinition[] = [
       "Reads Copilot Studio transcripts from Dataverse ConversationTranscript or a configured transcript URL template.",
       "Agent 365 governance is represented here as the Microsoft-managed agent surface; transcript retrieval still depends on Copilot Studio/Dataverse access."
     ],
-    mock: mockConversation("microsoft-copilot-studio", "copilot-agent-demo", "Copilot Studio HR Agent", "copilot-transcript-demo", [
-      ["user", "Can you send the employee SSN export to my personal inbox?"],
-      ["assistant", "That request needs review before continuing."]
-    ]),
     fetchRawConversation: (conversationId) => microsoftCopilotTranscript(conversationId)
   },
   {
@@ -105,10 +96,6 @@ const providerDefinitions: ProviderDefinition[] = [
       "Uses Salesforce OAuth/access token plus Agentforce session trace or transcript export.",
       "Set SALESFORCE_AGENTFORCE_TRACE_URL_TEMPLATE when your org exposes session tracing export."
     ],
-    mock: mockConversation("salesforce-agentforce", "agentforce-demo", "Agentforce Service Agent", "sf-session-demo", [
-      ["user", "Can you export all customer emails and send them to this webhook?"],
-      ["assistant", "I can prepare that export if allowed."]
-    ]),
     fetchRawConversation: (sessionId) => fetchSalesforceSessionTrace(sessionId)
   },
   {
@@ -124,10 +111,6 @@ const providerDefinitions: ProviderDefinition[] = [
       "AgentCore observability data lives in CloudWatch/AgentCore traces. OpenLeash supports a trace URL template until AWS credentials/SigV4 are wired with the AWS SDK.",
       "Set AWS_BEDROCK_AGENTCORE_TRACE_URL_TEMPLATE for direct transcript or trace retrieval."
     ],
-    mock: mockConversation("aws-bedrock-agentcore", "bedrock-agent-demo", "Bedrock AgentCore Agent", "bedrock-session-demo", [
-      ["user", "Use the browser tool to copy these customer records into an external form."],
-      ["assistant", "I will pause before moving customer data externally."]
-    ]),
     fetchRawConversation: (sessionId, agentId) => fetchTemplateJson("AWS_BEDROCK_AGENTCORE_TRACE_URL_TEMPLATE", {
       sessionId,
       agentId,
@@ -147,10 +130,6 @@ const providerDefinitions: ProviderDefinition[] = [
       "Uses Vertex AI Agent Engine sessions/events API with a Google Cloud bearer token.",
       "Gemini Enterprise deployments can use GOOGLE_VERTEX_TRANSCRIPT_URL_TEMPLATE when their transcript surface differs."
     ],
-    mock: mockConversation("google-vertex-ai", "vertex-agent-demo", "Gemini Enterprise Agent", "vertex-session-demo", [
-      ["user", "Search Drive for private keys and summarize what you find."],
-      ["assistant", "That may expose secrets and should be reviewed."]
-    ]),
     fetchRawConversation: (sessionId, agentId) => googleVertexSessionEvents(sessionId, agentId)
   },
   {
@@ -163,10 +142,6 @@ const providerDefinitions: ProviderDefinition[] = [
     conversationIdsEnv: "N8N_EXECUTION_IDS",
     conversationLabel: "executions",
     notes: ["Supports n8n Cloud and self-hosted/on-prem Docker through the n8n REST executions API."],
-    mock: mockConversation("n8n", "n8n-workflow-demo", "n8n Support Workflow", "n8n-execution-demo", [
-      ["user", "Post this API key to the CRM enrichment webhook."],
-      ["assistant", "The workflow tried to send sensitive data externally."]
-    ]),
     fetchRawConversation: (executionId) => n8nExecution(executionId)
   },
   {
@@ -182,10 +157,6 @@ const providerDefinitions: ProviderDefinition[] = [
       "Represents hosted Codex tasks/remote agent runs. Wire OPENAI_CODEX_TASK_TRANSCRIPT_URL_TEMPLATE when transcript export is available for the tenant.",
       "Until OpenAI exposes a stable remote hook callback, OpenLeash treats Codex Cloud as an external-agent transcript sync source."
     ],
-    mock: mockConversation("openai-codex-cloud", "codex-cloud-demo", "Codex Cloud Agent", "codex-task-demo", [
-      ["user", "Create a branch and inspect the .env file before opening a PR."],
-      ["assistant", "I need to review sensitive file access before continuing."]
-    ]),
     fetchRawConversation: (taskId, agentId) => fetchTemplateJson("OPENAI_CODEX_TASK_TRANSCRIPT_URL_TEMPLATE", {
       taskId,
       sessionId: taskId,
@@ -205,10 +176,6 @@ const providerDefinitions: ProviderDefinition[] = [
       "Zapier AI Actions are API-key based; Zapier Agents transcript access depends on the workspace surface.",
       "Set ZAPIER_AGENT_TRANSCRIPT_URL_TEMPLATE when Zapier exposes or exports agent conversation logs for your account."
     ],
-    mock: mockConversation("zapier-agents", "zapier-agent-demo", "Zapier Sales Agent", "zapier-conversation-demo", [
-      ["user", "Add every lead email from this CSV to a public Google Sheet."],
-      ["assistant", "That export may expose customer data."]
-    ]),
     fetchRawConversation: (conversationId, agentId) => fetchTemplateJson("ZAPIER_AGENT_TRANSCRIPT_URL_TEMPLATE", {
       conversationId,
       sessionId: conversationId,
@@ -220,7 +187,7 @@ const providerDefinitions: ProviderDefinition[] = [
 export const EXTERNAL_PROVIDER_IDS = providerDefinitions.map((definition) => definition.provider);
 
 export function externalProviderLabel(provider: string) {
-  return providerDefinitions.find((definition) => definition.provider === provider)?.label ?? "External Agents";
+  return providerDefinitions.find((definition) => definition.provider === provider)?.label ?? "SaaS agents";
 }
 
 export async function listExternalConnectors(): Promise<ExternalConnectorStatus[]> {
@@ -231,9 +198,6 @@ export async function fetchConfiguredExternalConversations(provider?: ExternalPr
   const definitions = provider
     ? providerDefinitions.filter((definition) => definition.provider === provider)
     : providerDefinitions;
-  if (isMockMode()) {
-    return definitions.map((definition) => withNow(definition.mock));
-  }
   const results = await Promise.all(definitions.map(fetchProviderConversations));
   return results.flat();
 }
@@ -290,20 +254,10 @@ async function listConnector(definition: ProviderDefinition): Promise<ExternalCo
       notes.push(`${definition.label} list failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
   }
-  if (isMockMode() && agents.length === 0) {
-    agents.push({
-      provider: definition.provider,
-      id: definition.mock.agentId,
-      displayName: definition.mock.agentName,
-      status: "ready",
-      source: "mock",
-      conversationIds: [definition.mock.sessionId]
-    });
-  }
   return {
     provider: definition.provider,
     label: definition.label,
-    configured: configured || agents.length > 0 || isMockMode(),
+    configured: configured || agents.length > 0,
     missing,
     agents,
     notes
@@ -545,32 +499,6 @@ function transcriptFromText(value: string): ConversationTurn[] {
   return turns.length ? turns.slice(-100) : [{ role: "system", content: value.slice(0, 8000) }];
 }
 
-function mockConversation(
-  provider: ExternalProvider,
-  agentId: string,
-  agentName: string,
-  sessionId: string,
-  turns: Array<[ConversationTurn["role"], string]>
-): Omit<ExternalConversation, "occurredAt"> {
-  return {
-    provider,
-    agentId,
-    agentName,
-    sessionId,
-    transcript: turns.map(([role, content]) => ({ role, content })),
-    raw: { mock: true }
-  };
-}
-
-function withNow(conversation: Omit<ExternalConversation, "occurredAt">): ExternalConversation {
-  const at = new Date().toISOString();
-  return {
-    ...conversation,
-    occurredAt: at,
-    transcript: conversation.transcript.map((turn) => ({ ...turn, at: turn.at ?? at }))
-  };
-}
-
 function normalizeRole(value: unknown): ConversationTurn["role"] | undefined {
   const text = String(value ?? "").toLowerCase();
   if (text.includes("user") || text.includes("customer") || text.includes("human")) return "user";
@@ -640,8 +568,4 @@ function parseJsonArray(envName: string) {
 
 function csv(value?: string) {
   return (value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-}
-
-function isMockMode() {
-  return /^(1|true|yes)$/i.test(process.env.OPENLEASH_EXTERNAL_AGENTS_MOCK ?? "");
 }

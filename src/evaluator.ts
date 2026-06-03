@@ -13,6 +13,11 @@ export async function evaluatePolicies(
   request: EvaluationRequest,
   policies: Policy[]
 ): Promise<{ results: PolicyDecision[]; model: string }> {
+  const fastResults = fastSensitiveFileEvaluation(request, policies);
+  if (fastResults) {
+    return { results: fastResults, model: "heuristic-fast" };
+  }
+
   if (!process.env.OPENAI_API_KEY) {
     return { results: heuristicEvaluation(request, policies), model: "heuristic" };
   }
@@ -71,6 +76,38 @@ export async function evaluatePolicies(
 
   const parsed = JSON.parse(response.output_text) as { results: PolicyDecision[] };
   return { results: parsed.results, model };
+}
+
+function fastSensitiveFileEvaluation(request: EvaluationRequest, policies: Policy[]) {
+  if (request.event.eventName !== "PreToolUse") return undefined;
+  const tool = (request.event.tool?.name ?? "").toLowerCase();
+  if (!/(read|grep|glob|ls|bash|cat|open)/.test(tool)) return undefined;
+
+  const text = JSON.stringify({
+    eventName: request.event.eventName,
+    prompt: request.event.prompt,
+    tool: request.event.tool
+  }).toLowerCase();
+  if (!credentialHeuristicHit(request, text)) return undefined;
+
+  let hasCredentialPolicy = false;
+  const evidence = bestEvidence(request);
+  const results = policies.map((policy) => {
+    const rule = `${policy.name} ${policy.naturalLanguageRule}`.toLowerCase();
+    const matchesCredentialPolicy = matchesPolicy(rule, ["credential", "secret", "token", "password", ".env"]);
+    if (matchesCredentialPolicy) hasCredentialPolicy = true;
+    return {
+      policyId: policy.id,
+      policyName: policy.name,
+      status: matchesCredentialPolicy ? "failed" as const : "passed" as const,
+      severity: policy.severity,
+      explanation: matchesCredentialPolicy
+        ? "The requested agent action appears to access or expose protected sensitive material."
+        : "No policy conflict was detected for this event.",
+      evidence: matchesCredentialPolicy ? [evidence] : []
+    };
+  });
+  return hasCredentialPolicy ? results : undefined;
 }
 
 export async function summarizeActionPurpose(request: EvaluationRequest): Promise<string> {

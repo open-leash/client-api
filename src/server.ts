@@ -23,7 +23,8 @@ import {
   type MobileDecisionResolveRequest,
   type OpenLeashApiFunction,
   type McpToolCall,
-  type Policy
+  type Policy,
+  type PolicyDecision
 } from "@openleash/shared";
 import { z } from "zod";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
@@ -269,6 +270,10 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
       return res.status(400).json({ error: "unsupported OpenLeash hook target" });
     }
     const request = normalizeHookRequest(agent, eventName, req.body, req.query);
+    if (isPromptOnlyHook(request)) {
+      await recordConversationEvent(request, user, triggerIntentKey(request));
+      return res.json(nativeHookDecision(agent, eventName, { decision: "allow", decisionId: "", summary: "OpenLeash logged this prompt intent.", results: [] }));
+    }
     const decision = await evaluateAndRecord(request, user);
     const resolvedDecision = await waitForHookDecision(user, decision);
     res.json(nativeHookDecision(agent, eventName, resolvedDecision));
@@ -345,8 +350,8 @@ app.get("/admin/overview", async (_req, res, next) => {
         join computers c on c.id = ar.computer_id
         left join users u on u.id = c.user_id
         order by ar.last_seen_at desc limit 20`),
-      pool.query(`select e.id, e.decision, e.summary, e.question, e.created_at, ce.event_name, ce.tool_name, ce.project_path,
-          ar.display_name as agent_name, c.hostname, u.display_name as user_name,
+      pool.query(`select e.id, e.decision, e.resolution, e.summary, e.question, e.created_at, ce.event_name, ce.tool_name, ce.project_path, ce.prompt,
+          ar.kind as agent_kind, ar.display_name as agent_name, c.hostname, u.display_name as user_name,
           coalesce(triggered.items, '[]'::jsonb) as triggered_policies
         from evaluations e
         join conversation_events ce on ce.id = e.conversation_event_id
@@ -367,6 +372,14 @@ app.get("/admin/overview", async (_req, res, next) => {
           from policy_results pr
           where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question')
         ) triggered on true
+        where (
+          e.decision in ('ask', 'deny')
+          or e.resolution = 'deny'
+          or exists (
+            select 1 from policy_results pr
+            where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question')
+          )
+        )
         order by e.created_at desc limit 30`),
       pool.query(policyInventorySql()),
       pool.query(`select u.id, u.email, u.display_name, u.role, u.created_at,
@@ -860,7 +873,7 @@ app.post("/auth/sso/callback", async (req, res, next) => {
       title: string | null;
     }>(
       `insert into users (organization_id, email, display_name, role, first_name, last_name, idp_user_id, idp_provider, status, last_login_at, metadata)
-       values ($1, $2, $3, 'admin', $4, $5, $6, $7, 'active', now(), $8)
+       values ($1, $2, $3, 'engineer', $4, $5, $6, $7, 'active', now(), $8)
        on conflict (email) do update set
          organization_id = excluded.organization_id,
          display_name = excluded.display_name,
@@ -874,7 +887,7 @@ app.post("/auth/sso/callback", async (req, res, next) => {
        returning id, email, display_name, role, first_name, last_name, department, title`,
       [
         organizationId,
-        profile.email.toLowerCase(),
+       profile.email.toLowerCase(),
         displayName,
         profile.givenName,
         profile.familyName,
@@ -883,6 +896,9 @@ app.post("/auth/sso/callback", async (req, res, next) => {
         JSON.stringify({ ssoProfile: profile.raw })
       ]
     );
+    if (!isDashboardAccessRole(userResult.rows[0].role)) {
+      return res.status(403).json({ success: false, message: "Dashboard access has not been assigned for this user." });
+    }
 
     const sessionToken = `ols_${crypto.randomBytes(32).toString("base64url")}`;
     const expiresAt = new Date(Date.now() + Number(process.env.OPENLEASH_DASHBOARD_SESSION_DAYS ?? 14) * 86400000);
@@ -1306,12 +1322,53 @@ app.post("/v1/mobile/devices", async (req, res, next) => {
   }
 });
 
-app.get("/v1/mobile/state", async (req, res, next) => {
+app.post("/v1/desktop/enroll", async (req, res, next) => {
   try {
     const session = await getDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const hostname = String(req.body?.hostname ?? os.hostname()).trim() || os.hostname();
+    const platform = String(req.body?.platform ?? "unknown");
+    const osRelease = typeof req.body?.osRelease === "string" ? req.body.osRelease : null;
+    const clientVersion = typeof req.body?.clientVersion === "string" ? req.body.clientVersion : null;
+    const agentToken = `ol_${crypto.randomBytes(24).toString("base64url")}`;
+    const user = await pool.query(
+      `update users
+       set token_hash = $2, status = 'active', last_login_at = now()
+       where id = $1 and organization_id = $3
+       returning id, email, display_name, organization_id`,
+      [session.user.id, hashToken(agentToken), session.organization.id]
+    );
+    if (!user.rows[0]) return res.status(404).json({ error: "session user not found" });
+    const computer = await pool.query(
+      `insert into computers (user_id, hostname, platform, os_release, enrolled_at, last_seen_at)
+       values ($1, $2, $3, $4, now(), now())
+       on conflict (user_id, hostname) do update set
+         platform = excluded.platform,
+         os_release = excluded.os_release,
+         enrolled_at = coalesce(computers.enrolled_at, now()),
+         last_seen_at = now()
+       returning id, hostname, platform, os_release, enrolled_at, last_seen_at`,
+      [session.user.id, hostname, platform, osRelease]
+    );
+    res.status(201).json({
+      token: agentToken,
+      user: user.rows[0],
+      computer: computer.rows[0],
+      organization: session.organization,
+      clientVersion,
+      rulesManagedBy: "openleash-cloud"
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/v1/mobile/state", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
     const [pending, agents, history, sessionMetrics, policies] = await Promise.all([
-      mobilePendingApprovals(session.user.id, session.organization.id),
+      mobilePendingApprovals(session.user.id, session.organization.id, session.source !== "client"),
       mobileAgents(session.organization.id),
       mobileRecentActivity(session.organization.id),
       mobileSessionMetrics(session.organization.id),
@@ -1339,12 +1396,13 @@ app.get("/v1/mobile/state", async (req, res, next) => {
 
 app.post("/v1/mobile/decisions/:id/resolve", async (req, res, next) => {
   try {
-    const session = await getDashboardSession(req.header("authorization") ?? "");
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
     const body = req.body as MobileDecisionResolveRequest;
     const resolution = body.resolution === "allow" ? "allow" : "deny";
     const result = await resolveApprovalGroup(req.params.id, resolution, `mobile:${session.user.id}`, {
-      organizationId: session.organization.id
+      organizationId: session.source === "client" ? undefined : session.organization.id,
+      userId: session.source === "client" ? session.user.id : undefined
     }, body.resolutionGuidance);
     if (!result) return res.status(404).json({ error: "approval not found" });
     res.json(result);
@@ -1497,6 +1555,10 @@ app.post("/admin/onboarding/company", async (req, res, next) => {
     if (!name) return res.status(400).json({ success: false, error: "Organization name is required" });
     const requestedSlug = String(req.body.slug ?? "").trim();
     const slug = slugifyTenant(requestedSlug || name);
+    const existingSlug = await pool.query(`select id from organizations where slug = $1 and id <> $2 limit 1`, [slug, organization.id]);
+    if ((existingSlug.rowCount ?? 0) > 0) {
+      return res.status(409).json({ success: false, error: "That dashboard URL is already taken." });
+    }
     const result = await pool.query(
       `update organizations
        set name = $2, slug = $3, region = $4, logo_url = $5, current_step = greatest(current_step, 2), updated_at = now()
@@ -1540,10 +1602,9 @@ app.post("/admin/onboarding/test-idp", async (req, res, next) => {
       const data = await response.json().catch(() => ({}));
       return res.status(response.ok ? 200 : 400).json(data);
     }
-    res.json({
-      success: true,
-      message: `${provider.label} connection shape is valid. Set IDENTITY_LOADER_URL to run a live test.`,
-      statistics: { usersProcessed: 12, groupsProcessed: 4, membershipsProcessed: 18 }
+    res.status(400).json({
+      success: false,
+      error: "Identity sync service is not configured. Set IDENTITY_LOADER_URL to test this provider."
     });
   } catch (error) {
     next(error);
@@ -1569,27 +1630,27 @@ app.post("/admin/onboarding/sync-identity", async (req, res, next) => {
       [organization.id, provider.idpType, JSON.stringify(credentials)]
     );
 
-    let stats = { usersProcessed: 0, groupsProcessed: 0, membershipsProcessed: 0 };
     const identityLoader = process.env.IDENTITY_LOADER_URL;
-    if (identityLoader) {
-      const response = await fetch(`${identityLoader.replace(/\/+$/, "")}/api/sync`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ idpType: provider.idpType, credentials, additionalConfig: { OrganizationId: organization.id } })
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok || data.success === false) {
-        await pool.query(`update idp_connections set last_error = $2, updated_at = now() where organization_id = $1`, [organization.id, data.error ?? data.message ?? "Identity sync failed"]);
-        return res.status(400).json(data);
-      }
-      stats = {
-        usersProcessed: Number(data.statistics?.usersProcessed ?? 0),
-        groupsProcessed: Number(data.statistics?.groupsProcessed ?? 0),
-        membershipsProcessed: Number(data.statistics?.membershipsProcessed ?? 0)
-      };
-    } else {
-      stats = await seedMockIdentity(organization.id, provider.idpType);
+    if (!identityLoader) {
+      const error = "Identity sync service is not configured. Set IDENTITY_LOADER_URL to sync real users and groups.";
+      await pool.query(`update idp_connections set last_error = $2, updated_at = now() where organization_id = $1`, [organization.id, error]);
+      return res.status(400).json({ success: false, error });
     }
+    const response = await fetch(`${identityLoader.replace(/\/+$/, "")}/api/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ idpType: provider.idpType, credentials, additionalConfig: { OrganizationId: organization.id } })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.success === false) {
+      await pool.query(`update idp_connections set last_error = $2, updated_at = now() where organization_id = $1`, [organization.id, data.error ?? data.message ?? "Identity sync failed"]);
+      return res.status(400).json(data);
+    }
+    const stats = {
+      usersProcessed: Number(data.statistics?.usersProcessed ?? 0),
+      groupsProcessed: Number(data.statistics?.groupsProcessed ?? 0),
+      membershipsProcessed: Number(data.statistics?.membershipsProcessed ?? 0)
+    };
 
     await pool.query(
       `update idp_connections
@@ -1609,15 +1670,21 @@ app.post("/admin/onboarding/rbac", async (req, res, next) => {
     const organization = await resolveOnboardingOrganization(req);
     await pool.query(`delete from role_assignments where organization_id = $1`, [organization.id]);
     const roles = Array.isArray(req.body.roles) ? req.body.roles : [];
+    const adminUserIds: string[] = [];
     for (const item of roles) {
       const role = ["admin", "analyst", "responder", "viewer"].includes(item.role) ? item.role : "viewer";
       const groupId = typeof item.groupId === "string" && item.groupId ? item.groupId : null;
       const userId = typeof item.userId === "string" && item.userId ? item.userId : null;
       if (!groupId && !userId) continue;
+      if (role === "admin" && userId) adminUserIds.push(userId);
       await pool.query(
         `insert into role_assignments (organization_id, role, group_id, user_id) values ($1, $2, $3, $4)`,
         [organization.id, role, groupId, userId]
       );
+    }
+    await pool.query(`update users set role = 'engineer' where organization_id = $1 and role = 'admin'`, [organization.id]);
+    if (adminUserIds.length > 0) {
+      await pool.query(`update users set role = 'admin' where organization_id = $1 and id = any($2::uuid[])`, [organization.id, adminUserIds]);
     }
     await pool.query(`update organizations set current_step = greatest(current_step, 5), updated_at = now() where id = $1`, [organization.id]);
     res.json({ success: true, count: roles.length });
@@ -1770,6 +1837,138 @@ app.get("/admin/triggers/:id", async (req, res, next) => {
     if (!trigger.rows[0]) return res.status(404).json({ error: "trigger not found" });
     const payload = await withTranscriptContext(trigger.rows[0].payload, trigger.rows[0].occurred_at);
     res.json({ trigger: { ...trigger.rows[0], payload, policy_results: policies.rows } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/admin/logs", async (req, res, next) => {
+  try {
+    const organization = await resolveOnboardingOrganization(req);
+    const filters: string[] = ["u.organization_id = $1"];
+    const values: unknown[] = [organization.id];
+    const add = (value: unknown) => {
+      values.push(value);
+      return `$${values.length}`;
+    };
+    if (typeof req.query.q === "string" && req.query.q.trim()) {
+      const param = add(`%${req.query.q.trim()}%`);
+      filters.push(`(
+        ce.prompt ilike ${param}
+        or ce.project_path ilike ${param}
+        or ce.tool_name ilike ${param}
+        or ce.session_id ilike ${param}
+        or ce.event_name ilike ${param}
+        or ar.display_name ilike ${param}
+        or ar.kind ilike ${param}
+        or c.hostname ilike ${param}
+        or u.display_name ilike ${param}
+        or u.email ilike ${param}
+        or ce.payload::text ilike ${param}
+      )`);
+    }
+    if (typeof req.query.userId === "string" && req.query.userId.trim()) {
+      filters.push(`u.id = ${add(req.query.userId.trim())}`);
+    }
+    if (typeof req.query.user === "string" && req.query.user.trim()) {
+      const param = add(`%${req.query.user.trim()}%`);
+      filters.push(`(u.display_name ilike ${param} or u.email ilike ${param})`);
+    }
+    if (typeof req.query.agent === "string" && req.query.agent.trim()) {
+      const param = add(`%${req.query.agent.trim()}%`);
+      filters.push(`(ar.display_name ilike ${param} or ar.kind ilike ${param})`);
+    }
+    if (typeof req.query.event === "string" && req.query.event.trim()) {
+      filters.push(`ce.event_name = ${add(req.query.event.trim())}`);
+    }
+    if (typeof req.query.decision === "string" && ["ask", "deny", "allow", "passed", "logged"].includes(req.query.decision)) {
+      if (req.query.decision === "logged") {
+        filters.push(`e.id is null`);
+      } else if (req.query.decision === "passed") {
+        filters.push(`e.decision = 'allow' and not exists (select 1 from policy_results pr where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question'))`);
+      } else {
+        filters.push(`e.decision = ${add(req.query.decision)}`);
+      }
+    }
+    if (typeof req.query.dateFrom === "string" && req.query.dateFrom.trim()) {
+      filters.push(`ce.created_at >= ${add(req.query.dateFrom)}`);
+    }
+    if (typeof req.query.dateTo === "string" && req.query.dateTo.trim()) {
+      filters.push(`ce.created_at <= ${add(req.query.dateTo)}`);
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 100), 1), 250);
+    const result = await pool.query(
+      `select ce.id, ce.session_id, ce.event_name, ce.project_path, ce.prompt, ce.tool_name,
+              ce.payload, ce.occurred_at, ce.created_at,
+              e.id as evaluation_id, e.decision, e.resolution, e.summary, e.question, e.created_at as evaluated_at,
+              ar.display_name as agent_name, ar.kind as agent_kind, ar.version as agent_version,
+              c.hostname, c.platform,
+              u.id as user_id, u.display_name as user_name, u.email as user_email,
+              coalesce(policy_summary.items, '[]'::jsonb) as policy_results
+       from conversation_events ce
+       join users u on u.id = ce.user_id
+       left join evaluations e on e.conversation_event_id = ce.id
+       left join agent_runtimes ar on ar.id = ce.agent_runtime_id
+       left join computers c on c.id = ce.computer_id
+       left join lateral (
+         select jsonb_agg(
+           jsonb_build_object(
+             'policy_name', pr.policy_name,
+             'status', pr.status,
+             'severity', pr.severity,
+             'explanation', pr.explanation,
+             'question', pr.question,
+             'evidence', pr.evidence
+           )
+           order by case pr.status when 'failed' then 0 when 'needs_question' then 1 else 2 end, pr.created_at asc
+         ) as items
+         from policy_results pr
+         where pr.evaluation_id = e.id
+       ) policy_summary on true
+       where ${filters.join(" and ")}
+       order by ce.created_at desc
+       limit ${add(limit)}`,
+      values
+    );
+    res.json({ logs: result.rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/admin/logs/:id", async (req, res, next) => {
+  try {
+    const organization = await resolveOnboardingOrganization(req);
+    const [log, policies] = await Promise.all([
+      pool.query(
+        `select ce.id, ce.session_id, ce.event_name, ce.project_path, ce.prompt, ce.tool_name,
+                ce.payload, ce.occurred_at, ce.created_at,
+                e.id as evaluation_id, e.decision, e.resolution, e.resolution_guidance, e.summary, e.question, e.model, e.created_at as evaluated_at,
+                ar.display_name as agent_name, ar.kind as agent_kind, ar.version as agent_version,
+                c.hostname, c.platform,
+                u.id as user_id, u.display_name as user_name, u.email as user_email
+         from conversation_events ce
+         join users u on u.id = ce.user_id
+         left join evaluations e on e.conversation_event_id = ce.id
+         left join agent_runtimes ar on ar.id = ce.agent_runtime_id
+         left join computers c on c.id = ce.computer_id
+         where ce.id = $1 and u.organization_id = $2`,
+        [req.params.id, organization.id]
+      ),
+      pool.query(
+        `select pr.policy_name, pr.status, pr.severity, pr.explanation, pr.evidence, pr.question, pr.created_at
+         from policy_results pr
+         join evaluations e on e.id = pr.evaluation_id
+         join conversation_events ce on ce.id = e.conversation_event_id
+         join users u on u.id = ce.user_id
+         where ce.id = $1 and u.organization_id = $2
+         order by pr.created_at asc`,
+        [req.params.id, organization.id]
+      )
+    ]);
+    if (!log.rows[0]) return res.status(404).json({ error: "log not found" });
+    const payload = await withTranscriptContext(log.rows[0].payload, log.rows[0].occurred_at);
+    res.json({ log: { ...log.rows[0], payload, policy_results: policies.rows } });
   } catch (error) {
     next(error);
   }
@@ -2195,6 +2394,7 @@ type ApiUser = { id: string; email?: string; display_name?: string; organization
 
 async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Promise<EvaluationResponse> {
   const intentKey = triggerIntentKey(request);
+  const { conversationEventId, computerId, runtimeId, organizationId } = await recordConversationEvent(request, user, intentKey);
   const handledIntent = intentKey ? await findRecentHandledIntent(user.id, request, intentKey) : undefined;
   if (handledIntent) {
     return {
@@ -2205,67 +2405,13 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
       results: []
     };
   }
-  const client = await pool.connect();
-  let conversationEventId = "";
-  let computerId = "";
-  let runtimeId = "";
-  const organizationId = user.organization_id ?? (await ensureDefaultOrganization()).id;
-  try {
-    await client.query("begin");
-    const computer = await client.query(
-      `insert into computers (user_id, hostname, platform, os_release, last_seen_at)
-       values ($1, $2, $3, $4, now())
-       on conflict (user_id, hostname) do update set platform = excluded.platform, os_release = excluded.os_release, last_seen_at = now()
-       returning id`,
-      [user.id, request.computer.hostname, request.computer.platform, request.computer.osRelease ?? null]
-    );
-    computerId = computer.rows[0].id;
-    const runtime = await client.query(
-      `insert into agent_runtimes (computer_id, kind, display_name, version, executable_path, last_seen_at)
-       values ($1, $2, $3, $4, $5, now())
-       on conflict (computer_id, kind, executable_path_key) do update set display_name = excluded.display_name, version = excluded.version, last_seen_at = now()
-       returning id`,
-      [
-        computerId,
-        request.agent.kind,
-        request.agent.displayName,
-        request.agent.version ?? null,
-        request.agent.executablePath ?? ""
-      ]
-    );
-    runtimeId = runtime.rows[0].id;
-    const event = await client.query(
-      `insert into conversation_events
-       (user_id, computer_id, agent_runtime_id, session_id, event_name, project_path, prompt, tool_name, payload, occurred_at)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       returning id`,
-      [
-        user.id,
-        computerId,
-        runtimeId,
-        request.event.sessionId,
-        request.event.eventName,
-        request.event.projectPath ?? null,
-        request.event.prompt ?? null,
-        request.event.tool?.name ?? null,
-          { ...request.event, raw: { ...(request.event.raw && typeof request.event.raw === "object" ? request.event.raw : {}), openleashIntentKey: intentKey } },
-        request.event.occurredAt
-      ]
-    );
-    conversationEventId = event.rows[0].id;
-    await client.query("commit");
-  } catch (error) {
-    await client.query("rollback");
-    throw error;
-  } finally {
-    client.release();
-  }
-
   const policies = await pool.query<Policy>(
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
      from policies where enabled = true order by created_at asc`
   );
-  const { results, model } = await evaluatePolicies(request, policies.rows);
+  const { results: evaluatedResults, model } = await evaluatePolicies(request, policies.rows);
+  const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, evaluatedResults);
+  const results = promptOnlyDeferred ? deferPromptOnlyPolicyResults(evaluatedResults) : evaluatedResults;
   const decision = results.some((r) => r.status === "failed" || r.status === "needs_question")
     ? "ask"
     : "allow";
@@ -2333,6 +2479,65 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     });
   }
   return { decision, decisionId: evaluation.rows[0].id, summary, question, results };
+}
+
+async function recordConversationEvent(request: EvaluationRequest, user: ApiUser, intentKey?: string) {
+  const client = await pool.connect();
+  let conversationEventId = "";
+  let computerId = "";
+  let runtimeId = "";
+  const organizationId = user.organization_id ?? (await ensureDefaultOrganization()).id;
+  try {
+    await client.query("begin");
+    const computer = await client.query(
+      `insert into computers (user_id, hostname, platform, os_release, last_seen_at)
+       values ($1, $2, $3, $4, now())
+       on conflict (user_id, hostname) do update set platform = excluded.platform, os_release = excluded.os_release, last_seen_at = now()
+       returning id`,
+      [user.id, request.computer.hostname, request.computer.platform, request.computer.osRelease ?? null]
+    );
+    computerId = computer.rows[0].id;
+    const runtime = await client.query(
+      `insert into agent_runtimes (computer_id, kind, display_name, version, executable_path, last_seen_at)
+       values ($1, $2, $3, $4, $5, now())
+       on conflict (computer_id, kind, executable_path_key) do update set display_name = excluded.display_name, version = excluded.version, last_seen_at = now()
+       returning id`,
+      [
+        computerId,
+        request.agent.kind,
+        request.agent.displayName,
+        request.agent.version ?? null,
+        request.agent.executablePath ?? ""
+      ]
+    );
+    runtimeId = runtime.rows[0].id;
+    const event = await client.query(
+      `insert into conversation_events
+       (user_id, computer_id, agent_runtime_id, session_id, event_name, project_path, prompt, tool_name, payload, occurred_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       returning id`,
+      [
+        user.id,
+        computerId,
+        runtimeId,
+        request.event.sessionId,
+        request.event.eventName,
+        request.event.projectPath ?? null,
+        request.event.prompt ?? null,
+        request.event.tool?.name ?? null,
+          { ...request.event, raw: { ...(request.event.raw && typeof request.event.raw === "object" ? request.event.raw : {}), openleashIntentKey: intentKey } },
+        request.event.occurredAt
+      ]
+    );
+    conversationEventId = event.rows[0].id;
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+  return { conversationEventId, computerId, runtimeId, organizationId };
 }
 
 async function recordMcpToolCall({
@@ -2458,7 +2663,7 @@ async function waitForHookDecision(user: ApiUser, decision: EvaluationResponse):
 }
 
 async function ensureExternalUser(provider: string): Promise<ApiUser> {
-  const displayName = provider === "external-agents" ? "External Agents" : externalProviderLabel(provider);
+  const displayName = provider === "external-agents" ? "SaaS agents" : externalProviderLabel(provider);
   const email = `${slug(displayName)}@external.openleash.com`;
   const result = await pool.query<{ id: string; email: string; display_name: string }>(
     `insert into users (email, display_name, role)
@@ -2498,6 +2703,7 @@ async function findRecentHandledIntent(userId: string, request: EvaluationReques
      join agent_runtimes ar on ar.id = ce.agent_runtime_id
      where e.user_id = $1
        and ar.kind = $2
+       and ce.event_name <> 'UserPromptSubmit'
        and ($6::boolean = false or ce.session_id = $3)
        and coalesce(ce.project_path, '') = $4
        and ($6::boolean = false or ce.payload->'raw'->>'openleashIntentKey' = $5)
@@ -2675,6 +2881,27 @@ function actionPurposeFromPayload(payload: unknown) {
 function isBoringEvaluationSummary(summary?: string | null) {
   if (!summary) return false;
   return /all active policies passed/i.test(summary);
+}
+
+function shouldDeferPromptOnlyApproval(request: EvaluationRequest, results: PolicyDecision[]) {
+  if (!isPromptOnlyHook(request)) return false;
+  return results.some((result) => result.status === "failed" || result.status === "needs_question");
+}
+
+function isPromptOnlyHook(request: EvaluationRequest) {
+  return request.event.eventName === "UserPromptSubmit" && !request.event.tool?.name;
+}
+
+function deferPromptOnlyPolicyResults(results: PolicyDecision[]): PolicyDecision[] {
+  return results.map((result) => result.status === "passed"
+    ? result
+    : {
+        ...result,
+        status: "passed",
+        explanation: "Prompt-only intent observed. Enforcement is deferred until the agent attempts the actual tool action.",
+        evidence: [],
+        question: undefined
+      });
 }
 
 async function withTranscriptContext(payload: unknown, occurredAt?: string | Date) {
@@ -3208,7 +3435,7 @@ async function createDashboardSessionFromProfile({
   };
 }
 
-async function mobilePendingApprovals(userId: string, organizationId: string) {
+async function mobilePendingApprovals(userId: string, organizationId: string, includeOrganization = true) {
   const result = await pool.query(
     `select e.id, e.summary, e.question, e.created_at,
             ce.event_name, ce.tool_name, ce.project_path, ce.prompt, ce.payload, ce.occurred_at,
@@ -3239,13 +3466,13 @@ async function mobilePendingApprovals(userId: string, organizationId: string) {
      ) triggered on true
      where e.decision = 'ask'
        and e.resolution is null
-       and (e.user_id = $1 or exists (
+       and (e.user_id = $1 or ($3::boolean and exists (
          select 1 from users u
          where u.id = e.user_id and u.organization_id = $2
-       ))
+       )))
      order by e.created_at asc
      limit 20`,
-    [userId, organizationId]
+    [userId, organizationId, includeOrganization]
   );
   const rows = dedupePendingApprovalRows(result.rows);
   return {
@@ -3894,8 +4121,51 @@ async function getDashboardSession(authHeader: string) {
   };
 }
 
+async function getClientOrDashboardSession(authHeader: string) {
+  const dashboardSession = await getDashboardSession(authHeader);
+  if (dashboardSession) return { ...dashboardSession, source: "dashboard" as const };
+
+  const token = bearerToken(authHeader);
+  const user = token ? await getUserByToken(token) : undefined;
+  if (!user?.organization_id) return null;
+
+  const organization = await pool.query<{
+    id: string;
+    name: string;
+    slug: string | null;
+    region: string | null;
+  }>(
+    `select id, name, slug, region
+     from organizations
+     where id = $1
+     limit 1`,
+    [user.organization_id]
+  );
+  const row = organization.rows[0];
+  if (!row) return null;
+  return {
+    source: "client" as const,
+    user: {
+      id: user.id,
+      email: user.email,
+      display_name: user.display_name,
+      role: "client"
+    },
+    organization: {
+      id: row.id,
+      name: row.name,
+      slug: row.slug,
+      region: row.region
+    }
+  };
+}
+
 function bearerToken(authHeader: string) {
   return authHeader.replace(/^Bearer\s+/i, "").trim();
+}
+
+function isDashboardAccessRole(role: unknown) {
+  return ["owner", "admin", "ciso", "security_admin"].includes(String(role ?? "").toLowerCase());
 }
 
 function isAllowedCorsOrigin(origin: string | undefined) {
@@ -4011,54 +4281,6 @@ function providerCredentials(provider: ReturnType<typeof normalizeIdpProvider>, 
 
 function hasAnyCredential(credentials: Record<string, unknown>) {
   return Object.values(credentials).some((value) => String(value ?? "").trim().length > 0);
-}
-
-async function seedMockIdentity(organizationId: string, provider: string) {
-  const mockGroups = [
-    { idp: "grp-security", name: "Security Engineering", description: "Security admins and reviewers" },
-    { idp: "grp-platform", name: "Platform Engineering", description: "Core infrastructure and developer tooling" },
-    { idp: "grp-product", name: "Product Engineering", description: "Application engineers" },
-    { idp: "grp-contractors", name: "Contractors", description: "External users requiring rollout review" }
-  ];
-  const mockUsers = [
-    { idp: "usr-max", email: "max.brin@northwind.example", name: "Max Brin", first: "Max", last: "Brin", department: "Security", title: "CISO", groups: ["grp-security"] },
-    { idp: "usr-margaret", email: "margaret.chen@northwind.example", name: "Margaret Chen", first: "Margaret", last: "Chen", department: "Engineering", title: "Product Security", groups: ["grp-security", "grp-product"] },
-    { idp: "usr-jenny", email: "jenny.wilson@northwind.example", name: "Jenny Wilson", first: "Jenny", last: "Wilson", department: "Infrastructure", title: "SRE", groups: ["grp-platform"] },
-    { idp: "usr-floyd", email: "floyd.miles@northwind.example", name: "Floyd Miles", first: "Floyd", last: "Miles", department: "Engineering", title: "Payments Engineer", groups: ["grp-product"] },
-    { idp: "usr-kristin", email: "kristin.watson@northwind.example", name: "Kristin Watson", first: "Kristin", last: "Watson", department: "Data", title: "Analytics Engineer", groups: ["grp-product"] },
-    { idp: "usr-robert", email: "robert.fox@northwind.example", name: "Robert Fox", first: "Robert", last: "Fox", department: "Identity", title: "IAM Engineer", groups: ["grp-platform"] }
-  ];
-  const groupIds = new Map<string, string>();
-  for (const group of mockGroups) {
-    const result = await pool.query<{ id: string }>(
-      `insert into identity_groups (organization_id, name, description, idp_group_id, idp_provider, updated_at)
-       values ($1, $2, $3, $4, $5, now())
-       on conflict (organization_id, idp_group_id) do update set name = excluded.name, description = excluded.description, idp_provider = excluded.idp_provider, updated_at = now()
-       returning id`,
-      [organizationId, group.name, group.description, group.idp, provider]
-    );
-    groupIds.set(group.idp, result.rows[0].id);
-  }
-  for (const user of mockUsers) {
-    const result = await pool.query<{ id: string }>(
-      `insert into users (organization_id, email, display_name, first_name, last_name, department, title, role, idp_user_id, idp_provider, status)
-       values ($1, $2, $3, $4, $5, $6, $7, 'engineer', $8, $9, 'active')
-       on conflict (email) do update set organization_id = excluded.organization_id, display_name = excluded.display_name,
-         first_name = excluded.first_name, last_name = excluded.last_name, department = excluded.department, title = excluded.title,
-         idp_user_id = excluded.idp_user_id, idp_provider = excluded.idp_provider, status = excluded.status
-       returning id`,
-      [organizationId, user.email, user.name, user.first, user.last, user.department, user.title, user.idp, provider]
-    );
-    for (const groupIdp of user.groups) {
-      const groupId = groupIds.get(groupIdp);
-      if (!groupId) continue;
-      await pool.query(
-        `insert into identity_group_members (group_id, user_id) values ($1, $2) on conflict do nothing`,
-        [groupId, result.rows[0].id]
-      );
-    }
-  }
-  return { usersProcessed: mockUsers.length, groupsProcessed: mockGroups.length, membershipsProcessed: mockUsers.reduce((sum, user) => sum + user.groups.length, 0) };
 }
 
 function enrollmentCommand(tenantUrl: string, token: string) {
@@ -4223,6 +4445,8 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/admin/mcp-servers" ||
     /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/skills" ||
+    requestPath === "/admin/logs" ||
+    /^\/admin\/logs\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/triggers" ||
     /^\/admin\/triggers\/[^/]+$/.test(requestPath) ||
     /^\/admin\/events\/[^/]+$/.test(requestPath) ||
@@ -4258,6 +4482,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/v1/enroll" ||
     requestPath === "/v1/evaluate" ||
     /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath) ||
+    requestPath === "/v1/desktop/enroll" ||
     requestPath === "/v1/skills/observations" ||
     /^\/v1\/decisions\/[^/]+$/.test(requestPath) ||
     /^\/admin\/decisions\/[^/]+\/resolve$/.test(requestPath) ||
@@ -4277,6 +4502,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   const verb = method.toUpperCase();
   if (requestPath === "/health") return "health";
   if (verb === "POST" && requestPath === "/v1/enroll") return "tenantEnroll";
+  if (verb === "POST" && requestPath === "/v1/desktop/enroll") return "desktopEnroll";
   if (verb === "POST" && requestPath === "/v1/evaluate") return "tenantEvaluate";
   if (verb === "POST" && /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath)) return "tenantHookEvaluate";
   if (verb === "POST" && requestPath === "/v1/skills/observations") return "tenantSkillObservation";
@@ -4287,6 +4513,8 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && requestPath === "/admin/mcp-servers") return "adminMcpServers";
   if (verb === "GET" && /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath)) return "adminMcpServerDetail";
   if (verb === "GET" && requestPath === "/admin/skills") return "adminSkills";
+  if (verb === "GET" && requestPath === "/admin/logs") return "adminLogs";
+  if (verb === "GET" && /^\/admin\/logs\/[^/]+$/.test(requestPath)) return "adminLogDetail";
   if (verb === "GET" && requestPath === "/admin/triggers") return "adminTriggers";
   if (verb === "GET" && /^\/admin\/triggers\/[^/]+$/.test(requestPath)) return "adminTriggerDetail";
   if (verb === "GET" && /^\/admin\/events\/[^/]+$/.test(requestPath)) return "adminEventDetail";
