@@ -338,7 +338,7 @@ app.get("/admin/overview", async (_req, res, next) => {
       const [metrics, sessionMetrics, agentSessions, usageSessions, agents, recent, policies, users] = await Promise.all([
       pool.query(`select
         (select count(*) from computers) as computers,
-        (select count(*) from agent_runtimes) as agents,
+        (select count(*) from agent_runtimes where kind not in ('openclaw', 'nanoclaw')) as agents,
         (select count(*) from conversation_events where created_at > now() - interval '30 days') as events,
         (select count(*) from evaluations where decision = 'deny' and created_at > now() - interval '30 days') as denied,
         (select count(*) from evaluations where decision = 'ask' and created_at > now() - interval '30 days') as questions`),
@@ -349,6 +349,7 @@ app.get("/admin/overview", async (_req, res, next) => {
         from agent_runtimes ar
         join computers c on c.id = ar.computer_id
         left join users u on u.id = c.user_id
+        where ar.kind not in ('openclaw', 'nanoclaw')
         order by ar.last_seen_at desc limit 20`),
       pool.query(`select e.id, e.decision, e.resolution, e.summary, e.question, e.created_at, ce.event_name, ce.tool_name, ce.project_path, ce.prompt,
           ar.kind as agent_kind, ar.display_name as agent_name, c.hostname, u.display_name as user_name,
@@ -385,9 +386,9 @@ app.get("/admin/overview", async (_req, res, next) => {
       pool.query(`select u.id, u.email, u.display_name, u.role, u.created_at,
           u.department, u.title as hr_title, u.idp_provider, u.status,
           count(distinct c.id) as endpoint_count,
-          count(distinct ar.id) as agent_count,
+          count(distinct ar.id) filter (where ar.kind not in ('openclaw', 'nanoclaw')) as agent_count,
           max(greatest(c.last_seen_at, coalesce(ar.last_seen_at, c.last_seen_at))) as last_seen_at,
-          coalesce(jsonb_agg(distinct ar.display_name) filter (where ar.id is not null), '[]'::jsonb) as agents,
+          coalesce(jsonb_agg(distinct ar.display_name) filter (where ar.id is not null and ar.kind not in ('openclaw', 'nanoclaw')), '[]'::jsonb) as agents,
           coalesce(jsonb_agg(distinct c.hostname) filter (where c.id is not null), '[]'::jsonb) as hostnames
         from users u
         left join computers c on c.user_id = u.id
