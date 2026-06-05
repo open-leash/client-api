@@ -2060,7 +2060,9 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       skillName?: string;
       skillPath?: string;
       contentHash?: string;
+      content?: string;
       contentPreview?: string;
+      purposeSummary?: string;
       status?: string;
       riskScore?: number;
       reasons?: Array<{ reason?: string; quote?: string }>;
@@ -2071,13 +2073,22 @@ app.post("/v1/skills/observations", async (req, res, next) => {
     const reasons = normalizeSkillReasons(body.reasons);
     const suspicious = body.status === "suspicious" || reasons.length > 0 || Number(body.riskScore ?? 0) >= 50;
     const status = suspicious ? "suspicious" : "observed";
+    const content = typeof body.content === "string" ? body.content.slice(0, 80000) : null;
+    const contentPreview = typeof body.contentPreview === "string" ? body.contentPreview.slice(0, 12000) : content?.slice(0, 12000) ?? null;
+    const contentHash = body.contentHash ?? crypto.createHash("sha256").update(content ?? skillPath).digest("hex");
+    const purposeSummary = await skillPurposeSummary({
+      provided: body.purposeSummary,
+      content: content ?? contentPreview ?? "",
+      skillName,
+      skillPath
+    });
     const client = await pool.connect();
     try {
       await client.query("begin");
       const skill = await client.query(
         `insert into skills
-         (organization_id, user_id, agent_kind, agent_name, scope, project_path, skill_name, skill_path, status, risk_score, reasons, content_hash, first_seen_at, last_seen_at, updated_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, now(), now(), now())
+         (organization_id, user_id, agent_kind, agent_name, scope, project_path, skill_name, skill_path, status, risk_score, reasons, content_hash, content, content_preview, purpose_summary, content_updated_at, first_seen_at, last_seen_at, updated_at)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, now(), now(), now(), now())
          on conflict (organization_id, user_id, skill_path) do update set
            agent_kind = excluded.agent_kind,
            agent_name = excluded.agent_name,
@@ -2088,6 +2099,10 @@ app.post("/v1/skills/observations", async (req, res, next) => {
            risk_score = excluded.risk_score,
            reasons = excluded.reasons,
            content_hash = excluded.content_hash,
+           content = excluded.content,
+           content_preview = excluded.content_preview,
+           purpose_summary = excluded.purpose_summary,
+           content_updated_at = case when skills.content_hash is distinct from excluded.content_hash then excluded.content_updated_at else coalesce(skills.content_updated_at, excluded.content_updated_at) end,
            last_seen_at = now(),
            updated_at = now()
          returning *`,
@@ -2103,7 +2118,10 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           status,
           Math.max(0, Math.min(100, Number(body.riskScore ?? (suspicious ? 70 : 0)))),
           JSON.stringify(reasons),
-          body.contentHash ?? crypto.createHash("sha256").update(skillPath).digest("hex")
+          contentHash,
+          content,
+          contentPreview,
+          purposeSummary
         ]
       );
       let evaluationId: string | null = null;
@@ -2134,7 +2152,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
             `skill:${skillPath}`,
             body.projectPath ?? null,
             `Skill ${skillName} changed at ${skillPath}`,
-            JSON.stringify({ openleashEventType: "skill-risk", skillName, skillPath, reasons, contentPreview: body.contentPreview ?? "" })
+            JSON.stringify({ openleashEventType: "skill-risk", skillName, skillPath, reasons, contentPreview: contentPreview ?? "", purposeSummary })
           ]
         );
         const evaluation = await client.query(
@@ -2161,8 +2179,8 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       }
       const event = await client.query(
         `insert into skill_events
-         (organization_id, skill_id, evaluation_id, user_id, agent_kind, agent_name, scope, project_path, skill_name, skill_path, event_type, status, risk_score, reasons, content_preview)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'changed', $11, $12, $13::jsonb, $14)
+         (organization_id, skill_id, evaluation_id, user_id, agent_kind, agent_name, scope, project_path, skill_name, skill_path, event_type, status, risk_score, reasons, content_preview, purpose_summary)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'changed', $11, $12, $13::jsonb, $14, $15)
          returning *`,
         [
           organizationId,
@@ -2178,7 +2196,8 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           status,
           Math.max(0, Math.min(100, Number(body.riskScore ?? (suspicious ? 70 : 0)))),
           JSON.stringify(reasons),
-          body.contentPreview ?? null
+          contentPreview,
+          purposeSummary
         ]
       );
       await client.query("commit");
@@ -4299,6 +4318,70 @@ function normalizeSkillReasons(value: unknown): Array<{ reason: string; quote?: 
     const quote = typeof record.quote === "string" ? truncate(record.quote, 320) : undefined;
     return reason ? [{ reason, ...(quote ? { quote } : {}) }] : [];
   }).slice(0, 12);
+}
+
+async function skillPurposeSummary({ provided, content, skillName, skillPath }: { provided?: string; content: string; skillName: string; skillPath: string }) {
+  const normalized = normalizeSkillPurpose(provided ?? "", skillName);
+  if (normalized) return normalized;
+  const apiKey = process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY;
+  if (apiKey && content.trim()) {
+    const llm = await summarizeSkillPurposeWithOpenAI({ apiKey, content, skillName, skillPath });
+    if (llm) return llm;
+  }
+  return heuristicSkillPurpose(content, skillName);
+}
+
+async function summarizeSkillPurposeWithOpenAI({ apiKey, content, skillName, skillPath }: { apiKey: string; content: string; skillName: string; skillPath: string }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: process.env.OPENLEASH_SKILL_SUMMARY_MODEL ?? process.env.OPENAI_EVAL_MODEL ?? "gpt-4.1-mini",
+        input: [
+          { role: "system", content: "Summarize this AI agent skill purpose in 4 to 8 words. No punctuation unless needed. No quotes. Return only the phrase." },
+          { role: "user", content: JSON.stringify({ skillName, skillPath, content: truncate(content, 10000) }) }
+        ],
+        temperature: 0,
+        max_output_tokens: 40
+      })
+    });
+    if (!response.ok) return undefined;
+    const payload = await response.json() as { output_text?: string; output?: Array<{ content?: Array<{ text?: string }> }> };
+    const output = payload.output_text ?? payload.output?.flatMap((item) => item.content ?? []).map((item) => item.text ?? "").join("") ?? "";
+    return normalizeSkillPurpose(output, skillName);
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function heuristicSkillPurpose(content: string, skillName: string) {
+  const heading = content.match(/^#\s+(.+)$/m)?.[1] ?? content.match(/^description:\s*["']?(.+?)["']?\s*$/mi)?.[1];
+  return normalizeSkillPurpose(heading ?? skillName.replace(/[-_]+/g, " "), skillName) ?? titleCaseWords(skillName.replace(/[-_]+/g, " "));
+}
+
+function normalizeSkillPurpose(value: string, fallback: string) {
+  const cleaned = value.replace(/["'`]/g, "").replace(/[.!?]+$/g, "").replace(/\s+/g, " ").trim();
+  const words = cleaned.split(/\s+/).filter(Boolean).slice(0, 8);
+  if (words.length >= 4) return titleCaseWords(words.join(" "));
+  const fallbackWords = fallback.replace(/[-_]+/g, " ").split(/\s+/).filter(Boolean).slice(0, 8);
+  return fallbackWords.length ? titleCaseWords(fallbackWords.join(" ")) : undefined;
+}
+
+function titleCaseWords(value: string) {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.length <= 3 ? word : word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
 
 function decodeJwtPayload(jwt: string) {
