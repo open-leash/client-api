@@ -1037,7 +1037,11 @@ app.post("/auth/logout", async (req, res, next) => {
 app.get("/v1/mobile/bootstrap", async (req, res, next) => {
   try {
     const slug = String(req.query.organizationSlug ?? req.query.slug ?? "").trim();
-    const organization = slug ? await getOrganizationBySlug(slug) : undefined;
+    let organization = slug ? await getOrganizationBySlug(slug) : undefined;
+    if (!organization && clientModeFromEnvironment() === "enterprise") {
+      const defaultSlug = String(process.env.OPENLEASH_MANAGED_MOBILE_ORG_SLUG ?? process.env.OPENLEASH_DEV_ORG_SLUG ?? "").trim();
+      organization = defaultSlug ? await getOrganizationBySlug(defaultSlug) : await ensureDefaultOrganization();
+    }
     const providers = organization
       ? await mobileProvidersForOrganization(organization.id, organization.slug)
       : mobileCloudProviders();
