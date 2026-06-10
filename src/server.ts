@@ -1369,12 +1369,18 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       ) {
         return res.status(400).json({ success: false, message: "Use your company Google Workspace or Microsoft 365 account, not a personal email address." });
       }
-      const organization: ManagedOrganization = requestedOrganization ? { ...requestedOrganization } : await resolveManagedMobileOrganization(profile, audience);
+      const provisionUser = body.provisionUser !== false;
+      const organization: ManagedOrganization = requestedOrganization
+        ? { ...requestedOrganization }
+        : provisionUser
+          ? await resolveManagedMobileOrganization(profile, audience)
+          : await resolveExistingMobileOrganizationForProfile(profile);
       const response = await createDashboardSessionFromProfile({
         organizationId: organization.id,
         providerType,
         profile,
-        role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer"
+        role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer",
+        provisionUser
       });
       return res.json({ ...response, authMode: "development" });
     }
@@ -1404,12 +1410,18 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       return res.status(400).json({ success: false, message: "Use your company Google Workspace or Microsoft 365 account, not a personal email address." });
     }
 
-    const organization: ManagedOrganization = requestedOrganization ? { ...requestedOrganization } : (providerType === "google" || providerType === "azure_ad" ? await resolveManagedMobileOrganization(profile, audience) : organizationForProvider!);
+    const provisionUser = body.provisionUser !== false;
+    const organization: ManagedOrganization = requestedOrganization
+      ? { ...requestedOrganization }
+      : provisionUser
+        ? (providerType === "google" || providerType === "azure_ad" ? await resolveManagedMobileOrganization(profile, audience) : organizationForProvider!)
+        : await resolveExistingMobileOrganizationForProfile(profile);
     const response = await createDashboardSessionFromProfile({
       organizationId: organization.id,
       providerType,
       profile,
-      role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer"
+      role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer",
+      provisionUser
     });
     res.json({ ...response, authMode: providerType === "google" ? "google" : "sso" });
   } catch (error) {
@@ -3137,7 +3149,8 @@ app.put("/admin/policies/:id", async (req, res, next) => {
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);
-  res.status(500).json({ error: err instanceof Error ? err.message : "unknown error" });
+  const status = typeof (err as { status?: unknown })?.status === "number" ? (err as { status: number }).status : 500;
+  res.status(status).json({ error: err instanceof Error ? err.message : "unknown error" });
 });
 
 function summarizeAgentActivity(agent: {
@@ -3475,6 +3488,28 @@ async function resolveManagedMobileOrganization(profile: ManagedAuthProfile, aud
   return { ...(await ensureManagedMobileOrganization()), defaultUserRole: audience === "organization" ? "admin" : "engineer" };
 }
 
+async function resolveExistingMobileOrganizationForProfile(profile: ManagedAuthProfile): Promise<ManagedOrganization> {
+  const result = await pool.query(
+    `select o.id, o.name, o.slug, o.region, o.setup_completed, o.current_step, o.deployment_mode, u.role as default_user_role
+     from users u
+     join organizations o on o.id = u.organization_id
+     where lower(u.email) = lower($1)
+       and u.status = 'active'
+     order by case when u.role in ('owner', 'admin') then 0 else 1 end, u.last_login_at desc nulls last
+     limit 1`,
+    [profile.email]
+  );
+  if (result.rows[0]) {
+    return {
+      ...result.rows[0],
+      defaultUserRole: result.rows[0].default_user_role ?? "engineer"
+    };
+  }
+  const error = new Error("No OpenLeash account exists for this email. Create your account from desktop or the web, then sign in on mobile.");
+  (error as Error & { status?: number }).status = 403;
+  throw error;
+}
+
 function organizationNameFromDomain(domain: string) {
   const first = domain.split(".")[0] || "Company";
   return first
@@ -3685,18 +3720,22 @@ async function createDashboardSessionFromProfile({
   organizationId,
   providerType,
   profile,
-  role = "engineer"
+  role = "engineer",
+  provisionUser = true
 }: {
   organizationId: string;
   providerType: string;
   profile: ManagedAuthProfile;
   role?: string;
+  provisionUser?: boolean;
 }) {
   const organizationResult = await pool.query(`select id, name, slug, region, setup_completed from organizations where id = $1 limit 1`, [organizationId]);
   const organization = organizationResult.rows[0];
   if (!organization) throw new Error("Organization not found");
   const displayName = profile.name || profile.email.split("@")[0] || "OpenLeash user";
-  const userResult = await pool.query<{
+  const userEmail = profile.email.toLowerCase();
+  const userResult = provisionUser
+    ? await pool.query<{
     id: string;
     email: string;
     display_name: string;
@@ -3717,7 +3756,7 @@ async function createDashboardSessionFromProfile({
      returning id, email, display_name, role`,
     [
       organizationId,
-      profile.email.toLowerCase(),
+      userEmail,
       displayName,
       role,
       profile.givenName,
@@ -3726,7 +3765,26 @@ async function createDashboardSessionFromProfile({
       providerType,
       JSON.stringify({ ssoProfile: profile.raw, mobile: true })
     ]
-  );
+      )
+    : await pool.query<{
+        id: string;
+        email: string;
+        display_name: string;
+        role: string;
+      }>(
+        `select id, email, display_name, role
+         from users
+         where organization_id = $1
+           and lower(email) = lower($2)
+           and status = 'active'
+         limit 1`,
+        [organizationId, userEmail]
+      );
+  if (!userResult.rows[0] && !provisionUser) {
+    const error = new Error("No OpenLeash account exists for this email. Create your account from desktop or the web, then sign in on mobile.");
+    (error as Error & { status?: number }).status = 403;
+    throw error;
+  }
   const sessionToken = `ols_${crypto.randomBytes(32).toString("base64url")}`;
   const expiresAt = new Date(Date.now() + Number(process.env.OPENLEASH_DASHBOARD_SESSION_DAYS ?? 14) * 86400000);
   await pool.query(
