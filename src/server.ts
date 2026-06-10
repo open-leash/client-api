@@ -30,6 +30,14 @@ import { z } from "zod";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
 import { evaluatePolicies, summarizeActionPurpose } from "./evaluator.js";
 import {
+  defaultPromptTransformConfig,
+  normalizePromptTransformConfig,
+  promptTransformsEnabled,
+  transformPrompt,
+  type PromptTransformConfig,
+  type PromptTransformResult
+} from "./prompt-transforms.js";
+import {
   EXTERNAL_PROVIDER_IDS,
   externalConversationToEvaluation,
   externalEvaluationKey,
@@ -38,6 +46,15 @@ import {
   listExternalConnectors,
   type ExternalProvider
 } from "./external-agents.js";
+import {
+  listProviderUsageConnections,
+  normalizeUsageProvider,
+  providerUsageOverview,
+  syncProviderUsage,
+  upsertProviderUsageConnection,
+  upsertProviderUsageBudget,
+  validateProviderConnection
+} from "./provider-usage.js";
 import { assertReleaseAdmin, checkForClientUpdate, updateRequestSchema, upsertRelease } from "./releases.js";
 
 export type ApiSurface = "client" | "dashboard" | "all";
@@ -140,6 +157,31 @@ app.get("/health", (_req, res) => res.json({
   surface: apiSurface,
   apiContracts: OPENLEASH_API_CONTRACTS
 }));
+
+app.get("/admin/prompt-transforms", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    res.json({ config: await readPromptTransformConfig(organizationId) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/prompt-transforms", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const config = normalizePromptTransformConfig(req.body?.config ?? req.body);
+    await pool.query(
+      `insert into prompt_transform_settings (organization_id, config, updated_at)
+       values ($1, $2, now())
+       on conflict (organization_id) do update set config = excluded.config, updated_at = now()`,
+      [organizationId, JSON.stringify(config)]
+    );
+    res.json({ ok: true, config });
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.post("/api/updates/check", async (req, res) => {
   try {
@@ -271,8 +313,8 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
     }
     const request = normalizeHookRequest(agent, eventName, req.body, req.query);
     if (isPromptOnlyHook(request)) {
-      await recordConversationEvent(request, user, triggerIntentKey(request));
-      return res.json(nativeHookDecision(agent, eventName, { decision: "allow", decisionId: "", summary: "OpenLeash logged this prompt intent.", results: [] }));
+      const transformed = await handlePromptOnlyHook(agent, eventName, request, user);
+      return res.json(transformed);
     }
     const decision = await evaluateAndRecord(request, user);
     const resolvedDecision = await waitForHookDecision(user, decision);
@@ -329,6 +371,109 @@ app.post("/admin/external-agents/sync", async (req, res, next) => {
     }
     res.json({ ok: true, synced, skipped, total: conversations.length });
   } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/admin/provider-usage", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const days = Math.max(1, Math.min(180, Number(req.query.days ?? 30) || 30));
+    const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    res.json(await providerUsageOverview(organizationId, start));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/admin/provider-usage/connections", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    res.json({ connections: await listProviderUsageConnections(organizationId) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/provider-usage/connections", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const provider = normalizeUsageProvider(req.body?.provider);
+    const apiKey = String(req.body?.apiKey ?? "").trim();
+    if (!provider) return res.status(400).json({ ok: false, message: "provider must be cursor, openai, or anthropic" });
+    if (!apiKey) return res.status(400).json({ ok: false, message: "apiKey is required" });
+    const result = await upsertProviderUsageConnection({
+      organizationId,
+      provider,
+      apiKey,
+      label: typeof req.body?.label === "string" ? req.body.label : undefined,
+      externalOrgId: typeof req.body?.externalOrgId === "string" ? req.body.externalOrgId : undefined
+    });
+    if (!result.ok) return res.status(400).json(result);
+    res.status(201).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/provider-usage/validate", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const provider = normalizeUsageProvider(req.body?.provider);
+    if (!provider) return res.status(400).json({ ok: false, message: "provider must be cursor, openai, or anthropic" });
+    const result = await validateProviderConnection(organizationId, provider);
+    if (!result.ok) return res.status(400).json(result);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/provider-usage/budgets", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const provider = normalizeUsageProvider(req.body?.provider);
+    const budget = await upsertProviderUsageBudget({
+      organizationId,
+      provider,
+      monthlyBudgetCents: Number(req.body?.monthlyBudgetCents ?? 0)
+    });
+    res.json({ ok: true, budget });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/provider-usage/sync", async (req, res, next) => {
+  let started: { rows: Array<{ id: string }> } | undefined;
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const provider = normalizeUsageProvider(req.body?.provider);
+    started = await pool.query<{ id: string }>(
+      `insert into provider_usage_sync_jobs (organization_id, provider, status, triggered_by)
+       values ($1, $2, 'running', $3)
+       returning id`,
+      [organizationId, provider ?? null, typeof req.body?.triggeredBy === "string" ? req.body.triggeredBy : "manual"]
+    );
+    const result = await syncProviderUsage(organizationId, provider);
+    const records = result.synced.reduce((sum, item) => sum + item.events, 0);
+    await pool.query(
+      `update provider_usage_sync_jobs
+       set status = $2, records = $3, error = $4, finished_at = now()
+       where id = $1`,
+      [started.rows[0].id, result.ok ? "completed" : "partial", records, result.failed.map(item => `${item.provider}: ${item.error}`).join("; ") || null]
+    );
+    res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown sync error";
+    if (started?.rows[0]?.id) {
+      await pool.query(
+        `update provider_usage_sync_jobs
+         set status = 'failed', error = $2, finished_at = now()
+         where id = $1`,
+        [started.rows[0].id, message]
+      );
+    }
     next(error);
   }
 });
@@ -706,7 +851,7 @@ app.get("/admin/skills", async (_req, res, next) => {
 app.get("/admin/onboarding", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
-    const [idp, groups, users, roles, tokens] = await Promise.all([
+    const [idp, groups, users, roles, tokens, providerUsage] = await Promise.all([
       pool.query(
         `select id, provider, enabled, last_sync_at, user_count, group_count, last_error, created_at, updated_at,
                 config - array['ClientSecret','clientSecret','PrivateKey','privateKey','ApiToken','apiToken','AccessToken','accessToken','ServiceAccountJson','serviceAccountJson'] as config
@@ -747,10 +892,16 @@ app.get("/admin/onboarding", async (req, res, next) => {
          from deployment_tokens
          order by created_at desc
          limit 10`
+      ),
+      pool.query(
+        `select
+           (select count(*)::int from provider_usage_connections where organization_id = $1 and enabled = true) as connection_count,
+           (select count(*)::int from provider_usage_budgets where organization_id = $1 and enabled = true) as budget_count`,
+        [organization.id]
       )
     ]);
     const deploymentMode = process.env.OPENLEASH_DEPLOYMENT_MODE ?? process.env.OPENLEASH_EDITION ?? organization.deployment_mode ?? "cloud";
-    res.json({ organization: { ...organization, deployment_mode: deploymentMode }, idp: idp.rows[0] ?? null, groups: groups.rows, users: users.rows, roles: roles.rows, deploymentTokens: tokens.rows });
+    res.json({ organization: { ...organization, deployment_mode: deploymentMode }, idp: idp.rows[0] ?? null, groups: groups.rows, users: users.rows, roles: roles.rows, deploymentTokens: tokens.rows, providerUsage: providerUsage.rows[0] ?? { connection_count: 0, budget_count: 0 } });
   } catch (error) {
     next(error);
   }
@@ -2486,6 +2637,69 @@ app.post("/admin/policies", async (req, res, next) => {
 });
 
 type ApiUser = { id: string; email?: string; display_name?: string; organization_id?: string | null };
+
+async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventName, request: EvaluationRequest, user: ApiUser) {
+  const intentKey = triggerIntentKey(request);
+  const { conversationEventId, organizationId } = await recordConversationEvent(request, user, intentKey);
+  const config = await readPromptTransformConfig(organizationId);
+  if (!request.event.prompt || !promptTransformsEnabled(config)) {
+    return nativeHookDecision(agent, eventName, { decision: "allow", decisionId: "", summary: "OpenLeash logged this prompt intent.", results: [] });
+  }
+  const result = await transformPrompt({
+    prompt: request.event.prompt,
+    config,
+    apiKey: process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY
+  });
+  await recordPromptTransformResult(conversationEventId, user.id, request.event.prompt, result);
+  if (result.blocked) {
+    return nativeHookDecision(agent, eventName, {
+      decision: "deny",
+      decisionId: "",
+      summary: result.summary,
+      results: []
+    });
+  }
+  return promptTransformHookDecision(agent, eventName, result.finalPrompt, result.summary);
+}
+
+async function readPromptTransformConfig(organizationId: string): Promise<PromptTransformConfig> {
+  const row = await pool.query<{ config: unknown }>(
+    "select config from prompt_transform_settings where organization_id = $1",
+    [organizationId]
+  );
+  return normalizePromptTransformConfig(row.rows[0]?.config ?? defaultPromptTransformConfig);
+}
+
+async function organizationIdForAdminRequest(req: express.Request) {
+  const slug = typeof req.query.organizationSlug === "string" ? req.query.organizationSlug : undefined;
+  if (slug) {
+    const organization = await pool.query<{ id: string }>("select id from organizations where slug = $1", [slug]);
+    if (organization.rows[0]?.id) return organization.rows[0].id;
+  }
+  return (await ensureDefaultOrganization()).id;
+}
+
+async function recordPromptTransformResult(conversationEventId: string, userId: string, originalPrompt: string, result: PromptTransformResult) {
+  await pool.query(
+    `update conversation_events
+     set payload = payload || $2::jsonb
+     where id = $1`,
+    [conversationEventId, JSON.stringify({
+      openleashPromptTransform: {
+        originalPrompt,
+        finalPrompt: result.finalPrompt,
+        blocked: result.blocked,
+        compression: result.compression,
+        dlp: result.dlp
+      }
+    })]
+  );
+  await pool.query(
+    `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
+     values ($1, $2, $3, $4, null, $5)`,
+    [conversationEventId, userId, result.blocked ? "deny" : "allow", result.summary, result.model]
+  );
+}
 
 async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Promise<EvaluationResponse> {
   const intentKey = triggerIntentKey(request);
@@ -4288,11 +4502,13 @@ function configuredCorsOrigins() {
 function requiresDashboardWriteSession(req: express.Request) {
   if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) return false;
   if (req.path === "/admin/external-agents/sync") return true;
+  if (req.path.startsWith("/admin/provider-usage")) return true;
   if (req.path.startsWith("/admin/onboarding")) return true;
   if (req.path.startsWith("/admin/decisions/")) return true;
   if (req.path === "/admin/users") return true;
   if (req.path.startsWith("/admin/deployment-tokens")) return true;
   if (req.path.startsWith("/admin/policies")) return true;
+  if (req.path === "/admin/prompt-transforms") return true;
   return false;
 }
 
@@ -4572,6 +4788,29 @@ function nativeHookDecision(agent: HookAgentSlug, eventName: HookEventName, deci
   return { decision: decision.decision === "deny" ? "block" : decision.decision, reason };
 }
 
+function promptTransformHookDecision(agent: HookAgentSlug, eventName: HookEventName, prompt: string, summary: string) {
+  const base = nativeHookDecision(agent, eventName, {
+    decision: "allow",
+    decisionId: "",
+    summary,
+    results: []
+  });
+  return {
+    ...base,
+    prompt,
+    transformedPrompt: prompt,
+    replacementPrompt: prompt,
+    output: prompt,
+    hookSpecificOutput: {
+      ...((base as { hookSpecificOutput?: object }).hookSpecificOutput ?? {}),
+      hookEventName: eventName,
+      prompt,
+      transformedPrompt: prompt,
+      replacementPrompt: prompt
+    }
+  };
+}
+
 function humanDecisionReason(decision: EvaluationResponse) {
   if (decision.decision === "allow") return "OpenLeash approved this action.";
   if (decision.decision === "deny" && decision.resolutionGuidance) {
@@ -4611,6 +4850,8 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     /^\/admin\/events\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/external-agents" ||
     requestPath === "/admin/external-agents/sync" ||
+    requestPath === "/admin/provider-usage" ||
+    requestPath.startsWith("/admin/provider-usage/") ||
     requestPath === "/admin/onboarding" ||
     requestPath.startsWith("/admin/onboarding/") ||
     requestPath === "/admin/identity" ||
@@ -4619,6 +4860,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath.startsWith("/admin/deployment-tokens") ||
     requestPath === "/admin/policies" ||
     /^\/admin\/policies\/[^/]+$/.test(requestPath) ||
+    requestPath === "/admin/prompt-transforms" ||
     requestPath === "/auth/session" ||
     requestPath === "/auth/logout" ||
     requestPath === "/auth/sso/authorize" ||
@@ -4681,6 +4923,9 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && /^\/admin\/events\/[^/]+$/.test(requestPath)) return "adminEventDetail";
   if (verb === "GET" && requestPath === "/admin/external-agents") return "adminExternalAgents";
   if (verb === "POST" && requestPath === "/admin/external-agents/sync") return "adminExternalAgentsSync";
+  if (verb === "GET" && (requestPath === "/admin/provider-usage" || requestPath === "/admin/provider-usage/connections")) return "adminProviderUsageRead";
+  if (verb === "POST" && requestPath === "/admin/provider-usage/sync") return "adminProviderUsageSync";
+  if (verb === "POST" && requestPath.startsWith("/admin/provider-usage/")) return "adminProviderUsageWrite";
   if (verb === "GET" && requestPath === "/admin/onboarding") return "adminOnboardingRead";
   if (verb === "GET" && requestPath === "/admin/identity") return "adminIdentityRead";
   if (requestPath.startsWith("/admin/onboarding/")) return "adminOnboardingWrite";
@@ -4689,6 +4934,8 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (requestPath.startsWith("/admin/deployment-tokens")) return "adminDeploymentTokensWrite";
   if (verb === "POST" && requestPath === "/admin/policies") return "adminPoliciesWrite";
   if (verb === "PUT" && /^\/admin\/policies\/[^/]+$/.test(requestPath)) return "adminPoliciesWrite";
+  if (verb === "GET" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsRead";
+  if (verb === "POST" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsWrite";
   if (verb === "GET" && requestPath === "/auth/session") return "authSession";
   if (verb === "POST" && requestPath === "/auth/logout") return "authLogout";
   if (verb === "POST" && requestPath === "/auth/sso/authorize") return "authSsoAuthorize";

@@ -17,6 +17,13 @@ create table if not exists organizations (
 
 alter table organizations add column if not exists deployment_mode text not null default 'cloud';
 alter table organizations add column if not exists infrastructure_config jsonb not null default '{}'::jsonb;
+alter table organizations add column if not exists region text;
+alter table organizations add column if not exists logo_url text;
+alter table organizations add column if not exists setup_completed boolean not null default false;
+alter table organizations add column if not exists current_step integer not null default 1;
+alter table organizations add column if not exists onboarding_code text unique;
+alter table organizations add column if not exists created_at timestamptz not null default now();
+alter table organizations add column if not exists updated_at timestamptz not null default now();
 
 create table if not exists users (
   id uuid primary key default gen_random_uuid(),
@@ -47,6 +54,8 @@ alter table users add column if not exists idp_provider text;
 alter table users add column if not exists status text not null default 'active';
 alter table users add column if not exists last_login_at timestamptz;
 alter table users add column if not exists metadata jsonb not null default '{}'::jsonb;
+alter table users add column if not exists token_hash text unique;
+alter table users add column if not exists created_at timestamptz not null default now();
 create index if not exists users_organization_idx on users(organization_id);
 create unique index if not exists users_org_idp_unique_idx on users(organization_id, idp_user_id) where idp_user_id is not null;
 
@@ -188,6 +197,7 @@ create table if not exists evaluations (
   user_id uuid references users(id) on delete set null,
   decision text not null,
   resolution text,
+  resolution_guidance text,
   resolved_at timestamptz,
   resolved_by text,
   summary text not null,
@@ -196,9 +206,17 @@ create table if not exists evaluations (
   created_at timestamptz not null default now()
 );
 
+alter table evaluations add column if not exists resolution_guidance text;
+
 alter table evaluations add column if not exists resolution text;
 alter table evaluations add column if not exists resolved_at timestamptz;
 alter table evaluations add column if not exists resolved_by text;
+
+create table if not exists prompt_transform_settings (
+  organization_id uuid primary key references organizations(id) on delete cascade,
+  config jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
 
 create table if not exists mcp_servers (
   id uuid primary key default gen_random_uuid(),
@@ -346,6 +364,79 @@ create index if not exists external_agent_connections_provider_idx on external_a
 create index if not exists conversation_events_external_evaluation_key_idx
   on conversation_events ((payload->'raw'->>'externalEvaluationKey'))
   where payload->'raw'->>'externalEvaluationKey' is not null;
+
+create table if not exists provider_usage_connections (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid references organizations(id) on delete cascade,
+  provider text not null,
+  label text not null,
+  credential_ciphertext text not null,
+  credential_key_id text not null default 'default',
+  enabled boolean not null default true,
+  status text not null default 'configured',
+  last_validated_at timestamptz,
+  last_sync_at timestamptz,
+  last_error text,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(organization_id, provider)
+);
+
+create table if not exists provider_usage_events (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid references organizations(id) on delete cascade,
+  connection_id uuid references provider_usage_connections(id) on delete cascade,
+  provider text not null,
+  external_id text not null,
+  provider_user_email text,
+  provider_user_name text,
+  model text,
+  usage_kind text,
+  input_tokens bigint not null default 0,
+  output_tokens bigint not null default 0,
+  cache_read_tokens bigint not null default 0,
+  cache_write_tokens bigint not null default 0,
+  request_count integer not null default 0,
+  cost_cents numeric(14, 4) not null default 0,
+  currency text not null default 'usd',
+  occurred_at timestamptz not null,
+  raw jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  unique(provider, external_id)
+);
+
+create table if not exists provider_usage_budgets (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid references organizations(id) on delete cascade,
+  provider text,
+  scope text not null default 'organization',
+  scope_key text,
+  monthly_budget_cents integer not null,
+  alert_thresholds integer[] not null default array[50, 80, 100],
+  enabled boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists provider_usage_sync_jobs (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid references organizations(id) on delete cascade,
+  provider text,
+  status text not null,
+  triggered_by text not null default 'cron',
+  records integer not null default 0,
+  error text,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz
+);
+
+create index if not exists provider_usage_connections_org_idx on provider_usage_connections(organization_id, provider);
+create index if not exists provider_usage_events_org_time_idx on provider_usage_events(organization_id, occurred_at desc);
+create index if not exists provider_usage_events_provider_idx on provider_usage_events(provider, occurred_at desc);
+create index if not exists provider_usage_events_user_idx on provider_usage_events(organization_id, provider_user_email, occurred_at desc);
+create index if not exists provider_usage_budgets_org_idx on provider_usage_budgets(organization_id);
+create index if not exists provider_usage_sync_jobs_org_idx on provider_usage_sync_jobs(organization_id, started_at desc);
 
 alter table computers add column if not exists enrollment_token_id uuid references deployment_tokens(id) on delete set null;
 alter table computers add column if not exists enrolled_at timestamptz;
