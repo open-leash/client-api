@@ -38,7 +38,7 @@ export async function getUserByToken(token: string) {
 }
 
 export async function ensureDevToken() {
-  const token = process.env.OPENLEASH_DEV_TOKEN ?? (process.env.NODE_ENV === "production" ? "" : "ol_max_brin_local_dev_token");
+  const token = process.env.OPENLEASH_DEV_TOKEN;
   if (!token) return;
   const user = await pool.query<{ id: string }>(
     `insert into users (email, display_name, role, token_hash)
