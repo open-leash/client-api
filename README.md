@@ -1,32 +1,66 @@
-# OpenLeash Client API 🧠⚡
+<div align="center">
 
-[![Open Core](https://img.shields.io/badge/open--core-yes-111718)](#)
-[![Surface](https://img.shields.io/badge/surface-client_api-0c8b67)](#)
-[![Node](https://img.shields.io/badge/node-%3E%3D20-3975a8)](#)
-[![Postgres](https://img.shields.io/badge/postgres-required-4169e1)](#)
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0EA5E9,45:2563EB,100:111827&height=220&section=header&text=Client%20API&fontSize=54&fontColor=ffffff&fontAlignY=38&desc=The%20managed%20agent%20decision%20surface.&descSize=18&descAlignY=58" width="100%" />
 
-The client-facing OpenLeash API. Desktop hooks, endpoint enrollment, mobile approvals, policy evaluation, audit ingestion, MCP telemetry, skill observations, and update checks speak here.
+<p>
+  <a href="https://openleash.com"><img src="https://img.shields.io/badge/OpenLeash-openleash.com-0EA5E9?style=for-the-badge&logo=googlechrome&logoColor=white" /></a>
+  <a href="https://docs.openleash.com"><img src="https://img.shields.io/badge/Docs-docs.openleash.com-2563EB?style=for-the-badge&logo=readthedocs&logoColor=white" /></a>
+  <img src="https://img.shields.io/badge/Open%20Core-Client%20API-111827?style=for-the-badge&logo=github&logoColor=white" />
+</p>
 
-## Where It Fits
+<p>
+  <img src="https://img.shields.io/badge/Postgres-schema%20migrations-4169E1?style=for-the-badge&logo=postgresql&logoColor=white" />
+  <img src="https://img.shields.io/badge/Node-%E2%89%A520-339933?style=for-the-badge&logo=node.js&logoColor=white" />
+  <img src="https://img.shields.io/badge/Surface-desktop%20%2B%20mobile%20%2B%20hooks-0EA5E9?style=for-the-badge" />
+</p>
+
+<h3>🐾 Unleash your agents. Keep the decision layer calm, fast, and observable.</h3>
+
+</div>
+
+---
+
+## ✨ What this app is
+
+`client-api` is the managed API that desktop clients, mobile clients, hooks, and enrollment flows talk to outside pure Local mode.
+
+It evaluates agent events, records audit trails, stores pending approvals, serves mobile state, manages update metadata, and exposes the core API that OpenLeash Cloud wraps for hosted customers.
 
 ```text
-desktop-client local API -> client-api -> policies + audit + approvals
-mobile-client ----------^
+desktop-client local API
+        │
+        ▼
+client-api ──► Postgres policies, audit, approvals, org state
+        ▲
+        │
+mobile-client
 ```
 
-Standalone desktop mode does not require this service. Managed self-hosted and OpenLeash Cloud do.
+---
 
-## Responsibilities
+## 🚀 Where it runs
 
-- Receive normalized local-agent events from `desktop-client`
-- Evaluate actions against enabled policies
-- Store events, evaluations, policy results, MCP calls, skills, and pending approvals
-- Serve mobile approval state
+| Mode | Role |
+| --- | --- |
+| 🖥️ Local mode | Not required. Desktop can evaluate locally/offline. |
+| 🏢 Private Cloud | Customer-hosted managed API. |
+| ☁️ OpenLeash Cloud | Wrapped by `cloud-client-api` for hosted tenancy and cloud controls. |
+
+---
+
+## 🔥 Responsibilities
+
+- Receive normalized agent events from `desktop-client`
+- Evaluate actions against policy and model providers
+- Store audit, evaluations, MCP calls, skills, triggers, and pending approvals
+- Serve mobile approval and account state
 - Enroll managed endpoints with deployment tokens
-- Serve desktop update metadata
-- Export extension points for private cloud wrappers
+- Apply Postgres migrations safely through `schema_migrations`
+- Provide extension points for hosted/private wrappers
 
-## Run Locally
+---
+
+## 🛠 Run locally
 
 ```bash
 npm install
@@ -41,35 +75,35 @@ Health:
 curl http://localhost:9318/health
 ```
 
-Smoke an evaluation:
+Recommended full-mode runner:
 
 ```bash
-OPENLEASH_CLIENT_API_URL=http://localhost:9318 ./scripts/smoke-evaluate.sh
+python3 run.py
 ```
 
-## Deployment Modes
+---
 
-| Mode | What happens |
-| --- | --- |
-| Standalone | Hooks call `desktop-client` local API; evaluation can happen locally. |
-| Managed self-hosted | Desktop forwards to a customer-hosted `client-api`. |
-| OpenLeash Cloud | Private `cloud-client-api` wraps this core and adds hosted tenant enforcement. |
+## 🧠 BYOK and evaluation
 
-## Extension Pattern
+OpenLeash supports tenant BYOK evaluation keys for OpenAI, Anthropic/Claude, and DeepSeek.
 
-Do not fork the API to add hosted behavior. Import it and wrap it:
+Keys are stored encrypted in organization config. Evaluation can run through:
 
-```ts
-import { app as coreApp, prepareOpenLeashApi } from "@openleash/client-api";
+- Tenant BYOK provider
+- OpenLeash-managed provider
+- Deterministic fallback for local/dev safety
 
-await prepareOpenLeashApi({ app: coreApp, surface: "client" });
-wrapper.use(cloudTenantMiddleware);
-wrapper.use(coreApp);
-```
+---
 
-## Security Notes
+## 🛡 Safety notes
 
 - Tokens are hashed before storage.
-- CORS is restricted to local and configured dashboard origins.
-- No production dev token is seeded unless explicitly configured.
-- Keep secrets in environment or a vault, never in fixtures or code.
+- Postgres migrations are checksummed and tracked.
+- Destructive DB changes should ship with explicit migration review.
+- Public core behavior belongs here; OpenLeash-hosted-only behavior belongs in cloud wrappers.
+
+<div align="center">
+
+### Built for the boringly important part: decisions that can be trusted.
+
+</div>
