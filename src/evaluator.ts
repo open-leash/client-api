@@ -4,26 +4,48 @@ import type {
   Policy,
   PolicyDecision
 } from "@openleash/shared";
+import type { TenantModelKey } from "./model-keys.js";
 
 const model = process.env.OPENAI_EVAL_MODEL ?? "gpt-5.2";
+const anthropicModel = process.env.ANTHROPIC_EVAL_MODEL ?? "claude-3-5-sonnet-latest";
+const deepseekModel = process.env.DEEPSEEK_EVAL_MODEL ?? "deepseek-chat";
 const actionPurposeModel = process.env.OPENLEASH_ACTION_PURPOSE_MODEL ?? "gpt-4.1-nano";
 export const actionPurposeContextMessages = Number(process.env.OPENLEASH_ACTION_PURPOSE_MESSAGES ?? 5);
 
 export async function evaluatePolicies(
   request: EvaluationRequest,
-  policies: Policy[]
+  policies: Policy[],
+  tenantModelKey?: TenantModelKey
 ): Promise<{ results: PolicyDecision[]; model: string }> {
   const fastResults = fastSensitiveFileEvaluation(request, policies);
   if (fastResults) {
     return { results: fastResults, model: "heuristic-fast" };
   }
 
-  if (!process.env.OPENAI_API_KEY) {
+  const modelConfig = modelConfigFor(tenantModelKey);
+  if (!modelConfig) {
     return { results: heuristicEvaluation(request, policies), model: "heuristic" };
   }
 
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const prompt = buildPrompt(request, policies);
+  if (modelConfig.provider === "anthropic") {
+    return {
+      results: await evaluateWithAnthropic(prompt, modelConfig.apiKey),
+      model: `tenant-byok:${modelConfig.provider}:${anthropicModel}`
+    };
+  }
+
+  if (modelConfig.provider === "deepseek") {
+    return {
+      results: await evaluateWithOpenAiCompatibleChat(prompt, modelConfig.apiKey, modelConfig.baseURL!, deepseekModel),
+      model: `tenant-byok:${modelConfig.provider}:${deepseekModel}`
+    };
+  }
+
+  const client = new OpenAI({
+    apiKey: modelConfig.apiKey,
+    ...(modelConfig.baseURL ? { baseURL: modelConfig.baseURL } : {})
+  });
   const response = await client.responses.create({
     model,
     input: prompt,
@@ -75,7 +97,7 @@ export async function evaluatePolicies(
   });
 
   const parsed = JSON.parse(response.output_text) as { results: PolicyDecision[] };
-  return { results: parsed.results, model };
+  return { results: parsed.results, model: `${modelConfig.source}:${modelConfig.provider}:${model}` };
 }
 
 function fastSensitiveFileEvaluation(request: EvaluationRequest, policies: Policy[]) {
@@ -110,11 +132,15 @@ function fastSensitiveFileEvaluation(request: EvaluationRequest, policies: Polic
   return hasCredentialPolicy ? results : undefined;
 }
 
-export async function summarizeActionPurpose(request: EvaluationRequest): Promise<string> {
+export async function summarizeActionPurpose(request: EvaluationRequest, tenantModelKey?: TenantModelKey): Promise<string> {
   const fallback = heuristicActionPurpose(request);
-  if (!process.env.OPENAI_API_KEY) return fallback;
+  const modelConfig = modelConfigFor(tenantModelKey);
+  if (!modelConfig || modelConfig.provider !== "openai") return fallback;
   const recentTranscript = request.event.transcript?.slice(-Math.max(1, actionPurposeContextMessages)) ?? [];
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const client = new OpenAI({
+    apiKey: modelConfig.apiKey,
+    ...(modelConfig.baseURL ? { baseURL: modelConfig.baseURL } : {})
+  });
   try {
     const response = await client.responses.create({
       model: actionPurposeModel,
@@ -143,6 +169,58 @@ export async function summarizeActionPurpose(request: EvaluationRequest): Promis
   } catch {
     return fallback;
   }
+}
+
+function modelConfigFor(tenantModelKey?: TenantModelKey):
+  | { provider: "openai" | "anthropic" | "deepseek"; apiKey: string; baseURL?: string; source: "tenant-byok" | "openleash-managed" }
+  | undefined {
+  if (tenantModelKey?.apiKey) {
+    if (tenantModelKey.provider === "deepseek") {
+      return { provider: "deepseek", apiKey: tenantModelKey.apiKey, baseURL: "https://api.deepseek.com", source: "tenant-byok" };
+    }
+    return { provider: tenantModelKey.provider, apiKey: tenantModelKey.apiKey, source: "tenant-byok" };
+  }
+  const managedKey = process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY;
+  return managedKey ? { provider: "openai", apiKey: managedKey, source: "openleash-managed" } : undefined;
+}
+
+async function evaluateWithAnthropic(prompt: string, apiKey: string): Promise<PolicyDecision[]> {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model: anthropicModel,
+      max_tokens: 1800,
+      system: "Return only valid JSON matching the requested OpenLeash policy result schema.",
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Anthropic evaluation failed (${response.status})`);
+  }
+  const body = await response.json() as { content?: Array<{ type?: string; text?: string }> };
+  const text = body.content?.find((item) => item.type === "text" && item.text)?.text ?? "";
+  const parsed = JSON.parse(text) as { results: PolicyDecision[] };
+  return parsed.results;
+}
+
+async function evaluateWithOpenAiCompatibleChat(prompt: string, apiKey: string, baseURL: string, modelName: string): Promise<PolicyDecision[]> {
+  const client = new OpenAI({ apiKey, baseURL });
+  const response = await client.chat.completions.create({
+    model: modelName,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "Return only valid JSON with a top-level results array matching the OpenLeash policy result schema." },
+      { role: "user", content: prompt }
+    ]
+  });
+  const text = response.choices[0]?.message?.content ?? "";
+  const parsed = JSON.parse(text) as { results: PolicyDecision[] };
+  return parsed.results;
 }
 
 function heuristicActionPurpose(request: EvaluationRequest) {

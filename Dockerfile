@@ -26,6 +26,7 @@ COPY packages/shared/package.json packages/shared/package.json
 RUN npm ci --omit=dev --workspace @openleash/client-api --workspace @openleash/shared --include-workspace-root && npm cache clean --force
 COPY --from=build /app/packages/shared/dist packages/shared/dist
 COPY --from=build /app/apps/client-api/dist apps/client-api/dist
+COPY --from=build /app/apps/client-api/infra apps/client-api/infra
 COPY infra infra
 EXPOSE 9318 9319
 CMD ["node", "apps/client-api/dist/server.js"]

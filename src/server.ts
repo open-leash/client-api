@@ -55,6 +55,11 @@ import {
   upsertProviderUsageBudget,
   validateProviderConnection
 } from "./provider-usage.js";
+import {
+  normalizeTenantModelProvider,
+  readTenantModelKey,
+  upsertTenantModelKey
+} from "./model-keys.js";
 import { assertReleaseAdmin, checkForClientUpdate, updateRequestSchema, upsertRelease } from "./releases.js";
 
 export type ApiSurface = "client" | "dashboard" | "all";
@@ -474,6 +479,20 @@ app.post("/admin/provider-usage/sync", async (req, res, next) => {
         [started.rows[0].id, message]
       );
     }
+    next(error);
+  }
+});
+
+app.post("/admin/evaluation-key", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const provider = normalizeTenantModelProvider(req.body?.provider ?? req.body?.apiProvider);
+    const apiKey = String(req.body?.apiKey ?? "").trim();
+    if (!provider) return res.status(400).json({ ok: false, error: "provider must be openai, anthropic, or deepseek" });
+    if (!apiKey) return res.status(400).json({ ok: false, error: "apiKey is required" });
+    const result = await upsertTenantModelKey({ organizationId, provider, apiKey });
+    res.json({ ok: true, ...result });
+  } catch (error) {
     next(error);
   }
 });
@@ -1433,29 +1452,12 @@ app.post("/v1/mobile/model-key", async (req, res, next) => {
   try {
     const session = await getDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const provider = String(req.body.provider ?? req.body.apiProvider ?? "").trim();
+    const provider = normalizeTenantModelProvider(req.body.provider ?? req.body.apiProvider);
     const apiKey = String(req.body.apiKey ?? "").trim();
-    if (!["openai", "anthropic"].includes(provider)) return res.status(400).json({ error: "provider must be openai or anthropic" });
+    if (!provider) return res.status(400).json({ error: "provider must be openai, anthropic, or deepseek" });
     if (!apiKey) return res.status(400).json({ error: "apiKey is required" });
-    const masked = `${apiKey.slice(0, 7)}...${apiKey.slice(-4)}`;
-    const fingerprint = crypto.createHash("sha256").update(apiKey).digest("hex");
-    const result = await pool.query(
-      `update organizations
-       set infrastructure_config = coalesce(infrastructure_config, '{}'::jsonb) || $2::jsonb,
-           updated_at = now()
-       where id = $1
-       returning id, name, slug, infrastructure_config`,
-      [
-        session.organization.id,
-        JSON.stringify({
-          modelProvider: provider,
-          modelKeyFingerprint: fingerprint,
-          modelKeyMasked: masked,
-          modelKeyUpdatedAt: new Date().toISOString()
-        })
-      ]
-    );
-    res.json({ ok: true, organization: result.rows[0], provider, masked });
+    const result = await upsertTenantModelKey({ organizationId: session.organization.id, provider, apiKey });
+    res.json({ ok: true, ...result });
   } catch (error) {
     next(error);
   }
@@ -2730,7 +2732,8 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
      from policies where enabled = true order by created_at asc`
   );
-  const { results: evaluatedResults, model } = await evaluatePolicies(request, policies.rows);
+  const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
+  const { results: evaluatedResults, model } = await evaluatePolicies(request, policies.rows, tenantModelKey);
   const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, evaluatedResults);
   const results = promptOnlyDeferred ? deferPromptOnlyPolicyResults(evaluatedResults) : evaluatedResults;
   const decision = results.some((r) => r.status === "failed" || r.status === "needs_question")
@@ -2788,7 +2791,7 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
   });
   let purposeSummary: string | undefined;
   if (decision === "ask") {
-    purposeSummary = await summarizeActionPurpose(request);
+    purposeSummary = await summarizeActionPurpose(request, tenantModelKey);
     await pool.query(
       `update conversation_events
        set payload = payload || $2::jsonb
@@ -2800,6 +2803,15 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     });
   }
   return { decision, decisionId: evaluation.rows[0].id, summary, question, results };
+}
+
+async function tenantModelKeyForEvaluation(organizationId: string) {
+  try {
+    return await readTenantModelKey(organizationId);
+  } catch (error) {
+    console.warn("tenant model key unavailable; falling back to managed or heuristic evaluation", error);
+    return undefined;
+  }
 }
 
 async function recordConversationEvent(request: EvaluationRequest, user: ApiUser, intentKey?: string) {
@@ -4910,6 +4922,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/admin/external-agents/sync" ||
     requestPath === "/admin/provider-usage" ||
     requestPath.startsWith("/admin/provider-usage/") ||
+    requestPath === "/admin/evaluation-key" ||
     requestPath === "/admin/onboarding" ||
     requestPath.startsWith("/admin/onboarding/") ||
     requestPath === "/admin/identity" ||
@@ -4984,6 +4997,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && (requestPath === "/admin/provider-usage" || requestPath === "/admin/provider-usage/connections")) return "adminProviderUsageRead";
   if (verb === "POST" && requestPath === "/admin/provider-usage/sync") return "adminProviderUsageSync";
   if (verb === "POST" && requestPath.startsWith("/admin/provider-usage/")) return "adminProviderUsageWrite";
+  if (verb === "POST" && requestPath === "/admin/evaluation-key") return "adminProviderUsageWrite";
   if (verb === "GET" && requestPath === "/admin/onboarding") return "adminOnboardingRead";
   if (verb === "GET" && requestPath === "/admin/identity") return "adminIdentityRead";
   if (requestPath.startsWith("/admin/onboarding/")) return "adminOnboardingWrite";
