@@ -163,6 +163,7 @@ create table if not exists agent_runtimes (
 create table if not exists policies (
   id uuid primary key default gen_random_uuid(),
   name text not null unique,
+  category text not null default 'General',
   description text not null default '',
   severity text not null default 'medium',
   natural_language_rule text not null,
@@ -172,6 +173,7 @@ create table if not exists policies (
   updated_at timestamptz not null default now()
 );
 
+alter table policies add column if not exists category text not null default 'General';
 alter table policies add column if not exists locked boolean not null default false;
 
 create table if not exists conversation_events (
@@ -215,6 +217,18 @@ create table if not exists prompt_transform_settings (
   config jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now()
 );
+
+create table if not exists plugin_settings (
+  organization_id uuid references organizations(id) on delete cascade,
+  plugin_id text not null,
+  enabled boolean not null default true,
+  config jsonb not null default '{}'::jsonb,
+  ordering_priority integer,
+  updated_at timestamptz not null default now(),
+  primary key (organization_id, plugin_id)
+);
+
+create index if not exists plugin_settings_org_idx on plugin_settings(organization_id, plugin_id);
 
 create table if not exists mcp_servers (
   id uuid primary key default gen_random_uuid(),

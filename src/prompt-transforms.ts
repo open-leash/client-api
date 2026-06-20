@@ -1,4 +1,10 @@
 import OpenAI from "openai";
+import type {
+  PluginDlpInspectionRequest,
+  PluginDlpInspectionResult,
+  PluginPromptCompressionRequest,
+  PluginPromptCompressionResult
+} from "@openleash/shared";
 
 export type CompressionLevel = "light" | "standard" | "maximum";
 export type DlpCategory = "pii" | "phi" | "tokens" | "keys" | "credentials";
@@ -142,6 +148,62 @@ export async function transformPrompt({
   };
 }
 
+export async function compressPromptCapability({
+  prompt,
+  level,
+  conciseResponse,
+  model,
+  apiKey
+}: PluginPromptCompressionRequest & { apiKey?: string }): Promise<PluginPromptCompressionResult> {
+  const config = normalizePromptTransformConfig({
+    compression: {
+      enabled: true,
+      level,
+      conciseResponse: Boolean(conciseResponse),
+      model
+    }
+  });
+  const compressed = await compressPrompt({ prompt, config, apiKey });
+  let finalPrompt = compressed.text;
+  if (config.compression.conciseResponse) {
+    finalPrompt = `${finalPrompt.trim()}\n\nRespond concisely. Be short, direct, and avoid filler.`;
+  }
+  return {
+    prompt: finalPrompt,
+    model: compressed.model,
+    originalLength: prompt.length,
+    compressedLength: finalPrompt.length,
+    ratio: prompt.length > 0 ? finalPrompt.length / prompt.length : 1
+  };
+}
+
+export async function inspectDlpCapability({
+  prompt,
+  action,
+  categories,
+  model,
+  apiKey
+}: PluginDlpInspectionRequest & { apiKey?: string }): Promise<PluginDlpInspectionResult> {
+  const config = normalizePromptTransformConfig({
+    dlp: {
+      enabled: true,
+      action,
+      categories,
+      model
+    }
+  });
+  const checked = await checkDlp({ prompt, config, apiKey });
+  return {
+    prompt: checked.text,
+    blocked: checked.blocked,
+    matched: checked.matched,
+    masked: checked.masked,
+    model: checked.model,
+    categories: checked.categories,
+    findings: checked.findings
+  };
+}
+
 async function compressPrompt({ prompt, config, apiKey }: { prompt: string; config: PromptTransformConfig; apiKey?: string }) {
   if (!apiKey) return { text: heuristicCompress(prompt, config.compression.level), model: "heuristic-compression" };
   try {
@@ -267,9 +329,11 @@ function heuristicDlp(prompt: string, config: PromptTransformConfig) {
   };
   add("pii", /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[EMAIL_MASKED]", "Email address detected.");
   add("pii", /\b\d{3}-\d{2}-\d{4}\b/g, "[SSN_MASKED]", "US SSN-like value detected.");
-  add("tokens", /\b(?:sk|pk|ol|ghp|github_pat)_[A-Za-z0-9_=-]{16,}\b/g, "[TOKEN_MASKED]", "Token-like value detected.");
+  add("tokens", /\b(?:sk|pk|ol|ghp|github_pat)_[A-Za-z0-9_=-]{12,}\b/g, "[TOKEN_MASKED]", "Token-like value detected.");
+  add("tokens", /\b(?:sk|pk)-(?:proj-)?[A-Za-z0-9_-]{8,}\b/g, "[TOKEN_MASKED]", "Provider token-like value detected.");
   add("keys", /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----/g, "[PRIVATE_KEY_MASKED]", "Private key block detected.");
   add("credentials", /\b(password|secret|api[_-]?key)\s*[:=]\s*['"]?[^'"\s]{8,}/gi, (match) => `${match.split(/[:=]/)[0].trim()}=[SECRET_MASKED]`, "Credential assignment detected.");
+  add("credentials", /\b(password|secret|api[_-]?key)\s+(?:is\s+|as\s+)?['"]?[^'"\s]{8,}/gi, (match) => `${match.split(/\s+/).slice(0, 2).join(" ")} [SECRET_MASKED]`, "Credential value detected.");
   add("phi", /\b(patient|diagnosis|medical record|mrn)\b[^\n]{0,120}/gi, "[PHI_MASKED]", "Health-data context detected.");
   const categories = [...new Set(findings.map((item) => item.category))];
   const matched = findings.length > 0;

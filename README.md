@@ -22,7 +22,7 @@
 
 ## ✨ What this app is
 
-`client-api` is the managed API that desktop clients, mobile clients, hooks, and enrollment flows talk to outside pure Local mode.
+`client-api` is the managed API that desktop clients, mobile clients, hooks, and enrollment flows talk to in Private Cloud. OpenLeash Cloud wraps the same surface through `cloud-client-api`.
 
 It evaluates agent events, records audit trails, stores pending approvals, serves mobile state, manages update metadata, and exposes the core API that OpenLeash Cloud wraps for hosted customers.
 
@@ -42,7 +42,6 @@ mobile-client
 
 | Mode | Role |
 | --- | --- |
-| 🖥️ Local mode | Not required. Desktop can evaluate locally/offline. |
 | 🏢 Private Cloud | Customer-hosted managed API. |
 | ☁️ OpenLeash Cloud | Wrapped by `cloud-client-api` for hosted tenancy and cloud controls. |
 

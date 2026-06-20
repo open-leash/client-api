@@ -11,7 +11,7 @@ import {
   OPENLEASH_API_FUNCTION_HEADER,
   OPENLEASH_API_VERSION_HEADER,
   HOOK_AGENT_METADATA,
-  mcpToolCallFromEvent,
+  type AgentKind,
   type ConversationTurn,
   type EvaluationRequest,
   type EvaluationResponse,
@@ -23,20 +23,25 @@ import {
   type MobileDecisionResolveRequest,
   type OpenLeashApiFunction,
   type McpToolCall,
+  type OpenLeashPluginManifest,
+  type PluginCatalogItem,
+  type PluginRunRecord,
   type Policy,
   type PolicyDecision
 } from "@openleash/shared";
 import { z } from "zod";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
-import { evaluatePolicies, summarizeActionPurpose } from "./evaluator.js";
+import { summarizeActionPurpose } from "./evaluator.js";
 import {
   defaultPromptTransformConfig,
   normalizePromptTransformConfig,
   promptTransformsEnabled,
-  transformPrompt,
-  type PromptTransformConfig,
-  type PromptTransformResult
+  type PromptTransformConfig
 } from "./prompt-transforms.js";
+import { firstPartyPluginManifests } from "./plugins/registry.js";
+import { runEvaluationPipeline, runPromptPipeline } from "./plugins/runtime.js";
+import { runSkillScanner } from "./plugins/skill-scanner/index.js";
+import type { PromptPipelineResult } from "./plugins/types.js";
 import {
   EXTERNAL_PROVIDER_IDS,
   externalConversationToEvaluation,
@@ -78,6 +83,11 @@ export type PrepareOpenLeashApiOptions = Pick<StartOpenLeashApiOptions, "app" | 
 
 export const app = express();
 export const apiSurface = apiSurfaceFromEnv();
+const LOCAL_HOOK_AGENT_METADATA: Record<string, { kind: AgentKind | string; displayName: string }> = {
+  ...HOOK_AGENT_METADATA,
+  gemini: { kind: "gemini", displayName: "Google Gemini CLI" },
+  opencode: { kind: "opencode", displayName: "OpenCode" }
+};
 
 app.disable("x-powered-by");
 app.use(cors({
@@ -313,7 +323,7 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
     if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
     const agent = req.params.agent as HookAgentSlug;
     const eventName = req.params.event as HookEventName;
-    if (!HOOK_AGENT_METADATA[agent] || !isHookEventName(eventName)) {
+    if (!LOCAL_HOOK_AGENT_METADATA[agent] || !isHookEventName(eventName)) {
       return res.status(400).json({ error: "unsupported OpenLeash hook target" });
     }
     const request = normalizeHookRequest(agent, eventName, req.body, req.query);
@@ -2236,14 +2246,29 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       riskScore?: number;
       reasons?: Array<{ reason?: string; quote?: string }>;
     };
-    const skillName = String(body.skillName ?? "").trim();
-    const skillPath = String(body.skillPath ?? "").trim();
-    if (!skillName || !skillPath) return res.status(400).json({ error: "skillName and skillPath are required" });
-    const reasons = normalizeSkillReasons(body.reasons);
-    const suspicious = body.status === "suspicious" || reasons.length > 0 || Number(body.riskScore ?? 0) >= 50;
-    const status = suspicious ? "suspicious" : "observed";
+	    const skillName = String(body.skillName ?? "").trim();
+	    const skillPath = String(body.skillPath ?? "").trim();
+	    if (!skillName || !skillPath) return res.status(400).json({ error: "skillName and skillPath are required" });
+	    const runtimePlugins = await pluginSettingsForRuntime(organizationId);
+	    if (runtimePlugins.get("openleash.skill-scanner")?.enabled === false) {
+	      return res.json({ ok: true, skipped: true, pluginId: "openleash.skill-scanner" });
+	    }
+	    const reasons = normalizeSkillReasons(body.reasons);
     const content = typeof body.content === "string" ? body.content.slice(0, 80000) : null;
     const contentPreview = typeof body.contentPreview === "string" ? body.contentPreview.slice(0, 12000) : content?.slice(0, 12000) ?? null;
+    const skillScan = runSkillScanner({
+      agentKind: body.agentKind ?? "unknown",
+      agentName: body.agentName ?? "Local agent",
+      skillName,
+      skillPath,
+      content,
+      contentPreview,
+      status: body.status,
+      riskScore: body.riskScore,
+      reasons
+    });
+    const suspicious = skillScan.status === "suspicious";
+    const status = skillScan.status;
     const contentHash = body.contentHash ?? crypto.createHash("sha256").update(content ?? skillPath).digest("hex");
     const purposeSummary = await skillPurposeSummary({
       provided: body.purposeSummary,
@@ -2285,8 +2310,8 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           skillName,
           skillPath,
           status,
-          Math.max(0, Math.min(100, Number(body.riskScore ?? (suspicious ? 70 : 0)))),
-          JSON.stringify(reasons),
+          skillScan.riskScore,
+          JSON.stringify(skillScan.reasons),
           contentHash,
           content,
           contentPreview,
@@ -2321,7 +2346,15 @@ app.post("/v1/skills/observations", async (req, res, next) => {
             `skill:${skillPath}`,
             body.projectPath ?? null,
             `Skill ${skillName} changed at ${skillPath}`,
-            JSON.stringify({ openleashEventType: "skill-risk", skillName, skillPath, reasons, contentPreview: contentPreview ?? "", purposeSummary })
+            JSON.stringify({
+              openleashEventType: "skill-risk",
+              skillName,
+              skillPath,
+              reasons: skillScan.reasons,
+              contentPreview: contentPreview ?? "",
+              purposeSummary,
+              openleashPluginRuns: [skillScan.run]
+            })
           ]
         );
         const evaluation = await client.query(
@@ -2341,7 +2374,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           [
             evaluationId,
             "A newly added or edited agent skill may contain unsafe instructions or executable behavior.",
-            JSON.stringify(reasons.map((reason) => reason.quote ? `${reason.reason}: ${reason.quote}` : reason.reason)),
+            JSON.stringify(skillScan.reasons.map((reason) => reason.quote ? `${reason.reason}: ${reason.quote}` : reason.reason)),
             "Delete this skill or approve it?"
           ]
         );
@@ -2363,8 +2396,8 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           skillName,
           skillPath,
           status,
-          Math.max(0, Math.min(100, Number(body.riskScore ?? (suspicious ? 70 : 0)))),
-          JSON.stringify(reasons),
+          skillScan.riskScore,
+          JSON.stringify(skillScan.reasons),
           contentPreview,
           purposeSummary
         ]
@@ -2650,6 +2683,54 @@ app.post("/admin/policies", async (req, res, next) => {
   }
 });
 
+app.get("/admin/plugins", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    res.json(await pluginCatalogForOrganization(organizationId));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/v1/plugins", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    res.json(await pluginCatalogForOrganization(session.organization.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/plugins/:pluginId/settings", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const manifest = firstPartyPluginManifests.find((plugin) => plugin.id === req.params.pluginId);
+    if (!manifest) return res.status(404).json({ error: "plugin not found" });
+    const enabled = typeof req.body.enabled === "boolean" ? req.body.enabled : true;
+    const config = req.body.config && typeof req.body.config === "object" && !Array.isArray(req.body.config)
+      ? req.body.config
+      : manifest.defaultConfig ?? {};
+    const orderingPriority = Number.isFinite(Number(req.body.orderingPriority))
+      ? Number(req.body.orderingPriority)
+      : manifest.ordering?.priority ?? null;
+    const result = await pool.query(
+      `insert into plugin_settings (organization_id, plugin_id, enabled, config, ordering_priority, updated_at)
+       values ($1, $2, $3, $4::jsonb, $5, now())
+       on conflict (organization_id, plugin_id) do update set
+         enabled = excluded.enabled,
+         config = excluded.config,
+         ordering_priority = excluded.ordering_priority,
+         updated_at = now()
+       returning plugin_id, enabled, config, ordering_priority as "orderingPriority", updated_at`,
+      [organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority]
+    );
+    res.json({ pluginId: manifest.id, settings: result.rows[0] });
+  } catch (error) {
+    next(error);
+  }
+});
+
 type ApiUser = { id: string; email?: string; display_name?: string; organization_id?: string | null };
 
 async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventName, request: EvaluationRequest, user: ApiUser) {
@@ -2659,10 +2740,11 @@ async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventNa
   if (!request.event.prompt || !promptTransformsEnabled(config)) {
     return nativeHookDecision(agent, eventName, { decision: "allow", decisionId: "", summary: "OpenLeash logged this prompt intent.", results: [] });
   }
-  const result = await transformPrompt({
-    prompt: request.event.prompt,
+  const result = await runPromptPipeline({
+    request,
     config,
-    apiKey: process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY
+    apiKey: process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY,
+    plugins: await pluginSettingsForRuntime(organizationId)
   });
   await recordPromptTransformResult(conversationEventId, user.id, request.event.prompt, result);
   if (result.blocked) {
@@ -2681,7 +2763,96 @@ async function readPromptTransformConfig(organizationId: string): Promise<Prompt
     "select config from prompt_transform_settings where organization_id = $1",
     [organizationId]
   );
-  return normalizePromptTransformConfig(row.rows[0]?.config ?? defaultPromptTransformConfig);
+  const config = normalizePromptTransformConfig(row.rows[0]?.config ?? defaultPromptTransformConfig);
+  const pluginSettings = await readPluginSettings(organizationId);
+  const compression = pluginSettings.get("openleash.prompt-compression");
+  if (compression) {
+    config.compression = normalizePromptTransformConfig({
+      compression: {
+        ...config.compression,
+        ...(compression.config ?? {}),
+        enabled: compression.enabled
+      }
+    }).compression;
+  }
+  const dlp = pluginSettings.get("openleash.dlp");
+  if (dlp) {
+    config.dlp = normalizePromptTransformConfig({
+      dlp: {
+        ...config.dlp,
+        ...(dlp.config ?? {}),
+        enabled: dlp.enabled
+      }
+    }).dlp;
+  }
+  return config;
+}
+
+type PluginSettingRecord = {
+  pluginId: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  orderingPriority: number | null;
+  updatedAt?: string;
+};
+
+async function pluginCatalogForOrganization(organizationId: string): Promise<{ plugins: PluginCatalogItem[] }> {
+  const settings = await readPluginSettings(organizationId);
+  return {
+    plugins: firstPartyPluginManifests.map((manifest) => pluginCatalogItem(manifest, settings.get(manifest.id)))
+  };
+}
+
+function pluginCatalogItem(manifest: OpenLeashPluginManifest, settings?: PluginSettingRecord): PluginCatalogItem {
+  return {
+    ...manifest,
+    settings: settings ?? {
+      enabled: true,
+      config: manifest.defaultConfig ?? {},
+      orderingPriority: manifest.ordering?.priority ?? null
+    }
+  };
+}
+
+async function readPluginSettings(organizationId: string) {
+  const rows = await pool.query<{
+    plugin_id: string;
+    enabled: boolean;
+    config: Record<string, unknown>;
+    ordering_priority: number | null;
+    updated_at: string;
+  }>(
+    `select plugin_id, enabled, config, ordering_priority, updated_at
+     from plugin_settings
+     where organization_id = $1`,
+    [organizationId]
+  );
+  return new Map<string, PluginSettingRecord>(rows.rows.map((row) => [
+    row.plugin_id,
+    {
+      pluginId: row.plugin_id,
+      enabled: row.enabled,
+      config: row.config ?? {},
+      orderingPriority: row.ordering_priority,
+      updatedAt: row.updated_at
+    }
+  ]));
+}
+
+async function pluginSettingsForRuntime(organizationId: string) {
+  const settings = await readPluginSettings(organizationId);
+  return new Map(firstPartyPluginManifests.map((manifest) => {
+    const stored = settings.get(manifest.id);
+    return [
+      manifest.id,
+      {
+        enabled: stored?.enabled ?? true,
+        config: stored?.config ?? manifest.defaultConfig ?? {},
+        orderingPriority: stored?.orderingPriority ?? manifest.ordering?.priority ?? null,
+        updatedAt: stored?.updatedAt
+      }
+    ];
+  }));
 }
 
 async function organizationIdForAdminRequest(req: express.Request) {
@@ -2693,7 +2864,7 @@ async function organizationIdForAdminRequest(req: express.Request) {
   return (await ensureDefaultOrganization()).id;
 }
 
-async function recordPromptTransformResult(conversationEventId: string, userId: string, originalPrompt: string, result: PromptTransformResult) {
+async function recordPromptTransformResult(conversationEventId: string, userId: string, originalPrompt: string, result: PromptPipelineResult) {
   await pool.query(
     `update conversation_events
      set payload = payload || $2::jsonb
@@ -2705,13 +2876,24 @@ async function recordPromptTransformResult(conversationEventId: string, userId: 
         blocked: result.blocked,
         compression: result.compression,
         dlp: result.dlp
-      }
+      },
+      openleashPluginRuns: result.runs
     })]
   );
   await pool.query(
     `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
      values ($1, $2, $3, $4, null, $5)`,
     [conversationEventId, userId, result.blocked ? "deny" : "allow", result.summary, result.model]
+  );
+}
+
+async function recordPluginRuns(conversationEventId: string, runs: PluginRunRecord[]) {
+  if (runs.length === 0) return;
+  await pool.query(
+    `update conversation_events
+     set payload = payload || $2::jsonb
+     where id = $1`,
+    [conversationEventId, JSON.stringify({ openleashPluginRuns: runs })]
   );
 }
 
@@ -2733,7 +2915,9 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
      from policies where enabled = true order by created_at asc`
   );
   const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
-  const { results: evaluatedResults, model } = await evaluatePolicies(request, policies.rows, tenantModelKey);
+  const pipeline = await runEvaluationPipeline({ request, policies: policies.rows, tenantModelKey, plugins: await pluginSettingsForRuntime(organizationId) });
+  await recordPluginRuns(conversationEventId, pipeline.runs);
+  const { results: evaluatedResults, model } = pipeline;
   const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, evaluatedResults);
   const results = promptOnlyDeferred ? deferPromptOnlyPolicyResults(evaluatedResults) : evaluatedResults;
   const decision = results.some((r) => r.status === "failed" || r.status === "needs_question")
@@ -2762,13 +2946,14 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     [conversationEventId, user.id, decision, summary, question ?? null, model]
   );
   for (const result of results) {
+    const policyId = resolvePolicyResultPolicyId(result, policies.rows);
     await pool.query(
       `insert into policy_results
        (evaluation_id, policy_id, policy_name, status, severity, explanation, evidence, question)
        values ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         evaluation.rows[0].id,
-        result.policyId,
+        policyId,
         result.policyName,
         result.status,
         result.severity,
@@ -2779,7 +2964,7 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     );
   }
   await recordMcpToolCall({
-    call: mcpToolCallFromEvent(request.event),
+    call: pipeline.mcpCall,
     organizationId,
     conversationEventId,
     evaluationId: evaluation.rows[0].id,
@@ -2803,6 +2988,13 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     });
   }
   return { decision, decisionId: evaluation.rows[0].id, summary, question, results };
+}
+
+function resolvePolicyResultPolicyId(result: PolicyDecision, policies: Policy[]) {
+  const byId = policies.find((policy) => policy.id === result.policyId);
+  if (byId) return byId.id;
+  const byName = policies.find((policy) => policy.name === result.policyName);
+  return byName?.id ?? null;
 }
 
 async function tenantModelKeyForEvaluation(organizationId: string) {
@@ -4750,8 +4942,8 @@ function normalizeHookRequest(
   raw: any,
   query: express.Request["query"]
 ): EvaluationRequest {
-  const metadata = HOOK_AGENT_METADATA[agent];
-  const agentKind = metadata.kind;
+  const metadata = LOCAL_HOOK_AGENT_METADATA[agent];
+  const agentKind = metadata.kind as AgentKind;
   const sessionId = firstString(raw?.session_id, raw?.sessionId, raw?.conversation_id, raw?.conversationId, raw?.thread_id, raw?.threadId, raw?.chat_id, raw?.chatId, raw?.run_id, raw?.runId) ?? stableHookSessionId(agent, raw);
   const toolName = firstString(raw?.tool_name, raw?.toolName, raw?.tool?.name, raw?.function?.name, raw?.command?.name);
   const toolInput = firstDefined(raw?.tool_input, raw?.toolInput, raw?.tool?.input, raw?.input, raw?.arguments, raw?.args, raw?.params, raw?.command?.args);
@@ -4791,6 +4983,13 @@ function normalizeHookPrompt(raw: any) {
     raw?.message,
     raw?.input_text,
     raw?.inputText,
+    raw?.prompt_response,
+    raw?.promptResponse,
+    raw?.agent_response,
+    raw?.agentResponse,
+    raw?.response,
+    raw?.output_text,
+    raw?.outputText,
     raw?.body,
     raw?.text,
     raw?.context?.content,
@@ -4913,6 +5112,8 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/admin/mcp-servers" ||
     /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/skills" ||
+    requestPath === "/admin/plugins" ||
+    requestPath.startsWith("/admin/plugins/") ||
     requestPath === "/admin/logs" ||
     /^\/admin\/logs\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/triggers" ||
@@ -4956,6 +5157,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath) ||
     requestPath === "/v1/desktop/enroll" ||
     requestPath === "/v1/desktop/agents" ||
+    requestPath === "/v1/plugins" ||
     requestPath === "/v1/skills/observations" ||
     /^\/v1\/decisions\/[^/]+$/.test(requestPath) ||
     /^\/admin\/decisions\/[^/]+\/resolve$/.test(requestPath) ||
@@ -4977,6 +5179,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && requestPath === "/v1/enroll") return "tenantEnroll";
   if (verb === "POST" && requestPath === "/v1/desktop/enroll") return "desktopEnroll";
   if (verb === "POST" && requestPath === "/v1/desktop/agents") return "desktopEnroll";
+  if (verb === "GET" && requestPath === "/v1/plugins") return "tenantPluginsRead";
   if (verb === "POST" && requestPath === "/v1/evaluate") return "tenantEvaluate";
   if (verb === "POST" && /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath)) return "tenantHookEvaluate";
   if (verb === "POST" && requestPath === "/v1/skills/observations") return "tenantSkillObservation";
@@ -4987,6 +5190,8 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && requestPath === "/admin/mcp-servers") return "adminMcpServers";
   if (verb === "GET" && /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath)) return "adminMcpServerDetail";
   if (verb === "GET" && requestPath === "/admin/skills") return "adminSkills";
+  if (verb === "GET" && requestPath === "/admin/plugins") return "adminPluginsRead";
+  if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/settings$/.test(requestPath)) return "adminPluginsWrite";
   if (verb === "GET" && requestPath === "/admin/logs") return "adminLogs";
   if (verb === "GET" && /^\/admin\/logs\/[^/]+$/.test(requestPath)) return "adminLogDetail";
   if (verb === "GET" && requestPath === "/admin/triggers") return "adminTriggers";
