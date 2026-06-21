@@ -73,6 +73,83 @@ const recent = await capabilities.storage.list({ keyPrefix: "sessions/", limit: 
 
 If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, or other approved services.
 
+## Build A Plugin
+
+Start from the manifest, then write one handler per stage. Keep the plugin understandable enough that someone can review its permissions without reading the whole implementation.
+
+1. Pick the narrowest stage.
+2. Declare only the permissions the plugin needs.
+3. Expose settings through `configSchema` and `defaultConfig`.
+4. Use runtime capabilities for model calls, prompt transforms, DLP, storage, notifications, and audit.
+5. Return a typed plugin run/result. Do not write directly to OpenLeash product tables.
+
+Minimal manifest:
+
+```ts
+export const manifest = {
+  id: "acme.prompt-labeler",
+  name: "Prompt Labeler",
+  version: "1.0.0",
+  publisher: "acme",
+  runtime: "node",
+  entrypoint: "src/index.ts",
+  stages: ["prompt.beforeSubmit"],
+  permissions: ["event:read", "prompt:read", "audit:write", "storage:write"],
+  effects: ["observe"],
+  ordering: {
+    priority: 250,
+    after: ["openleash.dlp"]
+  },
+  configSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      enabled: { type: "boolean" },
+      label: { type: "string" }
+    }
+  },
+  defaultConfig: {
+    enabled: true,
+    label: "reviewed"
+  }
+};
+```
+
+Minimal handler:
+
+```ts
+export async function run(input, capabilities) {
+  if (!input.config.enabled) {
+    return {
+      status: "skipped",
+      summary: "Prompt Labeler is disabled."
+    };
+  }
+
+  await capabilities.storage.set({
+    scope: { sessionId: input.event.sessionId },
+    key: "labels/latest",
+    value: {
+      label: input.config.label,
+      at: Date.now()
+    },
+    ttlSeconds: 24 * 60 * 60
+  });
+
+  return {
+    status: "passed",
+    summary: "Prompt labeled.",
+    findings: [{
+      title: "Prompt label",
+      severity: "info",
+      summary: input.config.label
+    }]
+  };
+}
+```
+
+External examples live in `open-leash/openleash-plugins`. The first-party plugin repos mirror the preinstalled plugins and are intended to be readable reference implementations.
+
 ## Plugin Storage
 
 Plugins should not create their own database or import OpenLeash database modules. OpenLeash owns tenancy, migrations, backup, encryption policy, and public/private cloud portability.

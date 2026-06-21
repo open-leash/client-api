@@ -52,10 +52,19 @@ mobile-client
 - Receive normalized agent events from `desktop-client`
 - Evaluate actions against policy and model providers
 - Store audit, evaluations, MCP calls, skills, triggers, and pending approvals
+- Run the ordered OpenLeash plugin pipeline for prompts, tools, agent responses, startup, sessions, MCP inventory, and skill changes
 - Serve mobile approval and account state
 - Enroll managed endpoints with deployment tokens
 - Apply Postgres migrations safely through `schema_migrations`
 - Provide extension points for hosted/private wrappers
+
+---
+
+## 🔌 Plugin architecture
+
+Core protections are implemented as pipeline plugins. Each plugin declares a manifest with metadata, stages, permissions, settings, effects, and ordering. Implementations use stable runtime capabilities instead of importing OpenLeash internals.
+
+Developer docs live in [`src/plugins/README.md`](src/plugins/README.md). Public examples live in [`open-leash/openleash-plugins`](https://github.com/open-leash/openleash-plugins).
 
 ---
 
