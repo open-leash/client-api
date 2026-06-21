@@ -52,6 +52,7 @@ Permissions are declarative and should match what the implementation actually ne
 - `decision:write`
 - `model:invoke`
 - `filesystem:read` / `filesystem:write`
+- `storage:read` / `storage:write`
 - `audit:write`
 - `notification:send`
 
@@ -66,9 +67,63 @@ Instead, plugin code receives stable capabilities from the runtime:
 ```ts
 await capabilities.prompt.compress({ prompt, level: "standard" });
 await capabilities.dlp.inspect({ prompt, action: "mask", categories: ["pii"] });
+await capabilities.storage.set({ key: "last-risk", value: { score: 82 } });
 ```
 
-If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, or other approved services.
+If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, or other approved services.
+
+## Plugin Storage
+
+Plugins should not create their own database or import OpenLeash database modules. OpenLeash owns tenancy, migrations, backup, encryption policy, and public/private cloud portability.
+
+Use `capabilities.storage` for plugin-owned state. Storage is scoped by:
+
+```text
+organization_id + plugin_id + scope + key
+```
+
+The runtime supplies `organization_id` and `plugin_id`; plugin code supplies only the logical scope and key.
+
+Example: a prompt evaluator should not show the same notification twice within five hours for the same session and conversation:
+
+```ts
+const scope = {
+  sessionId: input.request.event.sessionId,
+  conversationId: input.request.event.raw?.conversation_id
+};
+
+const previous = await capabilities.storage.get({
+  scope,
+  key: "risky-prompt-notification"
+});
+
+if (!previous) {
+  await capabilities.storage.set({
+    scope,
+    key: "risky-prompt-notification",
+    value: {
+      title: "Risky prompt needs review",
+      reason: "Prompt asked the agent to expose customer data."
+    },
+    ttlSeconds: 5 * 60 * 60
+  });
+
+  return pluginRun({
+    pluginId: manifest.id,
+    stage: "prompt.beforeSubmit",
+    status: "needs_question",
+    summary: "Prompt evaluator found a risk that needs review.",
+    startedAt,
+    findings: [{
+      title: "Risky prompt",
+      severity: "high",
+      summary: "Prompt asked the agent to expose customer data."
+    }]
+  });
+}
+```
+
+That returned finding/`needs_question` is what OpenLeash core turns into the actual approval flow. The plugin does not directly pop a desktop window; OpenLeash core owns desktop, mobile, dashboard, audit, and native hook response delivery.
 
 ## Stages
 

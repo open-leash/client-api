@@ -19,9 +19,14 @@ export async function runPromptPipeline(input: PromptPipelineInput): Promise<Pro
   const models = new Set<string>();
   let compression: PromptPipelineResult["compression"];
   let dlp: PromptPipelineResult["dlp"];
-  const capabilities = createPluginCapabilities({ apiKey: input.apiKey });
 
   for (const plugin of enabledPluginsForStage("prompt.beforeSubmit", input.plugins)) {
+    const capabilities = createPluginCapabilities({
+      apiKey: input.apiKey,
+      organizationId: input.organizationId,
+      pluginId: plugin.id,
+      request: input.request
+    });
     if (plugin.id === "openleash.prompt-compression") {
       const step = await runPromptCompression({
         prompt: current,
@@ -77,10 +82,15 @@ export async function runEvaluationPipeline(input: EvaluationPipelineInput): Pro
   let model = "none";
   const runs: EvaluationPipelineResult["runs"] = [];
   let mcpCall: EvaluationPipelineResult["mcpCall"];
-  const capabilities = createPluginCapabilities({ tenantModelKey: input.tenantModelKey });
   const stage = stageForHookEvent(input.request.event.eventName);
 
   for (const plugin of enabledPluginsForStage(stage, input.plugins)) {
+    const capabilities = createPluginCapabilities({
+      tenantModelKey: input.tenantModelKey,
+      organizationId: input.organizationId,
+      pluginId: plugin.id,
+      request: input.request
+    });
     if (plugin.id === "openleash.security-evaluator") {
       const security = await runSecurityEvaluator(input, capabilities);
       results = security.results;

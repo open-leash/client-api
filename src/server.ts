@@ -2743,6 +2743,7 @@ async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventNa
   const result = await runPromptPipeline({
     request,
     config,
+    organizationId,
     apiKey: process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY,
     plugins: await pluginSettingsForRuntime(organizationId)
   });
@@ -2915,7 +2916,7 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
      from policies where enabled = true order by created_at asc`
   );
   const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
-  const pipeline = await runEvaluationPipeline({ request, policies: policies.rows, tenantModelKey, plugins: await pluginSettingsForRuntime(organizationId) });
+  const pipeline = await runEvaluationPipeline({ request, organizationId, policies: policies.rows, tenantModelKey, plugins: await pluginSettingsForRuntime(organizationId) });
   await recordPluginRuns(conversationEventId, pipeline.runs);
   const { results: evaluatedResults, model } = pipeline;
   const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, evaluatedResults);

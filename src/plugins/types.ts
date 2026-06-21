@@ -25,6 +25,7 @@ export type PluginExecutionContext = {
 export type PromptPipelineInput = {
   request: EvaluationRequest;
   config: PluginPromptPipelineConfig;
+  organizationId?: string;
   apiKey?: string;
   plugins?: Map<string, PluginSettingState>;
 };
@@ -53,6 +54,7 @@ export type PromptPipelineResult = {
 
 export type EvaluationPipelineInput = {
   request: EvaluationRequest;
+  organizationId?: string;
   policies: Policy[];
   tenantModelKey?: TenantModelKey;
   plugins?: Map<string, PluginSettingState>;
