@@ -8,7 +8,7 @@ export const promptCompressionManifest: OpenLeashPluginManifest = {
   publisher: "openleash",
   runtime: "openleash-core",
   entrypoint: "plugins/prompt-compression",
-  stages: ["prompt.beforeSubmit"],
+  events: ["prompt.beforeSubmit"],
   permissions: ["event:read", "prompt:read", "prompt:write", "model:invoke", "audit:write"],
   effects: ["transform", "observe"],
   ordering: {

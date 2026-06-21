@@ -8,7 +8,7 @@ export const dlpManifest: OpenLeashPluginManifest = {
   publisher: "openleash",
   runtime: "openleash-core",
   entrypoint: "plugins/dlp",
-  stages: ["prompt.beforeSubmit"],
+  events: ["prompt.beforeSubmit"],
   permissions: ["event:read", "prompt:read", "prompt:write", "decision:write", "model:invoke", "audit:write"],
   effects: ["transform", "deny", "observe"],
   ordering: {

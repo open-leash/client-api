@@ -21,7 +21,7 @@ export async function runPromptCompression({
       result: undefined,
       run: pluginRun({
         pluginId: manifest.id,
-        stage: "prompt.beforeSubmit",
+        event: "prompt.beforeSubmit",
         status: "skipped",
         summary: "Prompt compression is disabled.",
         startedAt
@@ -55,7 +55,7 @@ export async function runPromptCompression({
     result,
     run: pluginRun({
       pluginId: manifest.id,
-      stage: "prompt.beforeSubmit",
+      event: "prompt.beforeSubmit",
       status: compressed.prompt !== prompt ? "modified" : "passed",
       summary,
       startedAt,

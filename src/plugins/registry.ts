@@ -1,9 +1,9 @@
-import { FIRST_PARTY_PLUGIN_MANIFESTS, type OpenLeashPluginManifest, type PipelineStage } from "@openleash/shared";
+import { FIRST_PARTY_PLUGIN_MANIFESTS, type OpenLeashPluginManifest, type PipelineEvent } from "@openleash/shared";
 
 export const firstPartyPluginManifests = orderPlugins([...FIRST_PARTY_PLUGIN_MANIFESTS]);
 
-export function pluginsForStage(stage: PipelineStage) {
-  return firstPartyPluginManifests.filter((plugin) => plugin.stages.includes(stage));
+export function pluginsForEvent(event: PipelineEvent) {
+  return firstPartyPluginManifests.filter((plugin) => plugin.events.includes(event));
 }
 
 export function orderPlugins(plugins: OpenLeashPluginManifest[]) {

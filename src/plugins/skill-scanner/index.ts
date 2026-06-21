@@ -28,7 +28,7 @@ export function runSkillScanner(input: SkillObservationInput): SkillObservationR
     findings,
     run: pluginRun({
       pluginId: manifest.id,
-      stage: "skill.changed",
+      event: "skill.changed",
       status: suspicious ? "needs_question" : "passed",
       summary: suspicious
         ? "Skill scanner found behavior that needs review."

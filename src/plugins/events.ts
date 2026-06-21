@@ -1,6 +1,6 @@
-import type { HookEventName, PipelineStage } from "@openleash/shared";
+import type { HookEventName, PipelineEvent } from "@openleash/shared";
 
-export function stageForHookEvent(eventName: HookEventName): PipelineStage {
+export function eventForHookEvent(eventName: HookEventName): PipelineEvent {
   switch (eventName) {
     case "SessionStart":
       return "session.started";

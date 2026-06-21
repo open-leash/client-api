@@ -8,7 +8,7 @@ export const mcpScannerManifest: OpenLeashPluginManifest = {
   publisher: "openleash",
   runtime: "openleash-core",
   entrypoint: "plugins/mcp-scanner",
-  stages: ["tool.beforeUse", "tool.afterUse"],
+  events: ["tool.beforeUse", "tool.afterUse"],
   permissions: ["event:read", "tool:read", "audit:write"],
   effects: ["observe", "inventory"],
   ordering: {

@@ -11,7 +11,7 @@ export function runMcpScanner(input: EvaluationPipelineInput) {
     call,
     run: pluginRun({
       pluginId: manifest.id,
-      stage: input.request.event.eventName === "PostToolUse" ? "tool.afterUse" : "tool.beforeUse",
+      event: input.request.event.eventName === "PostToolUse" ? "tool.afterUse" : "tool.beforeUse",
       status: call ? "passed" : "skipped",
       summary: call
         ? `Observed MCP tool ${call.fullToolName}.`

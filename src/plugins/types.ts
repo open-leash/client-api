@@ -2,7 +2,7 @@ import type {
   EvaluationRequest,
   McpToolCall,
   OpenLeashPluginManifest,
-  PipelineStage,
+  PipelineEvent,
   PluginCapabilities,
   PluginDlpAction,
   PluginDlpCategory,
@@ -16,7 +16,7 @@ import type {
 import type { TenantModelKey } from "../model-keys.js";
 
 export type PluginExecutionContext = {
-  stage: PipelineStage;
+  event: PipelineEvent;
   request: EvaluationRequest;
   capabilities: PluginCapabilities;
   startedAt: number;
@@ -93,7 +93,7 @@ export type OpenLeashCorePlugin = {
 
 export function pluginRun({
   pluginId,
-  stage,
+  event,
   status,
   summary,
   startedAt,
@@ -101,7 +101,7 @@ export function pluginRun({
   metadata
 }: {
   pluginId: string;
-  stage: PipelineStage;
+  event: PipelineEvent;
   status: PluginRunRecord["status"];
   summary: string;
   startedAt: number;
@@ -110,7 +110,7 @@ export function pluginRun({
 }): PluginRunRecord {
   return {
     pluginId,
-    stage,
+    event,
     status,
     summary,
     durationMs: Math.max(0, Date.now() - startedAt),

@@ -62,9 +62,9 @@ mobile-client
 
 ## 🔌 Plugin architecture
 
-Core protections are implemented as pipeline plugins. Each plugin declares a manifest with metadata, stages, permissions, settings, effects, and ordering. Implementations use stable runtime capabilities instead of importing OpenLeash internals.
+Core protections are implemented as pipeline plugins. Each plugin declares a manifest with metadata, events, permissions, settings, effects, and ordering. Implementations use stable runtime capabilities instead of importing OpenLeash internals.
 
-Developer docs live in [`src/plugins/README.md`](src/plugins/README.md). Public examples live in [`open-leash/openleash-plugins`](https://github.com/open-leash/openleash-plugins).
+Developer docs live in [`src/plugins/README.md`](src/plugins/README.md). Public examples live in [`open-leash/plugins`](https://github.com/open-leash/plugins).
 
 ---
 

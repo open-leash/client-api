@@ -1,6 +1,6 @@
 import type { PluginCapabilities } from "@openleash/shared";
 import { securityEvaluatorManifest as manifest } from "./manifest.js";
-import { stageForHookEvent } from "../stages.js";
+import { eventForHookEvent } from "../events.js";
 import { pluginRun, type EvaluationPipelineInput } from "../types.js";
 
 export { manifest };
@@ -17,7 +17,7 @@ export async function runSecurityEvaluator(input: EvaluationPipelineInput, capab
     model,
     run: pluginRun({
       pluginId: manifest.id,
-      stage: stageForHookEvent(input.request.event.eventName),
+      event: eventForHookEvent(input.request.event.eventName),
       status: failed.some((result) => result.status === "failed") ? "blocked" : failed.length ? "needs_question" : "passed",
       summary: failed.length
         ? `${failed.length} policy result${failed.length === 1 ? "" : "s"} need review.`

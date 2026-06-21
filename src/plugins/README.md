@@ -2,7 +2,7 @@
 
 OpenLeash features run as ordered pipeline plugins. A plugin is a folder with:
 
-- `manifest.ts` - metadata, stages, permissions, effects, ordering, and config schema.
+- `manifest.ts` - metadata, events, permissions, effects, ordering, and config schema.
 - `index.ts` - the implementation used by the runtime.
 
 Current first-party plugins:
@@ -75,9 +75,9 @@ If a plugin needs a new privileged operation, add a narrow capability to the sha
 
 ## Build A Plugin
 
-Start from the manifest, then write one handler per stage. Keep the plugin understandable enough that someone can review its permissions without reading the whole implementation.
+Start from the manifest, then write one handler per event. Keep the plugin understandable enough that someone can review its permissions without reading the whole implementation.
 
-1. Pick the narrowest stage.
+1. Pick the narrowest event.
 2. Declare only the permissions the plugin needs.
 3. Expose settings through `configSchema` and `defaultConfig`.
 4. Use runtime capabilities for model calls, prompt transforms, DLP, storage, notifications, and audit.
@@ -93,7 +93,7 @@ export const manifest = {
   publisher: "acme",
   runtime: "node",
   entrypoint: "src/index.ts",
-  stages: ["prompt.beforeSubmit"],
+  events: ["prompt.beforeSubmit"],
   permissions: ["event:read", "prompt:read", "audit:write", "storage:write"],
   effects: ["observe"],
   ordering: {
@@ -148,7 +148,7 @@ export async function run(input, capabilities) {
 }
 ```
 
-External examples live in `open-leash/openleash-plugins`. The first-party plugin repos mirror the preinstalled plugins and are intended to be readable reference implementations.
+External examples live in `open-leash/plugins`. The first-party plugin repos mirror the preinstalled plugins and are intended to be readable reference implementations.
 
 ## Plugin Storage
 
@@ -219,7 +219,7 @@ if (!previous) {
 
   return pluginRun({
     pluginId: manifest.id,
-    stage: "prompt.beforeSubmit",
+    event: "prompt.beforeSubmit",
     status: "needs_question",
     summary: "Prompt evaluator found a risk that needs review.",
     startedAt,
@@ -234,9 +234,9 @@ if (!previous) {
 
 That returned finding/`needs_question` is what OpenLeash core turns into the actual approval flow. The plugin does not directly pop a desktop window; OpenLeash core owns desktop, mobile, dashboard, audit, and native hook response delivery.
 
-## Stages
+## Events
 
-Use the narrowest stage possible:
+Use the narrowest event possible:
 
 - `openleash.startup`
 - `agent.detected`
@@ -248,7 +248,7 @@ Use the narrowest stage possible:
 - `session.started`
 - `session.ended`
 
-`agent.response` is the post-answer stage. Claude-style `Stop`, `Notification`, and subagent completion hooks map here because they represent agent output or completion after work has happened.
+`agent.response` is the post-answer event. Claude-style `Stop`, `Notification`, and subagent completion hooks map here because they represent agent output or completion after work has happened.
 
 ## Result Shape
 

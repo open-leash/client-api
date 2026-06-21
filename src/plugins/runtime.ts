@@ -2,16 +2,16 @@ import { createPluginCapabilities } from "./capabilities.js";
 import { runDlp } from "./dlp/index.js";
 import { runMcpScanner } from "./mcp-scanner/index.js";
 import { runPromptCompression } from "./prompt-compression/index.js";
-import { pluginsForStage, orderPlugins } from "./registry.js";
+import { pluginsForEvent, orderPlugins } from "./registry.js";
 import { runSecurityEvaluator } from "./security-evaluator/index.js";
-import { stageForHookEvent } from "./stages.js";
+import { eventForHookEvent } from "./events.js";
 import {
   type EvaluationPipelineInput,
   type EvaluationPipelineResult,
   type PromptPipelineInput,
   type PromptPipelineResult
 } from "./types.js";
-import type { OpenLeashPluginManifest, PipelineStage, PluginSettingState } from "@openleash/shared";
+import type { OpenLeashPluginManifest, PipelineEvent, PluginSettingState } from "@openleash/shared";
 
 export async function runPromptPipeline(input: PromptPipelineInput): Promise<PromptPipelineResult> {
   let current = input.request.event.prompt ?? "";
@@ -20,7 +20,7 @@ export async function runPromptPipeline(input: PromptPipelineInput): Promise<Pro
   let compression: PromptPipelineResult["compression"];
   let dlp: PromptPipelineResult["dlp"];
 
-  for (const plugin of enabledPluginsForStage("prompt.beforeSubmit", input.plugins)) {
+  for (const plugin of enabledPluginsForEvent("prompt.beforeSubmit", input.plugins)) {
     const capabilities = createPluginCapabilities({
       apiKey: input.apiKey,
       organizationId: input.organizationId,
@@ -82,9 +82,9 @@ export async function runEvaluationPipeline(input: EvaluationPipelineInput): Pro
   let model = "none";
   const runs: EvaluationPipelineResult["runs"] = [];
   let mcpCall: EvaluationPipelineResult["mcpCall"];
-  const stage = stageForHookEvent(input.request.event.eventName);
+  const event = eventForHookEvent(input.request.event.eventName);
 
-  for (const plugin of enabledPluginsForStage(stage, input.plugins)) {
+  for (const plugin of enabledPluginsForEvent(event, input.plugins)) {
     const capabilities = createPluginCapabilities({
       tenantModelKey: input.tenantModelKey,
       organizationId: input.organizationId,
@@ -114,8 +114,8 @@ export async function runEvaluationPipeline(input: EvaluationPipelineInput): Pro
   };
 }
 
-function enabledPluginsForStage(stage: PipelineStage, settings?: Map<string, PluginSettingState>) {
-  const plugins = pluginsForStage(stage)
+function enabledPluginsForEvent(event: PipelineEvent, settings?: Map<string, PluginSettingState>) {
+  const plugins = pluginsForEvent(event)
     .filter((plugin) => settings?.get(plugin.id)?.enabled ?? true)
     .map((plugin) => {
       const priority = settings?.get(plugin.id)?.orderingPriority;

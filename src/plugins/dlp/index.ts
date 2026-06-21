@@ -21,7 +21,7 @@ export async function runDlp({
       result: undefined,
       run: pluginRun({
         pluginId: manifest.id,
-        stage: "prompt.beforeSubmit",
+        event: "prompt.beforeSubmit",
         status: "skipped",
         summary: "DLP is disabled.",
         startedAt
@@ -57,7 +57,7 @@ export async function runDlp({
     result,
     run: pluginRun({
       pluginId: manifest.id,
-      stage: "prompt.beforeSubmit",
+      event: "prompt.beforeSubmit",
       status: inspected.blocked ? "blocked" : inspected.masked ? "modified" : "passed",
       summary,
       startedAt,
