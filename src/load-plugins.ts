@@ -79,6 +79,7 @@ function toMarketplaceListing(item: PluginImport, index: number): PluginMarketpl
     repositoryUrl: "https://github.com/open-leash/openleash",
     documentationUrl: `https://docs.openleash.com/plugins/${slug}`,
     iconText: iconText(slug, manifest.name),
+    visualPng: `/plugins/${slug}.png`,
     installCount: stats.installs,
     downloadCount: stats.downloads,
     weeklyDownloadCount: stats.weekly,
@@ -96,7 +97,7 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
        plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
        repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
-       ordering, config_schema, default_config, tags, icon_text, install_count,
+       ordering, config_schema, default_config, tags, icon_text, visual_png, install_count,
        download_count, weekly_download_count, trend_percent, rating,
        featured_rank, seo_title, seo_description, updated_at
      )
@@ -104,9 +105,9 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, $10, $11, $12, $13, $14,
        $15, $16, $17, $18, $19::jsonb, $20::jsonb, $21::jsonb,
-       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
-       $28, $29, $30, $31,
-       $32, $33, $34, now()
+       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27, $28,
+       $29, $30, $31, $32,
+       $33, $34, $35, now()
      )
      on conflict (plugin_id) do update set
        slug = excluded.slug,
@@ -134,6 +135,7 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
        default_config = excluded.default_config,
        tags = excluded.tags,
        icon_text = excluded.icon_text,
+       visual_png = excluded.visual_png,
        install_count = excluded.install_count,
        download_count = excluded.download_count,
        weekly_download_count = excluded.weekly_download_count,
@@ -170,6 +172,7 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
       JSON.stringify(plugin.defaultConfig ?? {}),
       JSON.stringify(plugin.tags ?? []),
       plugin.iconText,
+      plugin.visualPng ?? null,
       plugin.installCount,
       plugin.downloadCount,
       plugin.weeklyDownloadCount,

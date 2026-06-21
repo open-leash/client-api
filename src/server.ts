@@ -3057,6 +3057,7 @@ function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketpl
     defaultConfig: objectValue(row.default_config) ?? {},
     tags: arrayValue(row.tags),
     iconText: String(row.icon_text ?? "OL"),
+    visualPng: optionalString(row.visual_png),
     installCount: Number(row.install_count ?? 0),
     downloadCount: Number(row.download_count ?? 0),
     weeklyDownloadCount: Number(row.weekly_download_count ?? 0),

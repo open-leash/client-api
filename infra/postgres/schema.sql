@@ -271,6 +271,7 @@ create table if not exists plugin_marketplace (
   default_config jsonb not null default '{}'::jsonb,
   tags jsonb not null default '[]'::jsonb,
   icon_text text not null default 'OL',
+  visual_png text,
   install_count integer not null default 0,
   download_count integer not null default 0,
   weekly_download_count integer not null default 0,
