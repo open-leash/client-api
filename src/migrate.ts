@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import "dotenv/config";
+import { FIRST_PARTY_PLUGIN_MARKETPLACE } from "@openleash/shared";
 import { ensureDevToken, pool } from "./db.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -36,6 +37,7 @@ try {
         await applyMigration(migration);
       }
     }
+    await seedFirstPartyMarketplacePlugins();
     await removeLegacyMockIdentityRows();
     await ensureDevToken();
   });
@@ -158,6 +160,101 @@ async function backupPostgres(connectionString: string, outputDir: string) {
     connectionString
   ]);
   console.log(`[db:migrate] backup wrote ${outputPath}`);
+}
+
+async function seedFirstPartyMarketplacePlugins() {
+  for (const plugin of FIRST_PARTY_PLUGIN_MARKETPLACE) {
+    await pool.query(
+      `insert into plugin_marketplace (
+         plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
+         source, review_status, short_description, long_description, hero_tagline, package_url,
+         repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
+         ordering, config_schema, default_config, tags, icon_text, install_count,
+         download_count, weekly_download_count, trend_percent, rating,
+         featured_rank, seo_title, seo_description, updated_at
+       )
+       values (
+         $1, $2, $3, $4, $5, $6, $7, $8,
+         $9, $10, $11, $12, $13, $14,
+         $15, $16, $17, $18, $19::jsonb, $20::jsonb, $21::jsonb,
+         $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
+         $28, $29, $30, $31,
+         $32, $33, $34, now()
+       )
+       on conflict (plugin_id) do update set
+         slug = excluded.slug,
+         name = excluded.name,
+         description = excluded.description,
+         version = excluded.version,
+         publisher = excluded.publisher,
+         developer_name = excluded.developer_name,
+         developer_url = excluded.developer_url,
+         source = excluded.source,
+         review_status = excluded.review_status,
+         short_description = excluded.short_description,
+         long_description = excluded.long_description,
+         hero_tagline = excluded.hero_tagline,
+         package_url = excluded.package_url,
+         repository_url = excluded.repository_url,
+         documentation_url = excluded.documentation_url,
+         runtime = excluded.runtime,
+         entrypoint = excluded.entrypoint,
+         events = excluded.events,
+         permissions = excluded.permissions,
+         effects = excluded.effects,
+         ordering = excluded.ordering,
+         config_schema = excluded.config_schema,
+         default_config = excluded.default_config,
+         tags = excluded.tags,
+         icon_text = excluded.icon_text,
+         install_count = excluded.install_count,
+         download_count = excluded.download_count,
+         weekly_download_count = excluded.weekly_download_count,
+         trend_percent = excluded.trend_percent,
+         rating = excluded.rating,
+         featured_rank = excluded.featured_rank,
+         seo_title = excluded.seo_title,
+         seo_description = excluded.seo_description,
+         updated_at = now()`,
+      [
+        plugin.id,
+        plugin.slug,
+        plugin.name,
+        plugin.description,
+        plugin.version,
+        plugin.publisher,
+        plugin.developerName,
+        plugin.developerUrl ?? null,
+        plugin.source,
+        plugin.reviewStatus,
+        plugin.shortDescription,
+        plugin.longDescription,
+        plugin.heroTagline,
+        plugin.packageUrl ?? null,
+        plugin.repositoryUrl ?? null,
+        plugin.documentationUrl ?? null,
+        plugin.runtime,
+        plugin.entrypoint,
+        JSON.stringify(plugin.events),
+        JSON.stringify(plugin.permissions),
+        JSON.stringify(plugin.effects),
+        JSON.stringify(plugin.ordering ?? null),
+        JSON.stringify(plugin.configSchema ?? null),
+        JSON.stringify(plugin.defaultConfig ?? {}),
+        JSON.stringify(plugin.tags ?? []),
+        plugin.iconText,
+        plugin.installCount,
+        plugin.downloadCount,
+        plugin.weeklyDownloadCount,
+        plugin.trendPercent,
+        plugin.rating,
+        plugin.featuredRank ?? null,
+        plugin.seoTitle,
+        plugin.seoDescription
+      ]
+    );
+  }
+  console.log(`[db:migrate] seeded ${FIRST_PARTY_PLUGIN_MARKETPLACE.length} first-party marketplace plugins`);
 }
 
 function run(command: string, commandArgs: string[]) {

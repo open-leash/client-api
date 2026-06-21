@@ -2,8 +2,8 @@ import type { OpenLeashPluginManifest } from "@openleash/shared";
 
 export const promptCompressionManifest: OpenLeashPluginManifest = {
   id: "openleash.prompt-compression",
-  name: "Prompt Compression",
-  description: "Compresses user prompts before they reach the agent model to reduce token usage.",
+  name: "Token Saver",
+  description: "Compresses prompts before they reach agent models to reduce token usage and cost.",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

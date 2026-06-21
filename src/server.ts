@@ -25,6 +25,7 @@ import {
   type McpToolCall,
   type OpenLeashPluginManifest,
   type PluginCatalogItem,
+  type PluginMarketplaceListing,
   type PluginRunRecord,
   type Policy,
   type PolicyDecision
@@ -39,7 +40,9 @@ import {
   type PromptTransformConfig
 } from "./prompt-transforms.js";
 import { firstPartyPluginManifests } from "./plugins/registry.js";
+import { eventForHookEvent } from "./plugins/events.js";
 import { runEvaluationPipeline, runPromptPipeline } from "./plugins/runtime.js";
+import { runSiemExporter } from "./plugins/siem-exporter/index.js";
 import { runSkillScanner } from "./plugins/skill-scanner/index.js";
 import type { PromptPipelineResult } from "./plugins/types.js";
 import {
@@ -1618,12 +1621,13 @@ app.get("/v1/mobile/state", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const [pending, agents, history, sessionMetrics, policies] = await Promise.all([
+    const [pending, agents, history, sessionMetrics, policies, pluginCatalog] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, session.source !== "client"),
       mobileAgents(session.organization.id),
       mobileRecentActivity(session.organization.id),
       mobileSessionMetrics(session.organization.id),
-      pool.query(`select id, name, description, severity, natural_language_rule, enabled, locked from policies order by created_at asc`)
+      pool.query(`select id, name, description, severity, natural_language_rule, enabled, locked from policies order by created_at asc`),
+      pluginCatalogForOrganization(session.organization.id)
     ]);
     res.json({
       user: session.user,
@@ -1635,6 +1639,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       recentActivity: history.rows,
       sessionMetrics: sessionMetrics.rows[0],
       policies: policies.rows,
+      plugins: pluginCatalog.plugins,
       clientConfig: {
         approvalNotifications: true,
         managedByOrganization: true
@@ -2702,30 +2707,116 @@ app.get("/v1/plugins", async (req, res, next) => {
   }
 });
 
+app.get("/v1/plugin-marketplace", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    res.json(await pluginMarketplaceForOrganization(session.organization.id, String(req.query.search ?? "")));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/public/plugins", async (req, res, next) => {
+  try {
+    res.json({ listings: await readMarketplaceListings(String(req.query.search ?? "")) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/public/plugins/:slug", async (req, res, next) => {
+  try {
+    const plugin = await readMarketplaceListingBySlug(req.params.slug);
+    if (!plugin) return res.status(404).json({ error: "plugin not found" });
+    res.json(plugin);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/admin/plugin-marketplace", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    res.json(await pluginMarketplaceForOrganization(organizationId, String(req.query.search ?? ""), { includePending: true }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/admin/plugins/:pluginId/settings", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
-    const manifest = firstPartyPluginManifests.find((plugin) => plugin.id === req.params.pluginId);
-    if (!manifest) return res.status(404).json({ error: "plugin not found" });
-    const enabled = typeof req.body.enabled === "boolean" ? req.body.enabled : true;
-    const config = req.body.config && typeof req.body.config === "object" && !Array.isArray(req.body.config)
-      ? req.body.config
-      : manifest.defaultConfig ?? {};
-    const orderingPriority = Number.isFinite(Number(req.body.orderingPriority))
-      ? Number(req.body.orderingPriority)
-      : manifest.ordering?.priority ?? null;
-    const result = await pool.query(
-      `insert into plugin_settings (organization_id, plugin_id, enabled, config, ordering_priority, updated_at)
-       values ($1, $2, $3, $4::jsonb, $5, now())
-       on conflict (organization_id, plugin_id) do update set
-         enabled = excluded.enabled,
-         config = excluded.config,
-         ordering_priority = excluded.ordering_priority,
-         updated_at = now()
-       returning plugin_id, enabled, config, ordering_priority as "orderingPriority", updated_at`,
-      [organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority]
-    );
-    res.json({ pluginId: manifest.id, settings: result.rows[0] });
+    const result = await savePluginSettingsForOrganization(organizationId, req.params.pluginId, req.body);
+    if (!result) return res.status(404).json({ error: "plugin not found" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/plugins/:pluginId/policy", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const result = await saveOrganizationPluginPolicy(organizationId, req.params.pluginId, req.body);
+    if (!result) return res.status(404).json({ error: "plugin not found" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/plugin-marketplace/policy", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    res.json(await saveOrganizationMarketplacePolicy(organizationId, req.body));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/plugins/:pluginId/settings", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const result = await savePluginSettingsForOrganization(session.organization.id, req.params.pluginId, req.body);
+    if (!result) return res.status(404).json({ error: "plugin not found" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/plugins/:pluginId/install", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const result = await installMarketplacePluginForUser(session.organization.id, req.params.pluginId, session.source);
+    if (!result) return res.status(404).json({ error: "plugin not found or not installable" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/plugins/:pluginId/uninstall", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const result = await uninstallMarketplacePluginForUser(session.organization.id, req.params.pluginId, session.source);
+    if (!result) return res.status(404).json({ error: "plugin not found or mandatory" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/plugin-submissions", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const submission = await createPluginSubmission(session.organization.id, session.user.id, req.body);
+    res.status(201).json(submission);
   } catch (error) {
     next(error);
   }
@@ -2797,22 +2888,307 @@ type PluginSettingRecord = {
   updatedAt?: string;
 };
 
-async function pluginCatalogForOrganization(organizationId: string): Promise<{ plugins: PluginCatalogItem[] }> {
+type PluginPolicyRecord = {
+  pluginId: string;
+  mandatory: boolean;
+  defaultEnabled: boolean;
+  userInstallAllowed: boolean;
+};
+
+type MarketplacePolicyRecord = {
+  allowUserMarketplaceInstalls: boolean;
+  allowUserCommunityPlugins: boolean;
+};
+
+async function pluginCatalogForOrganization(organizationId: string): Promise<{ plugins: PluginCatalogItem[]; marketplacePolicy: MarketplacePolicyRecord }> {
   const settings = await readPluginSettings(organizationId);
+  const policy = await readOrganizationPluginPolicy(organizationId);
+  const marketplacePolicy = await readOrganizationMarketplacePolicy(organizationId);
+  const marketplace = await readMarketplaceListings("");
+  const marketplaceById = new Map(marketplace.map((item) => [item.id, item]));
+  const manifestsById = new Map(firstPartyPluginManifests.map((manifest) => [manifest.id, manifest]));
+  const ids = new Set([...marketplaceById.keys(), ...manifestsById.keys()]);
   return {
-    plugins: firstPartyPluginManifests.map((manifest) => pluginCatalogItem(manifest, settings.get(manifest.id)))
+    marketplacePolicy,
+    plugins: [...ids]
+      .map((pluginId) => {
+        const listing = marketplaceById.get(pluginId);
+        const manifest = manifestsById.get(pluginId) ?? listing;
+        if (!manifest) return undefined;
+        return pluginCatalogItem(manifest, settings.get(pluginId), listing, policy.get(pluginId), marketplacePolicy);
+      })
+      .filter((item): item is PluginCatalogItem => Boolean(item))
   };
 }
 
-function pluginCatalogItem(manifest: OpenLeashPluginManifest, settings?: PluginSettingRecord): PluginCatalogItem {
+function pluginCatalogItem(
+  manifest: OpenLeashPluginManifest,
+  settings?: PluginSettingRecord,
+  marketplace?: PluginMarketplaceListing,
+  policy?: PluginPolicyRecord,
+  marketplacePolicy?: MarketplacePolicyRecord
+): PluginCatalogItem {
+  const enabled = policy?.mandatory ? true : settings?.enabled ?? policy?.defaultEnabled ?? true;
   return {
     ...manifest,
-    settings: settings ?? {
-      enabled: true,
-      config: manifest.defaultConfig ?? {},
-      orderingPriority: manifest.ordering?.priority ?? null
+    slug: manifest.slug ?? marketplace?.slug,
+    marketplace,
+    settings: {
+      enabled,
+      config: settings?.config ?? manifest.defaultConfig ?? {},
+      orderingPriority: settings?.orderingPriority ?? manifest.ordering?.priority ?? null,
+      updatedAt: settings?.updatedAt
+    },
+    organizationPolicy: {
+      mandatory: Boolean(policy?.mandatory),
+      defaultEnabled: Boolean(policy?.defaultEnabled ?? true),
+      userInstallAllowed: Boolean(policy?.userInstallAllowed ?? marketplacePolicy?.allowUserMarketplaceInstalls ?? true)
     }
   };
+}
+
+async function savePluginSettingsForOrganization(organizationId: string, pluginId: string, body: Record<string, unknown>) {
+  const manifest = await manifestForPluginId(pluginId);
+  if (!manifest) return undefined;
+  const policy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
+  const enabled = policy?.mandatory ? true : typeof body.enabled === "boolean" ? body.enabled : true;
+  const config = body.config && typeof body.config === "object" && !Array.isArray(body.config)
+    ? body.config as Record<string, unknown>
+    : manifest.defaultConfig ?? {};
+  const orderingPriority = Number.isFinite(Number(body.orderingPriority))
+    ? Number(body.orderingPriority)
+    : manifest.ordering?.priority ?? null;
+  const result = await pool.query(
+    `insert into plugin_settings (organization_id, plugin_id, enabled, config, ordering_priority, updated_at)
+     values ($1, $2, $3, $4::jsonb, $5, now())
+     on conflict (organization_id, plugin_id) do update set
+       enabled = excluded.enabled,
+       config = excluded.config,
+       ordering_priority = excluded.ordering_priority,
+       updated_at = now()
+     returning plugin_id, enabled, config, ordering_priority as "orderingPriority", updated_at`,
+    [organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority]
+  );
+  return { pluginId: manifest.id, settings: result.rows[0] };
+}
+
+async function pluginMarketplaceForOrganization(organizationId: string, search: string, options: { includePending?: boolean } = {}) {
+  const [plugins, marketplacePolicy] = await Promise.all([
+    pluginCatalogForOrganization(organizationId),
+    readOrganizationMarketplacePolicy(organizationId)
+  ]);
+  let listings = await readMarketplaceListings(search, options);
+  if (!marketplacePolicy.allowUserCommunityPlugins) {
+    listings = listings.filter((listing) => listing.source === "first_party");
+  }
+  const installed = new Set(plugins.plugins.filter((plugin) => plugin.settings.enabled).map((plugin) => plugin.id));
+  const mandatory = new Set(plugins.plugins.filter((plugin) => plugin.organizationPolicy?.mandatory).map((plugin) => plugin.id));
+  return {
+    marketplacePolicy,
+    listings: listings.map((listing) => ({
+      ...listing,
+      installed: installed.has(listing.id),
+      mandatory: mandatory.has(listing.id),
+      installable: marketplacePolicy.allowUserMarketplaceInstalls || mandatory.has(listing.id) || installed.has(listing.id)
+    }))
+  };
+}
+
+async function readMarketplaceListings(search: string, options: { includePending?: boolean } = {}): Promise<PluginMarketplaceListing[]> {
+  const query = search.trim();
+  const params: unknown[] = [];
+  const where = [options.includePending ? "review_status <> 'rejected'" : "review_status = 'approved'"];
+  if (query) {
+    params.push(query);
+    where.push(`(
+      to_tsvector('english', name || ' ' || description || ' ' || short_description || ' ' || coalesce(tags::text, '')) @@ plainto_tsquery('english', $${params.length})
+      or slug ilike '%' || $${params.length} || '%'
+      or name ilike '%' || $${params.length} || '%'
+      or developer_name ilike '%' || $${params.length} || '%'
+    )`);
+  }
+  const rows = await pool.query(
+    `select *
+     from plugin_marketplace
+     where ${where.join(" and ")}
+     order by featured_rank nulls last, install_count desc, name asc
+     limit 50`,
+    params
+  );
+  return rows.rows.map(marketplaceListingFromRow);
+}
+
+async function readMarketplaceListingBySlug(slug: string): Promise<PluginMarketplaceListing | undefined> {
+  const rows = await pool.query(
+    `select *
+     from plugin_marketplace
+     where slug = $1 and review_status = 'approved'
+     limit 1`,
+    [slug]
+  );
+  return rows.rows[0] ? marketplaceListingFromRow(rows.rows[0]) : undefined;
+}
+
+function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketplaceListing {
+  return {
+    id: String(row.plugin_id),
+    slug: String(row.slug),
+    name: String(row.name),
+    description: String(row.description),
+    version: String(row.version),
+    publisher: String(row.publisher),
+    developerName: String(row.developer_name),
+    developerUrl: optionalString(row.developer_url),
+    source: String(row.source) as PluginMarketplaceListing["source"],
+    reviewStatus: String(row.review_status) as PluginMarketplaceListing["reviewStatus"],
+    shortDescription: String(row.short_description),
+    longDescription: String(row.long_description),
+    heroTagline: String(row.hero_tagline),
+    packageUrl: optionalString(row.package_url),
+    repositoryUrl: optionalString(row.repository_url),
+    documentationUrl: optionalString(row.documentation_url),
+    runtime: String(row.runtime) as PluginMarketplaceListing["runtime"],
+    entrypoint: String(row.entrypoint),
+    events: arrayValue(row.events) as PluginMarketplaceListing["events"],
+    permissions: arrayValue(row.permissions) as PluginMarketplaceListing["permissions"],
+    effects: arrayValue(row.effects) as PluginMarketplaceListing["effects"],
+    ordering: objectValue(row.ordering) as PluginMarketplaceListing["ordering"],
+    configSchema: objectValue(row.config_schema) as PluginMarketplaceListing["configSchema"],
+    defaultConfig: objectValue(row.default_config) ?? {},
+    tags: arrayValue(row.tags),
+    iconText: String(row.icon_text ?? "OL"),
+    installCount: Number(row.install_count ?? 0),
+    downloadCount: Number(row.download_count ?? 0),
+    weeklyDownloadCount: Number(row.weekly_download_count ?? 0),
+    trendPercent: Number(row.trend_percent ?? 0),
+    rating: Number(row.rating ?? 0),
+    featuredRank: row.featured_rank === null || row.featured_rank === undefined ? null : Number(row.featured_rank),
+    seoTitle: String(row.seo_title),
+    seoDescription: String(row.seo_description),
+    createdAt: optionalString(row.created_at),
+    updatedAt: optionalString(row.updated_at)
+  };
+}
+
+async function manifestForPluginId(pluginId: string): Promise<OpenLeashPluginManifest | undefined> {
+  const firstParty = firstPartyPluginManifests.find((plugin) => plugin.id === pluginId);
+  if (firstParty) return firstParty;
+  const rows = await pool.query("select * from plugin_marketplace where plugin_id = $1 and review_status = 'approved'", [pluginId]);
+  const listing = rows.rows[0] ? marketplaceListingFromRow(rows.rows[0]) : undefined;
+  return listing;
+}
+
+async function installMarketplacePluginForUser(organizationId: string, pluginId: string, source: "client" | "dashboard") {
+  const policy = await readOrganizationMarketplacePolicy(organizationId);
+  const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
+  const manifest = await manifestForPluginId(pluginId);
+  if (!manifest) return undefined;
+  if (source === "client" && !pluginPolicy?.mandatory && !policy.allowUserMarketplaceInstalls) return undefined;
+  if (source === "client" && manifest.publisher !== "openleash" && !policy.allowUserCommunityPlugins) return undefined;
+  return savePluginSettingsForOrganization(organizationId, pluginId, { enabled: true, config: manifest.defaultConfig ?? {} });
+}
+
+async function uninstallMarketplacePluginForUser(organizationId: string, pluginId: string, source: "client" | "dashboard") {
+  const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
+  if (pluginPolicy?.mandatory) return undefined;
+  if (source === "client" && !pluginPolicy?.userInstallAllowed) return undefined;
+  const manifest = await manifestForPluginId(pluginId);
+  if (!manifest) return undefined;
+  return savePluginSettingsForOrganization(organizationId, pluginId, { enabled: false, config: manifest.defaultConfig ?? {} });
+}
+
+async function saveOrganizationPluginPolicy(organizationId: string, pluginId: string, body: Record<string, unknown>) {
+  if (!await manifestForPluginId(pluginId)) return undefined;
+  const mandatory = Boolean(body.mandatory);
+  const defaultEnabled = mandatory || Boolean(body.defaultEnabled);
+  const userInstallAllowed = body.userInstallAllowed !== false;
+  const result = await pool.query(
+    `insert into organization_plugin_policy (organization_id, plugin_id, mandatory, default_enabled, user_install_allowed, updated_at)
+     values ($1, $2, $3, $4, $5, now())
+     on conflict (organization_id, plugin_id) do update set
+       mandatory = excluded.mandatory,
+       default_enabled = excluded.default_enabled,
+       user_install_allowed = excluded.user_install_allowed,
+       updated_at = now()
+     returning plugin_id as "pluginId", mandatory, default_enabled as "defaultEnabled", user_install_allowed as "userInstallAllowed", updated_at as "updatedAt"`,
+    [organizationId, pluginId, mandatory, defaultEnabled, userInstallAllowed]
+  );
+  if (mandatory) await savePluginSettingsForOrganization(organizationId, pluginId, { enabled: true });
+  return { pluginId, policy: result.rows[0] };
+}
+
+async function saveOrganizationMarketplacePolicy(organizationId: string, body: Record<string, unknown>) {
+  const allowUserMarketplaceInstalls = body.allowUserMarketplaceInstalls !== false;
+  const allowUserCommunityPlugins = Boolean(body.allowUserCommunityPlugins);
+  const result = await pool.query(
+    `insert into organization_plugin_marketplace_policy (organization_id, allow_user_marketplace_installs, allow_user_community_plugins, updated_at)
+     values ($1, $2, $3, now())
+     on conflict (organization_id) do update set
+       allow_user_marketplace_installs = excluded.allow_user_marketplace_installs,
+       allow_user_community_plugins = excluded.allow_user_community_plugins,
+       updated_at = now()
+     returning allow_user_marketplace_installs as "allowUserMarketplaceInstalls",
+               allow_user_community_plugins as "allowUserCommunityPlugins",
+               updated_at as "updatedAt"`,
+    [organizationId, allowUserMarketplaceInstalls, allowUserCommunityPlugins]
+  );
+  return { marketplacePolicy: result.rows[0] };
+}
+
+async function readOrganizationPluginPolicy(organizationId: string) {
+  const rows = await pool.query<{
+    plugin_id: string;
+    mandatory: boolean;
+    default_enabled: boolean;
+    user_install_allowed: boolean;
+  }>(
+    `select plugin_id, mandatory, default_enabled, user_install_allowed
+     from organization_plugin_policy
+     where organization_id = $1`,
+    [organizationId]
+  );
+  return new Map<string, PluginPolicyRecord>(rows.rows.map((row) => [row.plugin_id, {
+    pluginId: row.plugin_id,
+    mandatory: row.mandatory,
+    defaultEnabled: row.default_enabled,
+    userInstallAllowed: row.user_install_allowed
+  }]));
+}
+
+async function readOrganizationMarketplacePolicy(organizationId: string): Promise<MarketplacePolicyRecord> {
+  const rows = await pool.query<{
+    allow_user_marketplace_installs: boolean;
+    allow_user_community_plugins: boolean;
+  }>(
+    `select allow_user_marketplace_installs, allow_user_community_plugins
+     from organization_plugin_marketplace_policy
+     where organization_id = $1`,
+    [organizationId]
+  );
+  return {
+    allowUserMarketplaceInstalls: rows.rows[0]?.allow_user_marketplace_installs ?? true,
+    allowUserCommunityPlugins: rows.rows[0]?.allow_user_community_plugins ?? true
+  };
+}
+
+async function createPluginSubmission(organizationId: string, submittedBy: string, body: Record<string, unknown>) {
+  const name = String(body.name ?? "").trim();
+  const slug = slugify(String(body.slug ?? name));
+  const pluginId = String(body.pluginId ?? `community.${slug}`).trim();
+  const developerName = String(body.developerName ?? "").trim();
+  if (!name || !slug || !developerName) {
+    const error = new Error("Plugin name, slug, and developer name are required.");
+    (error as Error & { status?: number }).status = 400;
+    throw error;
+  }
+  const manifest = body.manifest && typeof body.manifest === "object" && !Array.isArray(body.manifest) ? body.manifest : {};
+  const result = await pool.query(
+    `insert into plugin_submissions (organization_id, submitted_by, plugin_id, slug, name, developer_name, package_url, repository_url, manifest)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+     returning id, plugin_id as "pluginId", slug, name, developer_name as "developerName", status, created_at as "createdAt"`,
+    [organizationId, submittedBy, pluginId, slug, name, developerName, optionalString(body.packageUrl), optionalString(body.repositoryUrl), JSON.stringify(manifest)]
+  );
+  return { submission: result.rows[0] };
 }
 
 async function readPluginSettings(organizationId: string) {
@@ -2916,8 +3292,8 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
      from policies where enabled = true order by created_at asc`
   );
   const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
-  const pipeline = await runEvaluationPipeline({ request, organizationId, policies: policies.rows, tenantModelKey, plugins: await pluginSettingsForRuntime(organizationId) });
-  await recordPluginRuns(conversationEventId, pipeline.runs);
+  const runtimePlugins = await pluginSettingsForRuntime(organizationId);
+  const pipeline = await runEvaluationPipeline({ request, organizationId, policies: policies.rows, tenantModelKey, plugins: runtimePlugins });
   const { results: evaluatedResults, model } = pipeline;
   const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, evaluatedResults);
   const results = promptOnlyDeferred ? deferPromptOnlyPolicyResults(evaluatedResults) : evaluatedResults;
@@ -2975,6 +3351,31 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     request,
     decision
   });
+  const organization = await organizationSummary(organizationId);
+  const siemSettings = runtimePlugins.get("openleash.siem-exporter");
+  const siemRun = await runSiemExporter({
+    request,
+    event: eventForRequest(request),
+    decision,
+    summary,
+    evaluationId: evaluation.rows[0].id,
+    conversationEventId,
+    organization,
+    user: {
+      id: user.id,
+      email: user.email,
+      displayName: user.display_name
+    },
+    computerId,
+    runtimeId,
+    policyResults: results,
+    pluginRuns: pipeline.runs,
+    config: {
+      ...(siemSettings?.config ?? {}),
+      enabled: Boolean(siemSettings?.enabled)
+    }
+  });
+  await recordPluginRuns(conversationEventId, [...pipeline.runs, siemRun]);
   let purposeSummary: string | undefined;
   if (decision === "ask") {
     purposeSummary = await summarizeActionPurpose(request, tenantModelKey);
@@ -3005,6 +3406,18 @@ async function tenantModelKeyForEvaluation(organizationId: string) {
     console.warn("tenant model key unavailable; falling back to managed or heuristic evaluation", error);
     return undefined;
   }
+}
+
+async function organizationSummary(organizationId: string) {
+  const result = await pool.query<{ id: string; name: string; slug: string | null }>(
+    "select id, name, slug from organizations where id = $1 limit 1",
+    [organizationId]
+  );
+  return result.rows[0] ?? { id: organizationId };
+}
+
+function eventForRequest(request: EvaluationRequest) {
+  return eventForHookEvent(request.event.eventName);
 }
 
 async function recordConversationEvent(request: EvaluationRequest, user: ApiUser, intentKey?: string) {
@@ -3765,6 +4178,23 @@ function generateOnboardingCode() {
 
 function slugifyTenant(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "openleash";
+}
+
+function slugify(value: string) {
+  return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+}
+
+function optionalString(value: unknown) {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text || undefined;
+}
+
+function arrayValue(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
 function normalizeDeploymentMode(value: unknown) {
@@ -5115,6 +5545,8 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/admin/skills" ||
     requestPath === "/admin/plugins" ||
     requestPath.startsWith("/admin/plugins/") ||
+    requestPath === "/admin/plugin-marketplace" ||
+    requestPath === "/admin/plugin-marketplace/policy" ||
     requestPath === "/admin/logs" ||
     /^\/admin\/logs\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/triggers" ||
@@ -5144,7 +5576,6 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/auth/microsoft/callback" ||
     requestPath === "/v1/auth/google/callback" ||
     requestPath === "/v1/auth/microsoft/callback" ||
-    requestPath === "/v1/mobile/auth/exchange" ||
     /^\/organizations\/[^/]+\/sso-providers$/.test(requestPath) ||
     /^\/organizations\/[^/]+$/.test(requestPath) ||
     (verb === "POST" && requestPath === "/organizations")
@@ -5154,16 +5585,23 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
 
   if (
     requestPath === "/v1/enroll" ||
+    requestPath === "/public/plugins" ||
+    /^\/public\/plugins\/[^/]+$/.test(requestPath) ||
     requestPath === "/v1/evaluate" ||
     /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath) ||
     requestPath === "/v1/desktop/enroll" ||
     requestPath === "/v1/desktop/agents" ||
     requestPath === "/v1/plugins" ||
+    requestPath === "/v1/plugin-marketplace" ||
+    requestPath === "/v1/plugin-submissions" ||
+    /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath) ||
+    /^\/v1\/plugins\/[^/]+\/install$/.test(requestPath) ||
+    /^\/v1\/plugins\/[^/]+\/uninstall$/.test(requestPath) ||
     requestPath === "/v1/skills/observations" ||
     /^\/v1\/decisions\/[^/]+$/.test(requestPath) ||
     /^\/admin\/decisions\/[^/]+\/resolve$/.test(requestPath) ||
     requestPath === "/admin/tray-status" ||
-    (requestPath.startsWith("/v1/mobile/") && requestPath !== "/v1/mobile/auth/exchange") ||
+    requestPath.startsWith("/v1/mobile/") ||
     requestPath === "/api/updates/check" ||
     requestPath === "/api/updates/latest" ||
     requestPath === "/api/admin/releases"
@@ -5181,6 +5619,13 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && requestPath === "/v1/desktop/enroll") return "desktopEnroll";
   if (verb === "POST" && requestPath === "/v1/desktop/agents") return "desktopEnroll";
   if (verb === "GET" && requestPath === "/v1/plugins") return "tenantPluginsRead";
+  if (verb === "GET" && requestPath === "/v1/plugin-marketplace") return "tenantPluginsRead";
+  if (verb === "GET" && requestPath === "/public/plugins") return "tenantPluginsRead";
+  if (verb === "GET" && /^\/public\/plugins\/[^/]+$/.test(requestPath)) return "tenantPluginsRead";
+  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath)) return "adminPluginsWrite";
+  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/install$/.test(requestPath)) return "adminPluginsWrite";
+  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/uninstall$/.test(requestPath)) return "adminPluginsWrite";
+  if (verb === "POST" && requestPath === "/v1/plugin-submissions") return "adminPluginsWrite";
   if (verb === "POST" && requestPath === "/v1/evaluate") return "tenantEvaluate";
   if (verb === "POST" && /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath)) return "tenantHookEvaluate";
   if (verb === "POST" && requestPath === "/v1/skills/observations") return "tenantSkillObservation";
@@ -5192,7 +5637,10 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath)) return "adminMcpServerDetail";
   if (verb === "GET" && requestPath === "/admin/skills") return "adminSkills";
   if (verb === "GET" && requestPath === "/admin/plugins") return "adminPluginsRead";
+  if (verb === "GET" && requestPath === "/admin/plugin-marketplace") return "adminPluginsRead";
   if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/settings$/.test(requestPath)) return "adminPluginsWrite";
+  if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/policy$/.test(requestPath)) return "adminPluginsWrite";
+  if (verb === "POST" && requestPath === "/admin/plugin-marketplace/policy") return "adminPluginsWrite";
   if (verb === "GET" && requestPath === "/admin/logs") return "adminLogs";
   if (verb === "GET" && /^\/admin\/logs\/[^/]+$/.test(requestPath)) return "adminLogDetail";
   if (verb === "GET" && requestPath === "/admin/triggers") return "adminTriggers";
