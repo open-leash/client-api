@@ -3,7 +3,7 @@ import type { OpenLeashPluginManifest } from "@openleash/shared";
 export const dlpManifest: OpenLeashPluginManifest = {
   id: "openleash.dlp",
   name: "Data Leakage Prevention",
-  description: "Masks or blocks sensitive prompt data before submission.",
+  description: "Mask secrets before agents send them.",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

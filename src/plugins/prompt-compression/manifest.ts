@@ -3,7 +3,7 @@ import type { OpenLeashPluginManifest } from "@openleash/shared";
 export const promptCompressionManifest: OpenLeashPluginManifest = {
   id: "openleash.prompt-compression",
   name: "Token Saver",
-  description: "Compresses prompts before they reach agent models to reduce token usage and cost.",
+  description: "Trim noisy context before every model call.",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

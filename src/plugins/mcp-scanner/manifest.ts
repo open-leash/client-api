@@ -3,7 +3,7 @@ import type { OpenLeashPluginManifest } from "@openleash/shared";
 export const mcpScannerManifest: OpenLeashPluginManifest = {
   id: "openleash.mcp-scanner",
   name: "MCP Scanner",
-  description: "Discovers and inventories MCP tool calls for audit and risk review.",
+  description: "See every MCP server, tool, and call.",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

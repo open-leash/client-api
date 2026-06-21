@@ -3,7 +3,7 @@ import type { OpenLeashPluginManifest } from "@openleash/shared";
 export const securityEvaluatorManifest: OpenLeashPluginManifest = {
   id: "openleash.security-evaluator",
   name: "Security Evaluator",
-  description: "Evaluates prompts, agent responses, and tool actions against organization policy.",
+  description: "Approve, deny, or log risky agent actions.",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

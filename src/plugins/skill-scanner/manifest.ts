@@ -3,7 +3,7 @@ import type { OpenLeashPluginManifest } from "@openleash/shared";
 export const skillScannerManifest: OpenLeashPluginManifest = {
   id: "openleash.skill-scanner",
   name: "Skill Scanner",
-  description: "Scans agent skills for suspicious instructions and records skill inventory.",
+  description: "Catch suspicious instructions before they spread.",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",
