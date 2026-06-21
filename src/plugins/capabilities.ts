@@ -1,4 +1,4 @@
-import type { EvaluationRequest, PluginCapabilities, PluginStorageGetRequest, PluginStorageScope } from "@openleash/shared";
+import type { EvaluationRequest, PluginCapabilities, PluginStorageGetRequest, PluginStorageListRequest, PluginStorageScope } from "@openleash/shared";
 import { pool } from "../db.js";
 import { evaluatePolicies } from "../evaluator.js";
 import type { TenantModelKey } from "../model-keys.js";
@@ -21,7 +21,7 @@ export function createPluginCapabilities({
     async get<T = unknown>({ key, scope }: PluginStorageGetRequest) {
       if (!organizationId) return undefined;
       const result = await pool.query<{ value: unknown; updated_at: string; expires_at: string | null }>(
-        `select value, updated_at, expires_at
+        `select state_key, value, updated_at, expires_at
          from plugin_state
          where organization_id = $1
            and plugin_id = $2
@@ -31,7 +31,7 @@ export function createPluginCapabilities({
         [organizationId, pluginId, scopeKey(scope, request), key]
       );
       const row = result.rows[0];
-      return row ? { value: row.value as T, updatedAt: row.updated_at, expiresAt: row.expires_at } : undefined;
+      return row ? { key, scope, value: row.value as T, updatedAt: row.updated_at, expiresAt: row.expires_at } : undefined;
     },
     async set({ key, value, scope, ttlSeconds }) {
       if (!organizationId) {
@@ -48,7 +48,29 @@ export function createPluginCapabilities({
         [organizationId, pluginId, scopeKey(scope, request), key, JSON.stringify(value), normalizedTtl(ttlSeconds)]
       );
       const row = result.rows[0];
-      return { value: row.value, updatedAt: row.updated_at, expiresAt: row.expires_at };
+      return { key, scope, value: row.value, updatedAt: row.updated_at, expiresAt: row.expires_at };
+    },
+    async list<T = unknown>({ keyPrefix, scope, limit }: PluginStorageListRequest = {}) {
+      if (!organizationId) return [];
+      const result = await pool.query<{ state_key: string; value: unknown; updated_at: string; expires_at: string | null }>(
+        `select state_key, value, updated_at, expires_at
+         from plugin_state
+         where organization_id = $1
+           and plugin_id = $2
+           and scope_key = $3
+           and ($4::text is null or state_key like $4::text || '%')
+           and (expires_at is null or expires_at > now())
+         order by updated_at desc
+         limit $5`,
+        [organizationId, pluginId, scopeKey(scope, request), cleanPrefix(keyPrefix), normalizedLimit(limit)]
+      );
+      return result.rows.map((row) => ({
+        key: row.state_key,
+        scope,
+        value: row.value as T,
+        updatedAt: row.updated_at,
+        expiresAt: row.expires_at
+      }));
     },
     async delete({ key, scope }) {
       if (!organizationId) return;
@@ -123,4 +145,14 @@ function scopeKey(scope: PluginStorageScope | undefined, request: EvaluationRequ
 function normalizedTtl(value: number | undefined) {
   if (!Number.isFinite(value)) return null;
   return Math.max(1, Math.min(60 * 60 * 24 * 365, Math.floor(Number(value))));
+}
+
+function normalizedLimit(value: number | undefined) {
+  if (!Number.isFinite(value)) return 100;
+  return Math.max(1, Math.min(500, Math.floor(Number(value))));
+}
+
+function cleanPrefix(value: string | undefined) {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text || null;
 }

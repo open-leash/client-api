@@ -68,6 +68,7 @@ Instead, plugin code receives stable capabilities from the runtime:
 await capabilities.prompt.compress({ prompt, level: "standard" });
 await capabilities.dlp.inspect({ prompt, action: "mask", categories: ["pii"] });
 await capabilities.storage.set({ key: "last-risk", value: { score: 82 } });
+const recent = await capabilities.storage.list({ keyPrefix: "sessions/", limit: 25 });
 ```
 
 If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, or other approved services.
@@ -76,15 +77,39 @@ If a plugin needs a new privileged operation, add a narrow capability to the sha
 
 Plugins should not create their own database or import OpenLeash database modules. OpenLeash owns tenancy, migrations, backup, encryption policy, and public/private cloud portability.
 
-Use `capabilities.storage` for plugin-owned state. Storage is scoped by:
+Use `capabilities.storage` for plugin-owned JSON state. Think of it as a small document store, not raw SQL. Storage is scoped by:
 
 ```text
 organization_id + plugin_id + scope + key
 ```
 
-The runtime supplies `organization_id` and `plugin_id`; plugin code supplies only the logical scope and key.
+The runtime supplies `organization_id` and `plugin_id`; plugin code supplies only the logical scope and key. One plugin cannot read or write another plugin's records because `plugin_id` is injected by the runtime, not accepted from plugin code.
 
-Example: a prompt evaluator should not show the same notification twice within five hours for the same session and conversation:
+Recommended key shapes:
+
+```text
+sessions/<session-id>/summary
+heuristics/<user-id>/risk-profile
+cache/<hash>
+notifications/<dedupe-key>
+```
+
+Available operations:
+
+- `get({ key, scope })`
+- `set({ key, value, scope, ttlSeconds })`
+- `list({ keyPrefix, scope, limit })`
+- `delete({ key, scope })`
+
+Limits:
+
+- Values must be JSON-serializable.
+- `list` is capped by the runtime.
+- Expired rows are ignored automatically.
+- Plugins cannot run arbitrary SQL or join OpenLeash product tables.
+- If a plugin needs indexed analytics, add a new reviewed storage capability instead of importing database internals.
+
+Example: a prompt evaluator wants session-aware memory and notification dedupe:
 
 ```ts
 const scope = {
@@ -94,16 +119,23 @@ const scope = {
 
 const previous = await capabilities.storage.get({
   scope,
-  key: "risky-prompt-notification"
+  key: "notifications/customer-data-risk"
+});
+
+const recentSessionFacts = await capabilities.storage.list({
+  scope,
+  keyPrefix: "sessions/",
+  limit: 20
 });
 
 if (!previous) {
   await capabilities.storage.set({
     scope,
-    key: "risky-prompt-notification",
+    key: "notifications/customer-data-risk",
     value: {
       title: "Risky prompt needs review",
-      reason: "Prompt asked the agent to expose customer data."
+      reason: "Prompt asked the agent to expose customer data.",
+      sessionFactCount: recentSessionFacts.length
     },
     ttlSeconds: 5 * 60 * 60
   });
