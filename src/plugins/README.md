@@ -55,6 +55,8 @@ Permissions are declarative and should match what the implementation actually ne
 - `storage:read` / `storage:write`
 - `audit:write`
 - `log:write`
+- `signal:write`
+- `usage:write`
 - `notification:send`
 
 The current runtime uses these for catalog and UI clarity. External plugin isolation should enforce them before third-party plugins are supported.
@@ -71,9 +73,11 @@ await capabilities.dlp.inspect({ prompt, action: "mask", categories: ["pii"] });
 await capabilities.storage.set({ key: "last-risk", value: { score: 82 } });
 const recent = await capabilities.storage.list({ keyPrefix: "sessions/", limit: 25 });
 await capabilities.log.emit({ level: "security", message: "Custom evaluator flagged a risky action." });
+await capabilities.signals.emit({ kind: "security.finding", severity: "high", title: "Risky action blocked." });
+await capabilities.usage.record({ kind: "llm.tokens", inputTokens: 8000, savedTokens: 2400 });
 ```
 
-If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, plugin/system logs, or other approved services.
+If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, plugin/system logs, SIEM export, security signals, usage records, or other approved services.
 
 ## Build A Plugin
 
@@ -235,6 +239,69 @@ if (!previous) {
 ```
 
 That returned finding/`needs_question` is what OpenLeash core turns into the actual approval flow. The plugin does not directly pop a desktop window; OpenLeash core owns desktop, mobile, dashboard, audit, notification policy, SIEM export, and native hook response delivery.
+
+## Security Signals And CISO Reporting
+
+Logs are useful for operators and SIEM export, but CISO dashboards need normalized records. Plugins should report incidents, findings, discoveries, policy decisions, and inventory observations with `capabilities.signals.emit`.
+
+OpenLeash injects trusted context into every signal:
+
+```text
+organization_id
+plugin_id
+conversation_event_id
+user_id
+computer_id
+agent_runtime_id
+```
+
+Plugin code can describe what happened, but it cannot choose a different organization, impersonate another user, or write raw dashboard rows. Identity sync stays in OpenLeash core: users and groups come from the configured IdP, endpoint enrollment links devices to users, and the runtime attaches that context to plugin records.
+
+Example security evaluator output:
+
+```ts
+await capabilities.signals.emit({
+  kind: "security.finding",
+  severity: "high",
+  title: "Destructive shell command blocked",
+  summary: "The agent attempted to remove a protected directory.",
+  decision: "blocked",
+  status: "contained",
+  target: { command: "rm -rf ./prod-data" },
+  evidence: [{ type: "policy", value: "destructive-command" }],
+  details: { policyIds: ["prod-safety"] },
+  correlationKeys: ["user:current", "command:rm-rf", "policy:prod-safety"]
+});
+```
+
+The dashboard reads OpenLeash-owned `plugin_signals`, not plugin databases. It can show:
+
+- latest incidents and findings;
+- affected synced employees;
+- sources by plugin;
+- contained or blocked outcomes;
+- cross-plugin correlations by shared user, conversation, device, or explicit `correlationKeys`.
+
+This means a better third-party security evaluator can coexist with the first-party evaluator. Each plugin emits its own signals, OpenLeash stores them with trusted context, and the dashboard correlates normalized data without letting plugins access each other's tables.
+
+## Usage And Cost Reporting
+
+Plugins report cost, token savings, scans, model calls, and other measurable activity with `capabilities.usage.record`. The runtime stamps the same trusted organization, user, device, runtime, and conversation context.
+
+```ts
+await capabilities.usage.record({
+  kind: "llm.tokens",
+  provider: "openleash-evaluator",
+  model: "policy-eval",
+  inputTokens: 4200,
+  outputTokens: 300,
+  savedTokens: 1600,
+  estimatedCostUsd: 0.018,
+  details: { reason: "prompt-compression" }
+});
+```
+
+The CISO sees usage by plugin and employee in the dashboard. A cost-focused plugin does not need database access to be useful; it only needs `usage:write`.
 
 ## Plugin And System Logs
 
