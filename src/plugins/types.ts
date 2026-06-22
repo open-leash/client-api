@@ -55,6 +55,10 @@ export type PromptPipelineResult = {
 export type EvaluationPipelineInput = {
   request: EvaluationRequest;
   organizationId?: string;
+  conversationEventId?: string;
+  userId?: string;
+  computerId?: string;
+  runtimeId?: string;
   policies: Policy[];
   tenantModelKey?: TenantModelKey;
   plugins?: Map<string, PluginSettingState>;

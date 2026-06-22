@@ -9,8 +9,8 @@ export const siemExporterManifest: OpenLeashPluginManifest = {
   publisher: "openleash",
   runtime: "openleash-core",
   entrypoint: "plugins/siem-exporter",
-  events: ["prompt.beforeSubmit", "agent.response", "tool.beforeUse", "tool.afterUse", "session.started", "session.ended", "skill.changed"],
-  permissions: ["event:read", "prompt:read", "tool:read", "network:access", "audit:write"],
+  events: ["prompt.beforeSubmit", "agent.response", "tool.beforeUse", "tool.afterUse", "session.started", "session.ended", "skill.changed", "log.emitted"],
+  permissions: ["event:read", "prompt:read", "tool:read", "network:access", "audit:write", "log:write"],
   effects: ["observe", "notify"],
   ordering: { priority: 900, after: ["openleash.security-evaluator", "openleash.mcp-scanner"] },
   configSchema: {

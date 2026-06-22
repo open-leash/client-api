@@ -1,4 +1,13 @@
-import type { EvaluationRequest, PluginCapabilities, PluginStorageGetRequest, PluginStorageListRequest, PluginStorageScope } from "@openleash/shared";
+import type {
+  EvaluationRequest,
+  PluginCapabilities,
+  PluginLogRecord,
+  PluginLogLevel,
+  PluginLogRequest,
+  PluginStorageGetRequest,
+  PluginStorageListRequest,
+  PluginStorageScope
+} from "@openleash/shared";
 import { pool } from "../db.js";
 import { evaluatePolicies } from "../evaluator.js";
 import type { TenantModelKey } from "../model-keys.js";
@@ -9,13 +18,21 @@ export function createPluginCapabilities({
   tenantModelKey,
   organizationId,
   pluginId,
-  request
+  request,
+  conversationEventId,
+  userId,
+  computerId,
+  runtimeId
 }: {
   apiKey?: string;
   tenantModelKey?: TenantModelKey;
   organizationId?: string;
   pluginId: string;
   request?: EvaluationRequest;
+  conversationEventId?: string;
+  userId?: string;
+  computerId?: string;
+  runtimeId?: string;
 }): PluginCapabilities {
   const storage: PluginCapabilities["storage"] = {
     async get<T = unknown>({ key, scope }: PluginStorageGetRequest) {
@@ -123,7 +140,89 @@ export function createPluginCapabilities({
         });
         return { sent: true, deduped: false };
       }
+    },
+    log: {
+      async emit(log) {
+        return emitPluginLog({
+          organizationId,
+          pluginId,
+          conversationEventId,
+          userId,
+          computerId,
+          runtimeId,
+          request,
+          log
+        });
+      }
     }
+  };
+}
+
+async function emitPluginLog({
+  organizationId,
+  pluginId,
+  conversationEventId,
+  userId,
+  computerId,
+  runtimeId,
+  request,
+  log
+}: {
+  organizationId?: string;
+  pluginId: string;
+  conversationEventId?: string;
+  userId?: string;
+  computerId?: string;
+  runtimeId?: string;
+  request?: EvaluationRequest;
+  log: PluginLogRequest;
+}) {
+  const level = normalizeLogLevel(log.level);
+  const category = normalizeLogCategory(log.category);
+  const message = String(log.message ?? "").trim().slice(0, 4000) || "Plugin log event.";
+  const code = typeof log.code === "string" && log.code.trim() ? log.code.trim().slice(0, 120) : undefined;
+  const scope = log.scope ?? {
+    agentKind: request?.agent.kind,
+    sessionId: request?.event.sessionId,
+    projectPath: request?.event.projectPath
+  };
+  const data = sanitizeLogData(log.data);
+  const createdAt = new Date().toISOString();
+
+  if (!organizationId) {
+    return { pluginId, level, message, code, category, data, scope, createdAt };
+  }
+
+  const result = await pool.query<{ id: string; created_at: string }>(
+    `insert into plugin_log_events
+     (organization_id, plugin_id, conversation_event_id, user_id, computer_id, agent_runtime_id, level, category, code, message, scope, data)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)
+     returning id, created_at`,
+    [
+      organizationId,
+      pluginId,
+      conversationEventId ?? null,
+      userId ?? null,
+      computerId ?? null,
+      runtimeId ?? null,
+      level,
+      category,
+      code ?? null,
+      message,
+      JSON.stringify(scope ?? {}),
+      JSON.stringify(data)
+    ]
+  );
+  return {
+    id: result.rows[0]?.id,
+    pluginId,
+    level,
+    message,
+    code,
+    category,
+    data,
+    scope,
+    createdAt: result.rows[0]?.created_at ?? createdAt
   };
 }
 
@@ -155,4 +254,38 @@ function normalizedLimit(value: number | undefined) {
 function cleanPrefix(value: string | undefined) {
   const text = typeof value === "string" ? value.trim() : "";
   return text || null;
+}
+
+function normalizeLogLevel(value: unknown): PluginLogLevel {
+  return value === "debug" || value === "info" || value === "warn" || value === "error" || value === "security"
+    ? value
+    : "info";
+}
+
+function normalizeLogCategory(value: unknown): PluginLogRecord["category"] {
+  return value === "system" || value === "security" || value === "audit" ? value : "plugin";
+}
+
+function sanitizeLogData(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .slice(0, 50)
+      .map(([key, entry]) => [key.slice(0, 120), sanitizeLogValue(entry, 0)])
+  );
+}
+
+function sanitizeLogValue(value: unknown, depth: number): unknown {
+  if (depth > 4) return "[Truncated]";
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") return value.length > 2000 ? `${value.slice(0, 1999)}…` : value;
+  if (Array.isArray(value)) return value.slice(0, 50).map((item) => sanitizeLogValue(item, depth + 1));
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .slice(0, 50)
+        .map(([key, entry]) => [key.slice(0, 120), sanitizeLogValue(entry, depth + 1)])
+    );
+  }
+  return String(value);
 }

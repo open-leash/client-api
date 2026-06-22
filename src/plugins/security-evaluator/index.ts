@@ -12,6 +12,20 @@ export async function runSecurityEvaluator(input: EvaluationPipelineInput, capab
     policies: input.policies
   });
   const failed = results.filter((result) => result.status === "failed" || result.status === "needs_question");
+  if (failed.length > 0) {
+    await capabilities.log.emit({
+      level: failed.some((result) => result.status === "failed") ? "security" : "warn",
+      category: "security",
+      code: "policy-review-required",
+      message: failed.length === 1
+        ? `Policy review required: ${failed[0].policyName}.`
+        : `${failed.length} policy results require review.`,
+      data: {
+        policyNames: failed.map((result) => result.policyName),
+        severities: failed.map((result) => result.severity)
+      }
+    });
+  }
   return {
     results,
     model,

@@ -89,7 +89,11 @@ export async function runEvaluationPipeline(input: EvaluationPipelineInput): Pro
       tenantModelKey: input.tenantModelKey,
       organizationId: input.organizationId,
       pluginId: plugin.id,
-      request: input.request
+      request: input.request,
+      conversationEventId: input.conversationEventId,
+      userId: input.userId,
+      computerId: input.computerId,
+      runtimeId: input.runtimeId
     });
     if (plugin.id === "openleash.security-evaluator") {
       const security = await runSecurityEvaluator(input, capabilities);

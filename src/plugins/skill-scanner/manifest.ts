@@ -9,7 +9,7 @@ export const skillScannerManifest: OpenLeashPluginManifest = {
   runtime: "openleash-core",
   entrypoint: "plugins/skill-scanner",
   events: ["openleash.startup", "agent.detected", "skill.changed"],
-  permissions: ["event:read", "filesystem:read", "decision:write", "model:invoke", "audit:write", "notification:send"],
+  permissions: ["event:read", "filesystem:read", "decision:write", "model:invoke", "audit:write", "log:write", "notification:send"],
   effects: ["observe", "ask", "inventory"],
   ordering: {
     priority: 150

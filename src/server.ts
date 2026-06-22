@@ -25,8 +25,10 @@ import {
   type McpToolCall,
   type OpenLeashPluginManifest,
   type PluginCatalogItem,
+  type PluginLogRecord,
   type PluginMarketplaceListing,
   type PluginRunRecord,
+  type PluginSettingState,
   type Policy,
   type PolicyDecision
 } from "@openleash/shared";
@@ -42,7 +44,7 @@ import {
 import { firstPartyPluginManifests } from "./plugins/registry.js";
 import { eventForHookEvent } from "./plugins/events.js";
 import { runEvaluationPipeline, runPromptPipeline } from "./plugins/runtime.js";
-import { runSiemExporter } from "./plugins/siem-exporter/index.js";
+import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
 import { runSkillScanner } from "./plugins/skill-scanner/index.js";
 import type { PromptPipelineResult } from "./plugins/types.js";
 import {
@@ -3275,6 +3277,105 @@ async function recordPluginRuns(conversationEventId: string, runs: PluginRunReco
   );
 }
 
+async function readPluginLogsForConversation(conversationEventId: string): Promise<PluginLogRecord[]> {
+  const rows = await pool.query<{
+    id: string;
+    plugin_id: string;
+    level: PluginLogRecord["level"];
+    category: PluginLogRecord["category"];
+    code: string | null;
+    message: string;
+    scope: PluginLogRecord["scope"] | null;
+    data: Record<string, unknown> | null;
+    created_at: string;
+  }>(
+    `select id, plugin_id, level, category, code, message, scope, data, created_at
+     from plugin_log_events
+     where conversation_event_id = $1
+     order by created_at asc`,
+    [conversationEventId]
+  );
+  return rows.rows.map((row) => ({
+    id: row.id,
+    pluginId: row.plugin_id,
+    level: row.level,
+    category: row.category,
+    code: row.code ?? undefined,
+    message: row.message,
+    scope: row.scope ?? undefined,
+    data: row.data ?? {},
+    createdAt: row.created_at
+  }));
+}
+
+async function recordOpenLeashSystemLog({
+  organizationId,
+  conversationEventId,
+  userId,
+  computerId,
+  runtimeId,
+  level,
+  code,
+  message,
+  data
+}: {
+  organizationId: string;
+  conversationEventId: string;
+  userId?: string;
+  computerId?: string;
+  runtimeId?: string;
+  level: PluginLogRecord["level"];
+  code: string;
+  message: string;
+  data?: Record<string, unknown>;
+}) {
+  await pool.query(
+    `insert into plugin_log_events
+     (organization_id, plugin_id, conversation_event_id, user_id, computer_id, agent_runtime_id, level, category, code, message, data)
+     values ($1, 'openleash.core', $2, $3, $4, $5, $6, 'system', $7, $8, $9::jsonb)`,
+    [
+      organizationId,
+      conversationEventId,
+      userId ?? null,
+      computerId ?? null,
+      runtimeId ?? null,
+      level,
+      code,
+      message,
+      JSON.stringify(data ?? {})
+    ]
+  );
+}
+
+async function exportPluginLogs({
+  logs,
+  organization,
+  user,
+  request,
+  conversationEventId,
+  plugins
+}: {
+  logs: PluginLogRecord[];
+  organization: { id: string; name?: string; slug?: string | null };
+  user: { id: string; email?: string; displayName?: string };
+  request: EvaluationRequest;
+  conversationEventId: string;
+  plugins: Map<string, PluginSettingState>;
+}) {
+  const runs: PluginRunRecord[] = [];
+  for (const log of logs) {
+    runs.push(...await runLogExportPlugins({
+      log,
+      organization,
+      user,
+      request,
+      conversationEventId,
+      plugins
+    }));
+  }
+  return runs;
+}
+
 async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Promise<EvaluationResponse> {
   const intentKey = triggerIntentKey(request);
   const { conversationEventId, computerId, runtimeId, organizationId } = await recordConversationEvent(request, user, intentKey);
@@ -3294,7 +3395,17 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
   );
   const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
   const runtimePlugins = await pluginSettingsForRuntime(organizationId);
-  const pipeline = await runEvaluationPipeline({ request, organizationId, policies: policies.rows, tenantModelKey, plugins: runtimePlugins });
+  const pipeline = await runEvaluationPipeline({
+    request,
+    organizationId,
+    conversationEventId,
+    userId: user.id,
+    computerId,
+    runtimeId,
+    policies: policies.rows,
+    tenantModelKey,
+    plugins: runtimePlugins
+  });
   const { results: evaluatedResults, model } = pipeline;
   const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, evaluatedResults);
   const results = promptOnlyDeferred ? deferPromptOnlyPolicyResults(evaluatedResults) : evaluatedResults;
@@ -3352,9 +3463,41 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     request,
     decision
   });
+  if (decision === "ask") {
+    await recordOpenLeashSystemLog({
+      organizationId,
+      conversationEventId,
+      userId: user.id,
+      computerId,
+      runtimeId,
+      level: "security",
+      code: "action-held-for-approval",
+      message: summary,
+      data: {
+        evaluationId: evaluation.rows[0].id,
+        eventName: request.event.eventName,
+        toolName: request.event.tool?.name,
+        policyNames: results
+          .filter((result) => result.status === "failed" || result.status === "needs_question")
+          .map((result) => result.policyName)
+      }
+    });
+  }
   const organization = await organizationSummary(organizationId);
-  const siemSettings = runtimePlugins.get("openleash.siem-exporter");
-  const siemRun = await runSiemExporter({
+  const pluginLogs = await readPluginLogsForConversation(conversationEventId);
+  const logExportRuns = await exportPluginLogs({
+    logs: pluginLogs,
+    organization,
+    user: {
+      id: user.id,
+      email: user.email,
+      displayName: user.display_name
+    },
+    request,
+    conversationEventId,
+    plugins: runtimePlugins
+  });
+  const exportRuns = await runExportPlugins({
     request,
     event: eventForRequest(request),
     decision,
@@ -3371,12 +3514,10 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     runtimeId,
     policyResults: results,
     pluginRuns: pipeline.runs,
-    config: {
-      ...(siemSettings?.config ?? {}),
-      enabled: Boolean(siemSettings?.enabled)
-    }
+    pluginLogs,
+    plugins: runtimePlugins
   });
-  await recordPluginRuns(conversationEventId, [...pipeline.runs, siemRun]);
+  await recordPluginRuns(conversationEventId, [...pipeline.runs, ...logExportRuns, ...exportRuns]);
   let purposeSummary: string | undefined;
   if (decision === "ask") {
     purposeSummary = await summarizeActionPurpose(request, tenantModelKey);

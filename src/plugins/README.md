@@ -54,6 +54,7 @@ Permissions are declarative and should match what the implementation actually ne
 - `filesystem:read` / `filesystem:write`
 - `storage:read` / `storage:write`
 - `audit:write`
+- `log:write`
 - `notification:send`
 
 The current runtime uses these for catalog and UI clarity. External plugin isolation should enforce them before third-party plugins are supported.
@@ -69,9 +70,10 @@ await capabilities.prompt.compress({ prompt, level: "standard" });
 await capabilities.dlp.inspect({ prompt, action: "mask", categories: ["pii"] });
 await capabilities.storage.set({ key: "last-risk", value: { score: 82 } });
 const recent = await capabilities.storage.list({ keyPrefix: "sessions/", limit: 25 });
+await capabilities.log.emit({ level: "security", message: "Custom evaluator flagged a risky action." });
 ```
 
-If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, or other approved services.
+If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, plugin/system logs, or other approved services.
 
 ## Build A Plugin
 
@@ -232,7 +234,25 @@ if (!previous) {
 }
 ```
 
-That returned finding/`needs_question` is what OpenLeash core turns into the actual approval flow. The plugin does not directly pop a desktop window; OpenLeash core owns desktop, mobile, dashboard, audit, and native hook response delivery.
+That returned finding/`needs_question` is what OpenLeash core turns into the actual approval flow. The plugin does not directly pop a desktop window; OpenLeash core owns desktop, mobile, dashboard, audit, notification policy, SIEM export, and native hook response delivery.
+
+## Plugin And System Logs
+
+Plugins emit structured logs through `capabilities.log.emit`. The runtime injects the organization, plugin id, user, host, runtime, and conversation event linkage; plugin code cannot write arbitrary audit rows or pretend to be another plugin.
+
+```ts
+await capabilities.log.emit({
+  level: "security",
+  category: "security",
+  code: "custom-risk",
+  message: "Custom evaluator flagged a risky action.",
+  data: { riskScore: 91 }
+});
+```
+
+OpenLeash core can write its own `openleash.core` system log records for product events such as held approvals or backend failures. The SIEM exporter subscribes to both streams as `log.emitted`, so SOC tools can receive OpenLeash system messages and plugin messages without giving plugins direct network or database access.
+
+Notification capabilities follow the same rule: a plugin can request or dedupe a notification-shaped event, but OpenLeash core owns whether it is sent, suppressed, silenced, rate-limited, or routed elsewhere.
 
 ## Events
 
@@ -241,6 +261,7 @@ Use the narrowest event possible:
 - `openleash.startup`
 - `agent.detected`
 - `skill.changed`
+- `log.emitted`
 - `prompt.beforeSubmit`
 - `agent.response`
 - `tool.beforeUse`
