@@ -26,6 +26,10 @@ export type PromptPipelineInput = {
   request: EvaluationRequest;
   config: PluginPromptPipelineConfig;
   organizationId?: string;
+  conversationEventId?: string;
+  userId?: string;
+  computerId?: string;
+  runtimeId?: string;
   apiKey?: string;
   plugins?: Map<string, PluginSettingState>;
 };

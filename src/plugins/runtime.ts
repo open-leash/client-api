@@ -25,7 +25,11 @@ export async function runPromptPipeline(input: PromptPipelineInput): Promise<Pro
       apiKey: input.apiKey,
       organizationId: input.organizationId,
       pluginId: plugin.id,
-      request: input.request
+      request: input.request,
+      conversationEventId: input.conversationEventId,
+      userId: input.userId,
+      computerId: input.computerId,
+      runtimeId: input.runtimeId
     });
     if (plugin.id === "openleash.prompt-compression") {
       const step = await runPromptCompression({
@@ -104,7 +108,7 @@ export async function runEvaluationPipeline(input: EvaluationPipelineInput): Pro
     }
 
     if (plugin.id === "openleash.mcp-scanner") {
-      const mcp = runMcpScanner(input);
+      const mcp = await runMcpScanner(input, capabilities);
       mcpCall = mcp.call;
       runs.push(mcp.run);
     }

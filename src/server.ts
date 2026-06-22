@@ -44,6 +44,7 @@ import {
 import { firstPartyPluginManifests } from "./plugins/registry.js";
 import { eventForHookEvent } from "./plugins/events.js";
 import { runEvaluationPipeline, runPromptPipeline } from "./plugins/runtime.js";
+import { createPluginCapabilities } from "./plugins/capabilities.js";
 import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
 import { runSkillScanner } from "./plugins/skill-scanner/index.js";
 import type { PromptPipelineResult } from "./plugins/types.js";
@@ -585,6 +586,124 @@ app.get("/admin/overview", async (_req, res, next) => {
       policies: policies.rows,
       users: users.rows,
       usage: { sessions: usageSessions.rows }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/admin/security", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const days = Math.max(1, Math.min(180, Number(req.query.days ?? 30) || 30));
+    const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const [summary, signals, byPlugin, byUser, usageByPlugin, usageByUser, correlations] = await Promise.all([
+      pool.query(
+        `select
+           count(*)::int as total_signals,
+           count(*) filter (where kind = 'security.finding')::int as findings,
+           count(*) filter (where severity in ('high', 'critical'))::int as high_severity,
+           count(*) filter (where decision in ('blocked', 'deny', 'ask'))::int as contained,
+           count(distinct user_id)::int as affected_users
+         from plugin_signals
+         where organization_id = $1 and created_at >= $2`,
+        [organizationId, start]
+      ),
+      pool.query(
+        `select ps.id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary, ps.decision, ps.status,
+                ps.target, ps.details, ps.correlation_keys, ps.occurred_at, ps.created_at,
+                u.id as user_id, u.email as user_email, u.display_name as user_name,
+                c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
+                ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+         from plugin_signals ps
+         left join users u on u.id = ps.user_id
+         left join computers c on c.id = ps.computer_id
+         left join agent_runtimes ar on ar.id = ps.agent_runtime_id
+         left join conversation_events ce on ce.id = ps.conversation_event_id
+         left join evaluations e on e.conversation_event_id = ce.id
+         where ps.organization_id = $1 and ps.created_at >= $2
+         order by ps.created_at desc
+         limit 100`,
+        [organizationId, start]
+      ),
+      pool.query(
+        `select plugin_id, kind, severity, count(*)::int as count
+         from plugin_signals
+         where organization_id = $1 and created_at >= $2
+         group by plugin_id, kind, severity
+         order by count desc, plugin_id asc`,
+        [organizationId, start]
+      ),
+      pool.query(
+        `select u.id as user_id, u.email, u.display_name as name,
+                count(*)::int as signal_count,
+                count(*) filter (where ps.severity in ('high', 'critical'))::int as high_count,
+                max(ps.created_at) as last_signal_at
+         from plugin_signals ps
+         left join users u on u.id = ps.user_id
+         where ps.organization_id = $1 and ps.created_at >= $2
+         group by u.id, u.email, u.display_name
+         order by high_count desc, signal_count desc
+         limit 25`,
+        [organizationId, start]
+      ),
+      pool.query(
+        `select plugin_id, kind, coalesce(provider, 'plugin') as provider, coalesce(model, '') as model,
+                count(*)::int as records,
+                coalesce(sum(input_tokens), 0)::int as input_tokens,
+                coalesce(sum(output_tokens), 0)::int as output_tokens,
+                coalesce(sum(saved_tokens), 0)::int as saved_tokens,
+                coalesce(sum(estimated_cost_cents), 0)::int as estimated_cost_cents
+         from plugin_usage_records
+         where organization_id = $1 and created_at >= $2
+         group by plugin_id, kind, provider, model
+         order by estimated_cost_cents desc, records desc
+         limit 50`,
+        [organizationId, start]
+      ),
+      pool.query(
+        `select u.id as user_id, u.email, u.display_name as name,
+                count(pur.*)::int as records,
+                coalesce(sum(pur.input_tokens), 0)::int as input_tokens,
+                coalesce(sum(pur.output_tokens), 0)::int as output_tokens,
+                coalesce(sum(pur.saved_tokens), 0)::int as saved_tokens,
+                coalesce(sum(pur.estimated_cost_cents), 0)::int as estimated_cost_cents,
+                max(pur.created_at) as last_usage_at
+         from plugin_usage_records pur
+         left join users u on u.id = pur.user_id
+         where pur.organization_id = $1 and pur.created_at >= $2
+         group by u.id, u.email, u.display_name
+         order by estimated_cost_cents desc, records desc
+         limit 25`,
+        [organizationId, start]
+      ),
+      pool.query(
+        `select key as correlation_key,
+                count(*)::int as signal_count,
+                count(distinct plugin_id)::int as plugin_count,
+                count(distinct user_id)::int as user_count,
+                max(created_at) as last_signal_at,
+                array_agg(distinct plugin_id) as plugin_ids
+         from plugin_signals ps, unnest(ps.correlation_keys) as key
+         where ps.organization_id = $1 and ps.created_at >= $2
+         group by key
+         having count(*) > 1 or count(distinct plugin_id) > 1
+         order by plugin_count desc, signal_count desc, last_signal_at desc
+         limit 30`,
+        [organizationId, start]
+      )
+    ]);
+    res.json({
+      range: { days, since: start.toISOString() },
+      summary: summary.rows[0] ?? {},
+      signals: signals.rows,
+      byPlugin: byPlugin.rows,
+      byUser: byUser.rows,
+      usage: {
+        byPlugin: usageByPlugin.rows,
+        byUser: usageByUser.rows
+      },
+      correlations: correlations.rows
     });
   } catch (error) {
     next(error);
@@ -2263,7 +2382,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
 	    const reasons = normalizeSkillReasons(body.reasons);
     const content = typeof body.content === "string" ? body.content.slice(0, 80000) : null;
     const contentPreview = typeof body.contentPreview === "string" ? body.contentPreview.slice(0, 12000) : content?.slice(0, 12000) ?? null;
-    const skillScan = runSkillScanner({
+    const skillScan = await runSkillScanner({
       agentKind: body.agentKind ?? "unknown",
       agentName: body.agentName ?? "Local agent",
       skillName,
@@ -2284,6 +2403,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       skillPath
     });
     const client = await pool.connect();
+    let signalContext: { eventId: string; computerId: string; runtimeId: string } | undefined;
     try {
       await client.query("begin");
       const skill = await client.query(
@@ -2375,6 +2495,11 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           ]
         );
         evaluationId = evaluation.rows[0].id;
+        signalContext = {
+          eventId: event.rows[0].id,
+          computerId: computer.rows[0].id,
+          runtimeId: runtime.rows[0].id
+        };
         await client.query(
           `insert into policy_results (evaluation_id, policy_id, policy_name, status, severity, explanation, evidence, question)
            values ($1, null, 'Agent skill integrity', 'needs_question', 'high', $2, $3::jsonb, $4)`,
@@ -2410,6 +2535,52 @@ app.post("/v1/skills/observations", async (req, res, next) => {
         ]
       );
       await client.query("commit");
+      if (signalContext) {
+        await createPluginCapabilities({
+          organizationId,
+          pluginId: "openleash.skill-scanner",
+          conversationEventId: signalContext.eventId,
+          userId: user.id,
+          computerId: signalContext.computerId,
+          runtimeId: signalContext.runtimeId,
+          request: {
+            computer: {
+              hostname: req.hostname || "unknown",
+              platform: "unknown"
+            },
+            agent: {
+              kind: body.agentKind ?? "unknown",
+              displayName: body.agentName ?? "Local agent"
+            },
+            event: {
+              eventName: "SubagentStart",
+              agentKind: body.agentKind ?? "unknown",
+              sessionId: `skill:${skillPath}`,
+              projectPath: body.projectPath ?? undefined,
+              prompt: `Skill ${skillName} changed at ${skillPath}`,
+              occurredAt: new Date().toISOString(),
+              raw: { openleashEventType: "skill-risk", skillName, skillPath }
+            }
+          } as EvaluationRequest
+        }).signals.emit({
+          kind: "security.finding",
+          severity: "high",
+          title: "Suspicious skill behavior",
+          summary: "Skill scanner found behavior that needs review.",
+          decision: "ask",
+          status,
+          target: { type: "agent_skill", name: skillName },
+          evidence: skillScan.reasons,
+          details: {
+            skillName,
+            skillPath,
+            agentKind: body.agentKind ?? "unknown",
+            agentName: body.agentName ?? "Local agent",
+            riskScore: skillScan.riskScore
+          },
+          correlationKeys: [`skill:${skillName}`, `agent:${body.agentKind ?? "unknown"}`]
+        });
+      }
       if (evaluationId) {
         notifyMobileApprovers(user.id, evaluationId, "Possible malicious skill", "Delete this skill or approve it?", undefined).catch((error) => {
           console.warn("mobile skill notification failed", error);
@@ -2828,7 +2999,7 @@ type ApiUser = { id: string; email?: string; display_name?: string; organization
 
 async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventName, request: EvaluationRequest, user: ApiUser) {
   const intentKey = triggerIntentKey(request);
-  const { conversationEventId, organizationId } = await recordConversationEvent(request, user, intentKey);
+  const { conversationEventId, computerId, runtimeId, organizationId } = await recordConversationEvent(request, user, intentKey);
   const config = await readPromptTransformConfig(organizationId);
   if (!request.event.prompt || !promptTransformsEnabled(config)) {
     return nativeHookDecision(agent, eventName, { decision: "allow", decisionId: "", summary: "OpenLeash logged this prompt intent.", results: [] });
@@ -2837,6 +3008,10 @@ async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventNa
     request,
     config,
     organizationId,
+    conversationEventId,
+    userId: user.id,
+    computerId,
+    runtimeId,
     apiKey: process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY,
     plugins: await pluginSettingsForRuntime(organizationId)
   });
@@ -5682,6 +5857,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
 
   if (
     requestPath === "/admin/overview" ||
+    requestPath === "/admin/security" ||
     requestPath === "/admin/mcp-servers" ||
     /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/skills" ||
@@ -5775,6 +5951,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && /^\/admin\/decisions\/[^/]+\/resolve$/.test(requestPath)) return "tenantDecisionResolve";
   if (verb === "GET" && requestPath === "/admin/tray-status") return "tenantTrayStatus";
   if (verb === "GET" && requestPath === "/admin/overview") return "adminOverview";
+  if (verb === "GET" && requestPath === "/admin/security") return "adminSecurity";
   if (verb === "GET" && requestPath === "/admin/mcp-servers") return "adminMcpServers";
   if (verb === "GET" && /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath)) return "adminMcpServerDetail";
   if (verb === "GET" && requestPath === "/admin/skills") return "adminSkills";

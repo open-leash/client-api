@@ -44,6 +44,28 @@ export async function runDlp({
     masked: inspected.masked
   };
   const summary = dlpSummary(dlp, inspected.blocked);
+  if (inspected.matched) {
+    await capabilities.signals.emit({
+      kind: "secret.detected",
+      severity: inspected.blocked ? "high" : "medium",
+      title: inspected.blocked ? "Sensitive data blocked" : "Sensitive data detected",
+      summary,
+      decision: inspected.blocked ? "blocked" : inspected.masked ? "observed" : "allow",
+      status: inspected.masked ? "masked" : inspected.blocked ? "blocked" : "detected",
+      target: { type: "prompt", name: "agent prompt" },
+      evidence: inspected.findings.map((finding) => ({
+        category: finding.category,
+        reason: finding.reason,
+        quote: finding.quote
+      })),
+      details: {
+        categories: inspected.categories,
+        action: config.action,
+        model: inspected.model
+      },
+      correlationKeys: inspected.categories.map((category) => `dlp:${category}`)
+    });
+  }
   const result = {
     finalPrompt: inspected.prompt,
     blocked: inspected.blocked,

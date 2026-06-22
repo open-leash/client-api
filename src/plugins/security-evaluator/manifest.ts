@@ -9,7 +9,7 @@ export const securityEvaluatorManifest: OpenLeashPluginManifest = {
   runtime: "openleash-core",
   entrypoint: "plugins/security-evaluator",
   events: ["prompt.beforeSubmit", "agent.response", "tool.beforeUse", "tool.afterUse"],
-  permissions: ["event:read", "prompt:read", "tool:read", "decision:write", "model:invoke", "audit:write", "log:write", "notification:send"],
+  permissions: ["event:read", "prompt:read", "tool:read", "decision:write", "model:invoke", "audit:write", "log:write", "signal:write", "usage:write", "notification:send"],
   effects: ["observe", "ask", "deny"],
   ordering: {
     priority: 300,

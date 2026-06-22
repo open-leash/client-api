@@ -41,6 +41,19 @@ export async function runPromptCompression({
     compressedLength: compressed.compressedLength,
     ratio: compressed.ratio
   };
+  await capabilities.usage.record({
+    kind: "llm.tokens",
+    model: compressed.model,
+    provider: "openleash-evaluator",
+    inputTokens: compressed.originalLength,
+    outputTokens: compressed.compressedLength,
+    savedTokens: Math.max(0, compressed.originalLength - compressed.compressedLength),
+    details: {
+      level: config.level,
+      conciseResponse: config.conciseResponse,
+      ratio: compressed.ratio
+    }
+  });
   const summary = compressionSummary(prompt, compressed.prompt, compression);
   const result = {
     finalPrompt: compressed.prompt,

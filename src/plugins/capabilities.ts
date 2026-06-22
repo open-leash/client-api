@@ -4,9 +4,15 @@ import type {
   PluginLogRecord,
   PluginLogLevel,
   PluginLogRequest,
+  PluginSignalKind,
+  PluginSignalRecord,
+  PluginSignalRequest,
   PluginStorageGetRequest,
   PluginStorageListRequest,
-  PluginStorageScope
+  PluginStorageScope,
+  PluginUsageKind,
+  PluginUsageRecord,
+  PluginUsageRecordRequest
 } from "@openleash/shared";
 import { pool } from "../db.js";
 import { evaluatePolicies } from "../evaluator.js";
@@ -154,6 +160,34 @@ export function createPluginCapabilities({
           log
         });
       }
+    },
+    signals: {
+      async emit(signal) {
+        return emitPluginSignal({
+          organizationId,
+          pluginId,
+          conversationEventId,
+          userId,
+          computerId,
+          runtimeId,
+          request,
+          signal
+        });
+      }
+    },
+    usage: {
+      async record(usage) {
+        return recordPluginUsage({
+          organizationId,
+          pluginId,
+          conversationEventId,
+          userId,
+          computerId,
+          runtimeId,
+          request,
+          usage
+        });
+      }
     }
   };
 }
@@ -226,6 +260,208 @@ async function emitPluginLog({
   };
 }
 
+async function emitPluginSignal({
+  organizationId,
+  pluginId,
+  conversationEventId,
+  userId,
+  computerId,
+  runtimeId,
+  request,
+  signal
+}: {
+  organizationId?: string;
+  pluginId: string;
+  conversationEventId?: string;
+  userId?: string;
+  computerId?: string;
+  runtimeId?: string;
+  request?: EvaluationRequest;
+  signal: PluginSignalRequest;
+}): Promise<PluginSignalRecord> {
+  const kind = normalizeSignalKind(signal.kind);
+  const severity = normalizeSignalSeverity(signal.severity);
+  const title = cleanText(signal.title, 240) || "Plugin signal";
+  const summary = cleanText(signal.summary, 2000);
+  const decision = normalizeSignalDecision(signal.decision);
+  const status = cleanText(signal.status, 80);
+  const target = sanitizeTarget(signal.target);
+  const evidence = sanitizeEvidence(signal.evidence);
+  const details = sanitizeLogData(signal.details);
+  const correlationKeys = normalizeCorrelationKeys(signal.correlationKeys, request, userId, computerId, runtimeId);
+  const occurredAt = normalizeTimestamp(signal.occurredAt);
+  const createdAt = new Date().toISOString();
+
+  if (!organizationId) {
+    return signalRecord({
+      pluginId,
+      kind,
+      severity,
+      title,
+      summary,
+      decision,
+      status,
+      target,
+      evidence,
+      details,
+      correlationKeys,
+      occurredAt,
+      createdAt,
+      request
+    });
+  }
+
+  const result = await pool.query<{ id: string; created_at: string; occurred_at: string }>(
+    `insert into plugin_signals
+     (organization_id, plugin_id, conversation_event_id, user_id, computer_id, agent_runtime_id, kind, severity, title, summary, decision, status, target, evidence, details, correlation_keys, occurred_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15::jsonb, $16::text[], $17)
+     returning id, created_at, occurred_at`,
+    [
+      organizationId,
+      pluginId,
+      conversationEventId ?? null,
+      userId ?? null,
+      computerId ?? null,
+      runtimeId ?? null,
+      kind,
+      severity,
+      title,
+      summary ?? null,
+      decision ?? null,
+      status ?? null,
+      JSON.stringify(target),
+      JSON.stringify(evidence),
+      JSON.stringify(details),
+      correlationKeys,
+      occurredAt
+    ]
+  );
+
+  return signalRecord({
+    id: result.rows[0]?.id,
+    organizationId,
+    conversationEventId,
+    userId,
+    computerId,
+    agentRuntimeId: runtimeId,
+    pluginId,
+    kind,
+    severity,
+    title,
+    summary,
+    decision,
+    status,
+    target,
+    evidence,
+    details,
+    correlationKeys,
+    occurredAt: result.rows[0]?.occurred_at ?? occurredAt,
+    createdAt: result.rows[0]?.created_at ?? createdAt,
+    request
+  });
+}
+
+async function recordPluginUsage({
+  organizationId,
+  pluginId,
+  conversationEventId,
+  userId,
+  computerId,
+  runtimeId,
+  request,
+  usage
+}: {
+  organizationId?: string;
+  pluginId: string;
+  conversationEventId?: string;
+  userId?: string;
+  computerId?: string;
+  runtimeId?: string;
+  request?: EvaluationRequest;
+  usage: PluginUsageRecordRequest;
+}): Promise<PluginUsageRecord> {
+  const kind = normalizeUsageKind(usage.kind);
+  const provider = cleanText(usage.provider, 80);
+  const model = cleanText(usage.model, 160);
+  const quantity = finiteNumber(usage.quantity);
+  const unit = cleanText(usage.unit, 40);
+  const inputTokens = finiteInteger(usage.inputTokens);
+  const outputTokens = finiteInteger(usage.outputTokens);
+  const savedTokens = finiteInteger(usage.savedTokens);
+  const estimatedCostCents = Math.max(0, Math.round(finiteNumber(usage.estimatedCostUsd) * 100));
+  const details = sanitizeLogData(usage.details);
+  const occurredAt = normalizeTimestamp(usage.occurredAt);
+  const createdAt = new Date().toISOString();
+
+  if (!organizationId) {
+    return usageRecord({
+      pluginId,
+      kind,
+      provider,
+      model,
+      quantity,
+      unit,
+      inputTokens,
+      outputTokens,
+      savedTokens,
+      estimatedCostUsd: estimatedCostCents / 100,
+      details,
+      occurredAt,
+      createdAt,
+      request
+    });
+  }
+
+  const result = await pool.query<{ id: string; created_at: string; occurred_at: string }>(
+    `insert into plugin_usage_records
+     (organization_id, plugin_id, conversation_event_id, user_id, computer_id, agent_runtime_id, kind, provider, model, quantity, unit, input_tokens, output_tokens, saved_tokens, estimated_cost_cents, details, occurred_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17)
+     returning id, created_at, occurred_at`,
+    [
+      organizationId,
+      pluginId,
+      conversationEventId ?? null,
+      userId ?? null,
+      computerId ?? null,
+      runtimeId ?? null,
+      kind,
+      provider ?? null,
+      model ?? null,
+      quantity,
+      unit ?? null,
+      inputTokens,
+      outputTokens,
+      savedTokens,
+      estimatedCostCents,
+      JSON.stringify(details),
+      occurredAt
+    ]
+  );
+
+  return usageRecord({
+    id: result.rows[0]?.id,
+    organizationId,
+    conversationEventId,
+    userId,
+    computerId,
+    agentRuntimeId: runtimeId,
+    pluginId,
+    kind,
+    provider,
+    model,
+    quantity,
+    unit,
+    inputTokens,
+    outputTokens,
+    savedTokens,
+    estimatedCostUsd: estimatedCostCents / 100,
+    details,
+    occurredAt: result.rows[0]?.occurred_at ?? occurredAt,
+    createdAt: result.rows[0]?.created_at ?? createdAt,
+    request
+  });
+}
+
 function scopeKey(scope: PluginStorageScope | undefined, request: EvaluationRequest | undefined) {
   const merged = {
     agentKind: scope?.agentKind ?? request?.agent.kind,
@@ -273,6 +509,119 @@ function sanitizeLogData(value: unknown): Record<string, unknown> {
       .slice(0, 50)
       .map(([key, entry]) => [key.slice(0, 120), sanitizeLogValue(entry, 0)])
   );
+}
+
+function normalizeSignalKind(value: unknown): PluginSignalKind {
+  const kinds: PluginSignalKind[] = [
+    "security.finding",
+    "policy.decision",
+    "approval.event",
+    "secret.detected",
+    "tool.risk",
+    "mcp.discovery",
+    "identity.risk",
+    "audit.event",
+    "plugin.health",
+    "export.status"
+  ];
+  return kinds.includes(value as PluginSignalKind) ? value as PluginSignalKind : "audit.event";
+}
+
+function normalizeSignalSeverity(value: unknown): PluginSignalRecord["severity"] {
+  return value === "critical" || value === "high" || value === "medium" || value === "low" || value === "info"
+    ? value
+    : "info";
+}
+
+function normalizeUsageKind(value: unknown): PluginUsageKind {
+  const kinds: PluginUsageKind[] = ["llm.tokens", "plugin.compute", "plugin.operation", "network.egress", "storage.bytes"];
+  return kinds.includes(value as PluginUsageKind) ? value as PluginUsageKind : "plugin.operation";
+}
+
+function normalizeSignalDecision(value: unknown): PluginSignalRequest["decision"] {
+  return value === "allow" ||
+    value === "ask" ||
+    value === "deny" ||
+    value === "blocked" ||
+    value === "approved" ||
+    value === "rejected" ||
+    value === "observed"
+    ? value
+    : undefined;
+}
+
+function cleanText(value: unknown, max: number) {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text ? text.slice(0, max) : undefined;
+}
+
+function sanitizeTarget(value: PluginSignalRequest["target"] | undefined) {
+  if (!value || typeof value !== "object") return {};
+  return {
+    ...(cleanText(value.type, 80) ? { type: cleanText(value.type, 80) } : {}),
+    ...(cleanText(value.name, 240) ? { name: cleanText(value.name, 240) } : {}),
+    ...(cleanText(value.id, 160) ? { id: cleanText(value.id, 160) } : {})
+  };
+}
+
+function sanitizeEvidence(value: unknown) {
+  if (value === undefined) return [];
+  return sanitizeLogValue(value, 0);
+}
+
+function normalizeCorrelationKeys(
+  keys: string[] | undefined,
+  request: EvaluationRequest | undefined,
+  userId?: string,
+  computerId?: string,
+  runtimeId?: string
+) {
+  const base = [
+    userId ? `user:${userId}` : undefined,
+    computerId ? `computer:${computerId}` : undefined,
+    runtimeId ? `agent-runtime:${runtimeId}` : undefined,
+    request?.agent.kind ? `agent:${request.agent.kind}` : undefined,
+    request?.event.sessionId ? `session:${request.event.sessionId}` : undefined
+  ];
+  return [...new Set([...(keys ?? []), ...base]
+    .filter((key): key is string => typeof key === "string" && key.trim().length > 0)
+    .map((key) => key.trim().slice(0, 200)))]
+    .slice(0, 24);
+}
+
+function normalizeTimestamp(value: unknown) {
+  if (typeof value === "string" && !Number.isNaN(Date.parse(value))) return new Date(value).toISOString();
+  return new Date().toISOString();
+}
+
+function finiteNumber(value: unknown) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function finiteInteger(value: unknown) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : 0;
+}
+
+function signalRecord(input: PluginSignalRecord & { request?: EvaluationRequest }): PluginSignalRecord {
+  const { request, ...record } = input;
+  return {
+    ...record,
+    agentKind: record.agentKind ?? request?.agent.kind,
+    sessionId: record.sessionId ?? request?.event.sessionId,
+    projectPath: record.projectPath ?? request?.event.projectPath
+  };
+}
+
+function usageRecord(input: PluginUsageRecord & { request?: EvaluationRequest }): PluginUsageRecord {
+  const { request, ...record } = input;
+  return {
+    ...record,
+    agentKind: record.agentKind ?? request?.agent.kind,
+    sessionId: record.sessionId ?? request?.event.sessionId,
+    projectPath: record.projectPath ?? request?.event.projectPath
+  };
 }
 
 function sanitizeLogValue(value: unknown, depth: number): unknown {

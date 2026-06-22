@@ -12,6 +12,56 @@ export async function runSecurityEvaluator(input: EvaluationPipelineInput, capab
     policies: input.policies
   });
   const failed = results.filter((result) => result.status === "failed" || result.status === "needs_question");
+  for (const result of failed) {
+    await capabilities.signals.emit({
+      kind: "security.finding",
+      severity: result.status === "failed" ? "high" : result.severity,
+      title: result.policyName,
+      summary: result.explanation,
+      decision: result.status === "failed" ? "blocked" : "ask",
+      status: result.status,
+      target: {
+        type: input.request.event.tool?.name ? "tool_call" : "agent_event",
+        name: input.request.event.tool?.name ?? input.request.event.eventName
+      },
+      evidence: result.evidence ?? [],
+      details: {
+        policyName: result.policyName,
+        question: result.question,
+        model
+      },
+      correlationKeys: [`policy:${result.policyName}`]
+    });
+    await capabilities.signals.emit({
+      kind: "policy.decision",
+      severity: result.severity,
+      title: `${result.policyName}: ${result.status}`,
+      summary: result.explanation,
+      decision: result.status === "failed" ? "blocked" : "ask",
+      status: result.status,
+      target: {
+        type: input.request.event.tool?.name ? "tool_call" : "agent_event",
+        name: input.request.event.tool?.name ?? input.request.event.eventName
+      },
+      details: {
+        policyName: result.policyName,
+        model
+      },
+      correlationKeys: [`policy:${result.policyName}`]
+    });
+  }
+  await capabilities.usage.record({
+    kind: "plugin.operation",
+    provider: "openleash-evaluator",
+    model,
+    quantity: results.length,
+    unit: "policy_results",
+    details: {
+      policyCount: input.policies.length,
+      reviewedCount: results.length,
+      failedCount: failed.length
+    }
+  });
   if (failed.length > 0) {
     await capabilities.log.emit({
       level: failed.some((result) => result.status === "failed") ? "security" : "warn",
