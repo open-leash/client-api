@@ -5967,8 +5967,6 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/auth/google/callback" ||
     requestPath === "/auth/microsoft/start" ||
     requestPath === "/auth/microsoft/callback" ||
-    requestPath === "/v1/auth/google/callback" ||
-    requestPath === "/v1/auth/microsoft/callback" ||
     /^\/organizations\/[^/]+\/sso-providers$/.test(requestPath) ||
     /^\/organizations\/[^/]+$/.test(requestPath) ||
     (verb === "POST" && requestPath === "/organizations")
@@ -5978,6 +5976,8 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
 
   if (
     requestPath === "/v1/enroll" ||
+    requestPath === "/v1/auth/google/callback" ||
+    requestPath === "/v1/auth/microsoft/callback" ||
     requestPath === "/public/plugins" ||
     /^\/public\/plugins\/[^/]+$/.test(requestPath) ||
     requestPath === "/v1/evaluate" ||
