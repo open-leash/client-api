@@ -3178,17 +3178,15 @@ async function readMarketplaceListings(search: string, options: { includePending
   if (query) {
     params.push(query);
     where.push(`(
-      to_tsvector('english', name || ' ' || description || ' ' || short_description || ' ' || coalesce(tags::text, '')) @@ plainto_tsquery('english', $${params.length})
+      to_tsvector('english', slug || ' ' || description || ' ' || short_description || ' ' || coalesce(tags::text, '')) @@ plainto_tsquery('english', $${params.length})
       or slug ilike '%' || $${params.length} || '%'
-      or name ilike '%' || $${params.length} || '%'
-      or developer_name ilike '%' || $${params.length} || '%'
     )`);
   }
   const rows = await pool.query(
     `select *
      from plugin_marketplace
      where ${where.join(" and ")}
-     order by featured_rank nulls last, install_count desc, name asc
+     order by featured_rank nulls last, install_count desc, slug asc
      limit 50`,
     params
   );
@@ -3207,10 +3205,11 @@ async function readMarketplaceListingBySlug(slug: string): Promise<PluginMarketp
 }
 
 function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketplaceListing {
+  const slug = String(row.slug);
   return {
     id: String(row.plugin_id),
-    slug: String(row.slug),
-    name: String(row.name),
+    slug,
+    name: slug,
     description: String(row.description),
     version: String(row.version),
     publisher: String(row.publisher),
@@ -3350,12 +3349,11 @@ async function readOrganizationMarketplacePolicy(organizationId: string): Promis
 }
 
 async function createPluginSubmission(organizationId: string, submittedBy: string, body: Record<string, unknown>) {
-  const name = String(body.name ?? "").trim();
-  const slug = slugify(String(body.slug ?? name));
+  const slug = slugify(String(body.slug ?? body.name ?? ""));
   const pluginId = String(body.pluginId ?? `community.${slug}`).trim();
   const developerName = String(body.developerName ?? "").trim();
-  if (!name || !slug || !developerName) {
-    const error = new Error("Plugin name, slug, and developer name are required.");
+  if (!slug || !developerName) {
+    const error = new Error("Plugin slug and developer name are required.");
     (error as Error & { status?: number }).status = 400;
     throw error;
   }
@@ -3364,7 +3362,7 @@ async function createPluginSubmission(organizationId: string, submittedBy: strin
     `insert into plugin_submissions (organization_id, submitted_by, plugin_id, slug, name, developer_name, package_url, repository_url, manifest)
      values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
      returning id, plugin_id as "pluginId", slug, name, developer_name as "developerName", status, created_at as "createdAt"`,
-    [organizationId, submittedBy, pluginId, slug, name, developerName, optionalString(body.packageUrl), optionalString(body.repositoryUrl), JSON.stringify(manifest)]
+    [organizationId, submittedBy, pluginId, slug, slug, developerName, optionalString(body.packageUrl), optionalString(body.repositoryUrl), JSON.stringify(manifest)]
   );
   return { submission: result.rows[0] };
 }

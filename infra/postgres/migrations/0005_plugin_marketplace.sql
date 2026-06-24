@@ -37,7 +37,7 @@ create table if not exists plugin_marketplace (
 );
 
 create index if not exists plugin_marketplace_search_idx on plugin_marketplace using gin (
-  to_tsvector('english', name || ' ' || description || ' ' || short_description || ' ' || coalesce(tags::text, ''))
+  to_tsvector('english', slug || ' ' || description || ' ' || short_description || ' ' || coalesce(tags::text, ''))
 );
 create index if not exists plugin_marketplace_featured_idx on plugin_marketplace(featured_rank) where featured_rank is not null;
 create index if not exists plugin_marketplace_review_idx on plugin_marketplace(review_status);

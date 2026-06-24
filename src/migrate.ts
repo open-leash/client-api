@@ -220,7 +220,7 @@ async function seedFirstPartyMarketplacePlugins() {
       [
         plugin.id,
         plugin.slug,
-        plugin.name,
+        plugin.slug,
         plugin.description,
         plugin.version,
         plugin.publisher,

@@ -3,7 +3,7 @@ import type { OpenLeashPluginManifest } from "@openleash/shared";
 export const siemExporterManifest: OpenLeashPluginManifest = {
   id: "openleash.siem-exporter",
   slug: "siem-exporter",
-  name: "SIEM Exporter",
+  name: "siem-exporter",
   description: "Send agent incidents to your SOC stack.",
   version: "1.0.0",
   publisher: "openleash",

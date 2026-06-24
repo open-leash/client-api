@@ -78,7 +78,7 @@ function toMarketplaceListing(item: PluginImport, index: number): PluginMarketpl
     packageUrl: item.packageName ? `npm:${item.packageName}` : `openleash:plugin/${slug}`,
     repositoryUrl: "https://github.com/open-leash/openleash",
     documentationUrl: `https://docs.openleash.com/plugins/${slug}`,
-    iconText: iconText(slug, manifest.name),
+    iconText: iconText(slug),
     visualPng: `/plugins/${slug}.png`,
     installCount: stats.installs,
     downloadCount: stats.downloads,
@@ -148,7 +148,7 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
     [
       plugin.id,
       plugin.slug,
-      plugin.name,
+      plugin.slug,
       plugin.description,
       plugin.version,
       plugin.publisher,
@@ -190,7 +190,7 @@ function slugForPlugin(manifest: OpenLeashPluginManifest, item: PluginImport) {
   if (explicit) return slugify(explicit);
   const npmName = item.packageName?.split("/").pop()?.replace(/^plugin-/, "");
   const folderName = path.basename(item.root);
-  const base = npmName || folderName || manifest.name || manifest.id;
+  const base = npmName || folderName || manifest.id;
   if (manifest.id === "openleash.security-evaluator") return "sec-evaluator";
   if (manifest.id === "openleash.prompt-compression") return "token-saver";
   return slugify(base);
@@ -227,10 +227,10 @@ function sentence(value: string) {
   return cleaned.endsWith(".") ? cleaned : `${cleaned}.`;
 }
 
-function iconText(slug: string, name: string) {
+function iconText(slug: string) {
   const words = slug.split("-").filter(Boolean);
   if (words.length >= 2) return `${words[0][0]}${words[1][0]}`.toUpperCase();
-  return name.split(/\s+/).slice(0, 2).map((word) => word[0]).join("").toUpperCase() || "OL";
+  return slug.slice(0, 2).toUpperCase() || "OL";
 }
 
 function titleize(value: string) {
