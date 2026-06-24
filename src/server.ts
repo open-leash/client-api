@@ -1320,7 +1320,51 @@ app.get("/auth/session", async (req, res, next) => {
   try {
     const session = await getDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ authenticated: false });
-    res.json({ authenticated: true, user: session.user, organization: session.organization });
+    res.json({
+      authenticated: true,
+      user: session.user,
+      organization: session.organization,
+      account: session.account
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/auth/account/package", async (req, res, next) => {
+  try {
+    const session = await getDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const packageId = normalizeCloudPackage(req.body?.packageId ?? req.body?.plan);
+    if (!packageId) return res.status(400).json({ error: "packageId must be personal-byok, personal-managed, work-byok, or work-managed" });
+    const audience = packageId.startsWith("work-") ? "organization" : "individual";
+    await pool.query(
+      `update users
+       set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
+         'accountAudience', $2::text,
+         'cloudPackage', $3::text,
+         'cloudPackageSelectedAt', now()
+       )
+       where id = $1`,
+      [session.user.id, audience, packageId]
+    );
+    await pool.query(
+      `update organizations
+       set infrastructure_config = coalesce(infrastructure_config, '{}'::jsonb) || jsonb_build_object(
+         'cloudPackage', $2::text,
+         'cloudPackageSelectedAt', now()
+       ),
+       updated_at = now()
+       where id = $1`,
+      [session.organization.id, packageId]
+    );
+    res.json({
+      ok: true,
+      account: {
+        audience,
+        packageId
+      }
+    });
   } catch (error) {
     next(error);
   }
@@ -1526,14 +1570,15 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       const organization: ManagedOrganization = requestedOrganization
         ? { ...requestedOrganization }
         : provisionUser
-          ? await resolveManagedMobileOrganization(profile, audience)
+        ? await resolveManagedMobileOrganization(profile, audience)
           : await resolveExistingMobileOrganizationForProfile(profile);
       const response = await createDashboardSessionFromProfile({
         organizationId: organization.id,
         providerType,
         profile,
         role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer",
-        provisionUser
+        provisionUser,
+        accountAudience: audience
       });
       return res.json({ ...response, authMode: "development" });
     }
@@ -1574,7 +1619,8 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       providerType,
       profile,
       role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer",
-      provisionUser
+      provisionUser,
+      accountAudience: audience
     });
     res.json({ ...response, authMode: providerType === "google" ? "google" : "sso" });
   } catch (error) {
@@ -1936,12 +1982,22 @@ app.post("/admin/onboarding/company", async (req, res, next) => {
     if ((existingSlug.rowCount ?? 0) > 0) {
       return res.status(409).json({ success: false, error: "That dashboard URL is already taken." });
     }
+    const packageId = normalizeCloudPackage(req.body.packageId ?? req.body.plan) ?? "work-managed";
     const result = await pool.query(
       `update organizations
-       set name = $2, slug = $3, region = $4, logo_url = $5, current_step = greatest(current_step, 2), updated_at = now()
+       set name = $2,
+           slug = $3,
+           region = $4,
+           logo_url = $5,
+           infrastructure_config = coalesce(infrastructure_config, '{}'::jsonb) || jsonb_build_object(
+             'cloudPackage', $6::text,
+             'cloudPackageSelectedAt', now()
+           ),
+           current_step = greatest(current_step, 2),
+           updated_at = now()
        where id = $1
        returning *`,
-      [organization.id, name, slug, req.body.region ?? null, req.body.logoUrl ?? null]
+      [organization.id, name, slug, req.body.region ?? null, req.body.logoUrl ?? null, packageId]
     );
     res.json({ organization: result.rows[0] });
   } catch (error) {
@@ -3186,7 +3242,7 @@ async function readMarketplaceListings(search: string, options: { includePending
     `select *
      from plugin_marketplace
      where ${where.join(" and ")}
-     order by featured_rank nulls last, install_count desc, slug asc
+     order by featured_rank nulls last, slug asc
      limit 50`,
     params
   );
@@ -3234,11 +3290,6 @@ function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketpl
     tags: arrayValue(row.tags),
     iconText: String(row.icon_text ?? "OL"),
     visualPng: optionalString(row.visual_png),
-    installCount: Number(row.install_count ?? 0),
-    downloadCount: Number(row.download_count ?? 0),
-    weeklyDownloadCount: Number(row.weekly_download_count ?? 0),
-    trendPercent: Number(row.trend_percent ?? 0),
-    rating: Number(row.rating ?? 0),
     featuredRank: row.featured_rank === null || row.featured_rank === undefined ? null : Number(row.featured_rank),
     seoTitle: String(row.seo_title),
     seoDescription: String(row.seo_description),
@@ -4517,6 +4568,14 @@ function normalizeDeploymentMode(value: unknown) {
   return normalized.includes("private") || normalized.includes("onprem") || normalized.includes("on-prem") ? "private" : "cloud";
 }
 
+function normalizeCloudPackage(value: unknown) {
+  const normalized = String(value ?? "").trim();
+  if (["personal-byok", "personal-managed", "work-byok", "work-managed"].includes(normalized)) {
+    return normalized as "personal-byok" | "personal-managed" | "work-byok" | "work-managed";
+  }
+  return null;
+}
+
 async function getOrganizationBySlug(slug: string) {
   const normalized = slugifyTenant(slug);
   const result = await pool.query(`select * from organizations where slug = $1 limit 1`, [normalized]);
@@ -4571,9 +4630,9 @@ function mobileGoogleConfig() {
 
 function cloudMicrosoftConfig() {
   return {
-    TenantId: process.env.OPENLEASH_MICROSOFT_TENANT_ID ?? process.env.AZURE_TENANT_ID ?? "organizations",
-    ClientId: process.env.OPENLEASH_MICROSOFT_CLIENT_ID ?? process.env.AZURE_CLIENT_ID ?? "",
-    ClientSecret: process.env.OPENLEASH_MICROSOFT_CLIENT_SECRET ?? process.env.AZURE_CLIENT_SECRET ?? ""
+    TenantId: process.env.OPENLEASH_MICROSOFT_TENANT_ID ?? process.env.MICROSOFT_ENTRA_TENANT_ID ?? process.env.AZURE_TENANT_ID ?? "organizations",
+    ClientId: process.env.OPENLEASH_MICROSOFT_CLIENT_ID ?? process.env.MICROSOFT_CLIENT_ID ?? process.env.AZURE_CLIENT_ID ?? "",
+    ClientSecret: process.env.OPENLEASH_MICROSOFT_CLIENT_SECRET ?? process.env.MICROSOFT_CLIENT_SECRET ?? process.env.AZURE_CLIENT_SECRET ?? ""
   };
 }
 
@@ -4671,13 +4730,15 @@ async function createDashboardSessionFromProfile({
   providerType,
   profile,
   role = "engineer",
-  provisionUser = true
+  provisionUser = true,
+  accountAudience = "individual"
 }: {
   organizationId: string;
   providerType: string;
   profile: ManagedAuthProfile;
   role?: string;
   provisionUser?: boolean;
+  accountAudience?: "individual" | "organization";
 }) {
   const organizationResult = await pool.query(`select id, name, slug, region, setup_completed from organizations where id = $1 limit 1`, [organizationId]);
   const organization = organizationResult.rows[0];
@@ -4702,7 +4763,7 @@ async function createDashboardSessionFromProfile({
        idp_provider = excluded.idp_provider,
        status = 'active',
        last_login_at = now(),
-       metadata = excluded.metadata
+       metadata = coalesce(users.metadata, '{}'::jsonb) || excluded.metadata
      returning id, email, display_name, role`,
     [
       organizationId,
@@ -4713,7 +4774,7 @@ async function createDashboardSessionFromProfile({
       profile.familyName,
       profile.subject,
       providerType,
-      JSON.stringify({ ssoProfile: profile.raw, mobile: true })
+      JSON.stringify({ ssoProfile: profile.raw, mobile: true, accountAudience })
     ]
       )
     : await pool.query<{
@@ -4748,7 +4809,11 @@ async function createDashboardSessionFromProfile({
     sessionToken,
     tokens: { accessToken: sessionToken, expiresAt: expiresAt.toISOString() },
     user: userResult.rows[0],
-    organization
+    organization,
+    account: {
+      audience: accountAudience,
+      packageId: null
+    }
   };
 }
 
@@ -5413,10 +5478,12 @@ async function getDashboardSession(authHeader: string) {
     email: string;
     display_name: string;
     role: string;
+    user_metadata: Record<string, unknown> | null;
     organization_id: string;
     organization_name: string;
     organization_slug: string;
     region: string | null;
+    infrastructure_config: Record<string, unknown> | null;
   }>(
     `update dashboard_sessions ds
      set last_seen_at = now()
@@ -5426,15 +5493,24 @@ async function getDashboardSession(authHeader: string) {
        and ds.token_hash = $1
        and ds.revoked_at is null
        and ds.expires_at > now()
-     returning u.id as user_id, u.email, u.display_name, u.role,
-               o.id as organization_id, o.name as organization_name, o.slug as organization_slug, o.region`,
+     returning u.id as user_id, u.email, u.display_name, u.role, u.metadata as user_metadata,
+               o.id as organization_id, o.name as organization_name, o.slug as organization_slug, o.region,
+               o.infrastructure_config`,
     [hashToken(token)]
   );
   const row = result.rows[0];
   if (!row) return null;
+  const userMetadata = row.user_metadata ?? {};
+  const organizationConfig = row.infrastructure_config ?? {};
+  const accountAudience = userMetadata.accountAudience === "individual" ? "individual" : "organization";
+  const packageId = normalizeCloudPackage(userMetadata.cloudPackage ?? organizationConfig.cloudPackage);
   return {
     user: { id: row.user_id, email: row.email, display_name: row.display_name, role: row.role },
-    organization: { id: row.organization_id, name: row.organization_name, slug: row.organization_slug, region: row.region }
+    organization: { id: row.organization_id, name: row.organization_name, slug: row.organization_slug, region: row.region },
+    account: {
+      audience: accountAudience,
+      packageId
+    }
   };
 }
 
@@ -5883,6 +5959,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     /^\/admin\/policies\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/prompt-transforms" ||
     requestPath === "/auth/session" ||
+    requestPath === "/auth/account/package" ||
     requestPath === "/auth/logout" ||
     requestPath === "/auth/sso/authorize" ||
     requestPath === "/auth/sso/callback" ||
@@ -5980,6 +6057,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsRead";
   if (verb === "POST" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsWrite";
   if (verb === "GET" && requestPath === "/auth/session") return "authSession";
+  if (verb === "POST" && requestPath === "/auth/account/package") return "authSession";
   if (verb === "POST" && requestPath === "/auth/logout") return "authLogout";
   if (verb === "POST" && requestPath === "/auth/sso/authorize") return "authSsoAuthorize";
   if (verb === "POST" && requestPath === "/auth/sso/callback") return "authSsoCallback";

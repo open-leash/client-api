@@ -60,7 +60,6 @@ function toMarketplaceListing(item: PluginImport, index: number): PluginMarketpl
   const manifest = item.manifest;
   const slug = slugForPlugin(manifest, item);
   const readmeDescription = descriptionFromReadme(item.readme);
-  const stats = fakeStats(manifest.id, index);
   const source = sourceOverride ?? (manifest.publisher === "openleash" ? "first_party" : "community");
   const developerName = manifest.publisher === "openleash" ? "OpenLeash" : titleize(manifest.publisher);
   const shortDescription = sentence(manifest.description);
@@ -80,11 +79,6 @@ function toMarketplaceListing(item: PluginImport, index: number): PluginMarketpl
     documentationUrl: `https://docs.openleash.com/plugins/${slug}`,
     iconText: iconText(slug),
     visualPng: `/plugins/${slug}.png`,
-    installCount: stats.installs,
-    downloadCount: stats.downloads,
-    weeklyDownloadCount: stats.weekly,
-    trendPercent: stats.trend,
-    rating: stats.rating,
     featuredRank: index + 1,
     seoTitle: `${slug} Plugin for OpenLeash`,
     seoDescription: `Install ${slug} for OpenLeash. ${shortDescription}`
@@ -97,17 +91,15 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
        plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
        repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
-       ordering, config_schema, default_config, tags, icon_text, visual_png, install_count,
-       download_count, weekly_download_count, trend_percent, rating,
+       ordering, config_schema, default_config, tags, icon_text, visual_png,
        featured_rank, seo_title, seo_description, updated_at
      )
      values (
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, $10, $11, $12, $13, $14,
        $15, $16, $17, $18, $19::jsonb, $20::jsonb, $21::jsonb,
-       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27, $28,
-       $29, $30, $31, $32,
-       $33, $34, $35, now()
+       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
+       $28, $29, $30, now()
      )
      on conflict (plugin_id) do update set
        slug = excluded.slug,
@@ -136,11 +128,6 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
        tags = excluded.tags,
        icon_text = excluded.icon_text,
        visual_png = excluded.visual_png,
-       install_count = excluded.install_count,
-       download_count = excluded.download_count,
-       weekly_download_count = excluded.weekly_download_count,
-       trend_percent = excluded.trend_percent,
-       rating = excluded.rating,
        featured_rank = excluded.featured_rank,
        seo_title = excluded.seo_title,
        seo_description = excluded.seo_description,
@@ -173,11 +160,6 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
       JSON.stringify(plugin.tags ?? []),
       plugin.iconText,
       plugin.visualPng ?? null,
-      plugin.installCount,
-      plugin.downloadCount,
-      plugin.weeklyDownloadCount,
-      plugin.trendPercent,
-      plugin.rating,
       plugin.featuredRank ?? null,
       plugin.seoTitle,
       plugin.seoDescription
@@ -193,17 +175,8 @@ function slugForPlugin(manifest: OpenLeashPluginManifest, item: PluginImport) {
   const base = npmName || folderName || manifest.id;
   if (manifest.id === "openleash.security-evaluator") return "sec-evaluator";
   if (manifest.id === "openleash.prompt-compression") return "token-saver";
+  if (manifest.id === "openleash.dlp") return "data-leakage-prevention";
   return slugify(base);
-}
-
-function fakeStats(id: string, index: number) {
-  const seed = [...id].reduce((total, char) => total + char.charCodeAt(0), 0);
-  const installs = 7400 + ((seed * 97) % 16000) + index * 230;
-  const downloads = installs + 9200 + ((seed * 53) % 22000);
-  const weekly = 520 + ((seed * 31) % 2600);
-  const trend = 4 + ((seed * 17) % 23);
-  const rating = Math.round((4.4 + ((seed % 6) / 10)) * 10) / 10;
-  return { installs, downloads, weekly, trend, rating: Math.min(rating, 4.9) };
 }
 
 function descriptionFromReadme(readme?: string) {
