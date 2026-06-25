@@ -24,6 +24,9 @@ import {
   type OpenLeashApiFunction,
   type McpToolCall,
   type OpenLeashPluginManifest,
+  type OpenLeashOutcomeDomain,
+  type OpenLeashOutcomeRecord,
+  type OpenLeashOutcomeStatus,
   type PluginCatalogItem,
   type PluginLogRecord,
   type PluginMarketplaceListing,
@@ -710,6 +713,220 @@ app.get("/admin/security", async (req, res, next) => {
   }
 });
 
+app.get("/admin/outcomes", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const days = Math.max(1, Math.min(365, Number(req.query.days ?? 30) || 30));
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit ?? 80) || 80));
+    const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const domain = normalizeOutcomeDomain(req.query.domain);
+    const severity = normalizeOutcomeSeverity(req.query.severity);
+    const search = String(req.query.search ?? "").trim();
+    const params: unknown[] = [organizationId, start];
+    const where = ["ps.organization_id = $1", "ps.created_at >= $2"];
+    if (domain) {
+      params.push(kindsForOutcomeDomain(domain));
+      where.push(`ps.kind = any($${params.length}::text[])`);
+    }
+    if (severity) {
+      params.push(severity);
+      where.push(`ps.severity = $${params.length}`);
+    }
+    if (search) {
+      params.push(`%${search.toLowerCase()}%`);
+      where.push(`(
+        lower(ps.title) like $${params.length}
+        or lower(coalesce(ps.summary, '')) like $${params.length}
+        or lower(ps.plugin_id) like $${params.length}
+        or lower(coalesce(u.email, '')) like $${params.length}
+        or lower(coalesce(u.display_name, '')) like $${params.length}
+        or lower(coalesce(ce.project_path, '')) like $${params.length}
+      )`);
+    }
+    params.push(limit);
+    const limitIndex = params.length;
+    const rows = await pool.query(
+      `select ps.id, ps.organization_id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary,
+              ps.decision, ps.status, ps.target, ps.evidence, ps.details, ps.correlation_keys,
+              ps.conversation_event_id, ps.user_id, ps.computer_id, ps.agent_runtime_id,
+              ps.occurred_at, ps.created_at,
+              o.slug as organization_slug,
+              u.email as user_email, u.display_name as user_name,
+              c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
+              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+       from plugin_signals ps
+       left join organizations o on o.id = ps.organization_id
+       left join users u on u.id = ps.user_id
+       left join computers c on c.id = ps.computer_id
+       left join agent_runtimes ar on ar.id = ps.agent_runtime_id
+       left join conversation_events ce on ce.id = ps.conversation_event_id
+       left join evaluations e on e.conversation_event_id = ce.id
+       where ${where.join(" and ")}
+       order by ps.created_at desc
+       limit $${limitIndex}`,
+      params
+    );
+    const outcomes = rows.rows.map(signalRowToOutcome);
+    const summary = outcomeSummary(outcomes);
+    res.json({
+      range: { days, since: start.toISOString() },
+      summary,
+      outcomes
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function signalRowToOutcome(row: any): OpenLeashOutcomeRecord {
+  const domain = outcomeDomainForSignal(row.kind, row.plugin_id);
+  return {
+    id: String(row.id),
+    domain,
+    title: String(row.title ?? outcomeDomainLabel(domain)),
+    summary: row.summary ?? null,
+    severity: normalizeSignalSeverity(row.severity),
+    status: outcomeStatusForSignal(row.status, row.decision, row.kind),
+    decision: row.decision ?? null,
+    occurredAt: new Date(row.occurred_at ?? row.created_at ?? Date.now()).toISOString(),
+    createdAt: new Date(row.created_at ?? Date.now()).toISOString(),
+    source: {
+      pluginId: String(row.plugin_id ?? "openleash"),
+      label: outcomeSourceLabel(row.plugin_id),
+      kind: row.kind
+    },
+    subject: normalizeOutcomeSubject(row.target),
+    actor: {
+      userId: row.user_id ?? null,
+      name: row.user_name ?? null,
+      email: row.user_email ?? null
+    },
+    agent: {
+      kind: row.agent_kind ?? null,
+      name: row.agent_name ?? null,
+      hostname: row.hostname ?? null
+    },
+    context: {
+      organizationId: row.organization_id,
+      organizationSlug: row.organization_slug,
+      conversationEventId: row.conversation_event_id ?? null,
+      evaluationId: row.evaluation_id ?? null,
+      eventName: row.event_name ?? null,
+      toolName: row.tool_name ?? null,
+      projectPath: row.project_path ?? null,
+      correlationKeys: Array.isArray(row.correlation_keys) ? row.correlation_keys : []
+    },
+    evidence: normalizeOutcomeEvidence(row.evidence),
+    details: row.details && typeof row.details === "object" ? row.details : {}
+  };
+}
+
+function outcomeSummary(outcomes: OpenLeashOutcomeRecord[]) {
+  return {
+    total: outcomes.length,
+    highSeverity: outcomes.filter((item) => item.severity === "high" || item.severity === "critical").length,
+    blocked: outcomes.filter((item) => item.status === "blocked" || item.decision === "blocked" || item.decision === "deny").length,
+    needsReview: outcomes.filter((item) => item.status === "needs_review" || item.decision === "ask").length,
+    byDomain: outcomes.reduce<Record<string, number>>((acc, item) => {
+      acc[item.domain] = (acc[item.domain] ?? 0) + 1;
+      return acc;
+    }, {})
+  };
+}
+
+function outcomeDomainForSignal(kind: string, pluginId?: string): OpenLeashOutcomeDomain {
+  if (kind === "secret.detected" || pluginId === "openleash.dlp") return "data_protection";
+  if (kind === "tool.risk" || kind === "mcp.discovery" || pluginId === "openleash.mcp-scanner") return "tool_risk";
+  if (kind === "identity.risk") return "identity";
+  if (kind === "export.status" || kind === "plugin.health") return "operations";
+  if (kind === "policy.decision" || kind === "security.finding" || pluginId === "openleash.security-evaluator" || pluginId === "openleash.skill-scanner") return "security";
+  return "compliance";
+}
+
+function kindsForOutcomeDomain(domain: OpenLeashOutcomeDomain) {
+  if (domain === "data_protection") return ["secret.detected"];
+  if (domain === "tool_risk") return ["tool.risk", "mcp.discovery"];
+  if (domain === "identity") return ["identity.risk"];
+  if (domain === "operations") return ["plugin.health", "export.status", "audit.event"];
+  if (domain === "security") return ["security.finding", "policy.decision"];
+  return ["security.finding", "policy.decision", "approval.event", "audit.event"];
+}
+
+function normalizeOutcomeDomain(value: unknown): OpenLeashOutcomeDomain | undefined {
+  const normalized = String(value ?? "").trim();
+  return ["security", "data_protection", "tool_risk", "identity", "cost", "productivity", "compliance", "operations"].includes(normalized)
+    ? normalized as OpenLeashOutcomeDomain
+    : undefined;
+}
+
+function normalizeOutcomeSeverity(value: unknown) {
+  const normalized = String(value ?? "").trim();
+  return ["info", "low", "medium", "high", "critical"].includes(normalized) ? normalized : undefined;
+}
+
+function normalizeSignalSeverity(value: unknown) {
+  const normalized = String(value ?? "").trim();
+  return ["info", "low", "medium", "high", "critical"].includes(normalized) ? normalized as OpenLeashOutcomeRecord["severity"] : "info";
+}
+
+function outcomeStatusForSignal(status: unknown, decision: unknown, kind: string): OpenLeashOutcomeStatus {
+  const statusText = String(status ?? "").toLowerCase();
+  const decisionText = String(decision ?? "").toLowerCase();
+  if (statusText === "masked") return "masked";
+  if (statusText === "blocked" || decisionText === "blocked" || decisionText === "deny") return "blocked";
+  if (statusText === "failed") return "failed";
+  if (statusText === "needs_question" || decisionText === "ask") return "needs_review";
+  if (statusText === "modified") return "modified";
+  if (kind === "policy.decision" && !statusText) return "passed";
+  return "observed";
+}
+
+function normalizeOutcomeSubject(value: unknown) {
+  if (!value || typeof value !== "object") return undefined;
+  const target = value as Record<string, unknown>;
+  return {
+    type: typeof target.type === "string" ? target.type : undefined,
+    name: typeof target.name === "string" ? target.name : undefined,
+    id: typeof target.id === "string" ? target.id : undefined
+  };
+}
+
+function normalizeOutcomeEvidence(value: unknown): OpenLeashOutcomeRecord["evidence"] {
+  const evidence = Array.isArray(value) ? value : [];
+  return evidence.slice(0, 12).map((item, index) => {
+    if (typeof item === "string") return { label: `Evidence ${index + 1}`, value: item, kind: "text" as const };
+    if (item && typeof item === "object") {
+      const record = item as Record<string, unknown>;
+      const label = String(record.category ?? record.label ?? record.reason ?? `Evidence ${index + 1}`);
+      const value = record.quote ?? record.value ?? record.text ?? record.path ?? record.name ?? record.reason;
+      return {
+        label,
+        value: value === undefined ? undefined : String(value),
+        kind: record.path ? "path" as const : "text" as const,
+        sensitive: Boolean(record.sensitive)
+      };
+    }
+    return { label: `Evidence ${index + 1}`, value: String(item), kind: "text" as const };
+  });
+}
+
+function outcomeSourceLabel(pluginId?: string | null) {
+  const value = String(pluginId ?? "").trim();
+  if (value === "openleash.security-evaluator") return "Security Evaluation";
+  if (value === "openleash.dlp") return "Data Protection";
+  if (value === "openleash.mcp-scanner") return "MCP and Tool Risk";
+  if (value === "openleash.skill-scanner") return "Skill Review";
+  if (value === "openleash.prompt-compression") return "Token Savings";
+  if (value === "openleash.siem-exporter") return "SIEM Export";
+  return value.replace(/^openleash\./, "").replace(/[-_.]+/g, " ") || "OpenLeash";
+}
+
+function outcomeDomainLabel(domain: OpenLeashOutcomeDomain) {
+  if (domain === "data_protection") return "Data protection";
+  if (domain === "tool_risk") return "Tool risk";
+  return domain.charAt(0).toUpperCase() + domain.slice(1);
+}
+
 function dashboardSessionMetrics() {
   return pool.query(
     `with sessions as (
@@ -1364,6 +1581,47 @@ app.post("/auth/account/package", async (req, res, next) => {
         audience,
         packageId
       }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/auth/account/outcomes", async (req, res, next) => {
+  try {
+    const session = await getDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const days = Math.max(1, Math.min(365, Number(req.query.days ?? 30) || 30));
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 40) || 40));
+    const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const rows = await pool.query(
+      `select ps.id, ps.organization_id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary,
+              ps.decision, ps.status, ps.target, ps.evidence, ps.details, ps.correlation_keys,
+              ps.conversation_event_id, ps.user_id, ps.computer_id, ps.agent_runtime_id,
+              ps.occurred_at, ps.created_at,
+              o.slug as organization_slug,
+              u.email as user_email, u.display_name as user_name,
+              c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
+              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+       from plugin_signals ps
+       left join organizations o on o.id = ps.organization_id
+       left join users u on u.id = ps.user_id
+       left join computers c on c.id = ps.computer_id
+       left join agent_runtimes ar on ar.id = ps.agent_runtime_id
+       left join conversation_events ce on ce.id = ps.conversation_event_id
+       left join evaluations e on e.conversation_event_id = ce.id
+       where ps.organization_id = $1
+         and ps.user_id = $2
+         and ps.created_at >= $3
+       order by ps.created_at desc
+       limit $4`,
+      [session.organization.id, session.user.id, start, limit]
+    );
+    const outcomes = rows.rows.map(signalRowToOutcome);
+    res.json({
+      range: { days, since: start.toISOString() },
+      summary: outcomeSummary(outcomes),
+      outcomes
     });
   } catch (error) {
     next(error);
@@ -5932,6 +6190,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
   if (
     requestPath === "/admin/overview" ||
     requestPath === "/admin/security" ||
+    requestPath === "/admin/outcomes" ||
     requestPath === "/admin/mcp-servers" ||
     /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/skills" ||
@@ -5960,6 +6219,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/admin/prompt-transforms" ||
     requestPath === "/auth/session" ||
     requestPath === "/auth/account/package" ||
+    requestPath === "/auth/account/outcomes" ||
     requestPath === "/auth/logout" ||
     requestPath === "/auth/sso/authorize" ||
     requestPath === "/auth/sso/callback" ||
@@ -6027,6 +6287,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && requestPath === "/admin/tray-status") return "tenantTrayStatus";
   if (verb === "GET" && requestPath === "/admin/overview") return "adminOverview";
   if (verb === "GET" && requestPath === "/admin/security") return "adminSecurity";
+  if (verb === "GET" && requestPath === "/admin/outcomes") return "adminOutcomes";
   if (verb === "GET" && requestPath === "/admin/mcp-servers") return "adminMcpServers";
   if (verb === "GET" && /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath)) return "adminMcpServerDetail";
   if (verb === "GET" && requestPath === "/admin/skills") return "adminSkills";
@@ -6058,6 +6319,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsWrite";
   if (verb === "GET" && requestPath === "/auth/session") return "authSession";
   if (verb === "POST" && requestPath === "/auth/account/package") return "authSession";
+  if (verb === "GET" && requestPath === "/auth/account/outcomes") return "authAccountOutcomes";
   if (verb === "POST" && requestPath === "/auth/logout") return "authLogout";
   if (verb === "POST" && requestPath === "/auth/sso/authorize") return "authSsoAuthorize";
   if (verb === "POST" && requestPath === "/auth/sso/callback") return "authSsoCallback";
