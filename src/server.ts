@@ -3419,7 +3419,7 @@ function pluginCatalogItem(
   policy?: PluginPolicyRecord,
   marketplacePolicy?: MarketplacePolicyRecord
 ): PluginCatalogItem {
-  const enabled = policy?.mandatory ? true : settings?.enabled ?? policy?.defaultEnabled ?? true;
+  const enabled = policy?.mandatory ? true : settings?.enabled ?? policy?.defaultEnabled ?? false;
   return {
     ...manifest,
     slug: manifest.slug ?? marketplace?.slug,
@@ -3432,7 +3432,7 @@ function pluginCatalogItem(
     },
     organizationPolicy: {
       mandatory: Boolean(policy?.mandatory),
-      defaultEnabled: Boolean(policy?.defaultEnabled ?? true),
+      defaultEnabled: Boolean(policy?.defaultEnabled ?? false),
       userInstallAllowed: Boolean(policy?.userInstallAllowed ?? marketplacePolicy?.allowUserMarketplaceInstalls ?? true)
     }
   };
@@ -3548,6 +3548,12 @@ function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketpl
     tags: arrayValue(row.tags),
     iconText: String(row.icon_text ?? "OL"),
     visualPng: optionalString(row.visual_png),
+    installCount: row.install_count === undefined ? undefined : Number(row.install_count ?? 0),
+    downloadCount: row.download_count === undefined ? undefined : Number(row.download_count ?? 0),
+    weeklyDownloadCount: row.weekly_download_count === undefined ? undefined : Number(row.weekly_download_count ?? 0),
+    trendPercent: row.trend_percent === undefined ? undefined : Number(row.trend_percent ?? 0),
+    rating: row.rating === undefined ? undefined : Number(row.rating ?? 0),
+    ratingCount: row.rating_count === undefined ? undefined : Number(row.rating_count ?? 0),
     featuredRank: row.featured_rank === null || row.featured_rank === undefined ? null : Number(row.featured_rank),
     seoTitle: String(row.seo_title),
     seoDescription: String(row.seo_description),
@@ -3708,7 +3714,7 @@ async function pluginSettingsForRuntime(organizationId: string) {
     return [
       manifest.id,
       {
-        enabled: stored?.enabled ?? true,
+        enabled: stored?.enabled ?? false,
         config: stored?.config ?? manifest.defaultConfig ?? {},
         orderingPriority: stored?.orderingPriority ?? manifest.ordering?.priority ?? null,
         updatedAt: stored?.updatedAt
