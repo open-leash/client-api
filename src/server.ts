@@ -778,6 +778,47 @@ app.get("/admin/outcomes", async (req, res, next) => {
   }
 });
 
+app.get("/v1/outcomes", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const days = Math.max(1, Math.min(365, Number(req.query.days ?? 30) || 30));
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 40) || 40));
+    const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const rows = await pool.query(
+      `select ps.id, ps.organization_id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary,
+              ps.decision, ps.status, ps.target, ps.evidence, ps.details, ps.correlation_keys,
+              ps.conversation_event_id, ps.user_id, ps.computer_id, ps.agent_runtime_id,
+              ps.occurred_at, ps.created_at,
+              o.slug as organization_slug,
+              u.email as user_email, u.display_name as user_name,
+              c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
+              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+       from plugin_signals ps
+       left join organizations o on o.id = ps.organization_id
+       left join users u on u.id = ps.user_id
+       left join computers c on c.id = ps.computer_id
+       left join agent_runtimes ar on ar.id = ps.agent_runtime_id
+       left join conversation_events ce on ce.id = ps.conversation_event_id
+       left join evaluations e on e.conversation_event_id = ce.id
+       where ps.organization_id = $1
+         and ps.user_id = $2
+         and ps.created_at >= $3
+       order by ps.created_at desc
+       limit $4`,
+      [session.organization.id, session.user.id, start, limit]
+    );
+    const outcomes = rows.rows.map(signalRowToOutcome);
+    res.json({
+      range: { days, since: start.toISOString() },
+      summary: outcomeSummary(outcomes),
+      outcomes
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 function signalRowToOutcome(row: any): OpenLeashOutcomeRecord {
   const domain = outcomeDomainForSignal(row.kind, row.plugin_id);
   return {
@@ -2047,10 +2088,10 @@ app.get("/v1/mobile/state", async (req, res, next) => {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
     const [pending, agents, history, sessionMetrics, policies, pluginCatalog] = await Promise.all([
-      mobilePendingApprovals(session.user.id, session.organization.id, session.source !== "client"),
-      mobileAgents(session.organization.id),
-      mobileRecentActivity(session.organization.id),
-      mobileSessionMetrics(session.organization.id),
+      mobilePendingApprovals(session.user.id, session.organization.id, false),
+      mobileAgents(session.organization.id, session.user.id),
+      mobileRecentActivity(session.organization.id, session.user.id),
+      mobileSessionMetrics(session.organization.id, session.user.id),
       pool.query(`select id, name, description, severity, natural_language_rule, enabled, locked from policies order by created_at asc`),
       pluginCatalogForOrganization(session.organization.id, session.user.id)
     ]);
@@ -2082,8 +2123,7 @@ app.post("/v1/mobile/decisions/:id/resolve", async (req, res, next) => {
     const body = req.body as MobileDecisionResolveRequest;
     const resolution = body.resolution === "allow" ? "allow" : "deny";
     const result = await resolveApprovalGroup(req.params.id, resolution, `mobile:${session.user.id}`, {
-      organizationId: session.source === "client" ? undefined : session.organization.id,
-      userId: session.source === "client" ? session.user.id : undefined
+      userId: session.user.id
     }, body.resolutionGuidance);
     if (!result) return res.status(404).json({ error: "approval not found" });
     res.json(result);
@@ -5373,7 +5413,7 @@ function cleanContextText(value: string) {
   return value.replace(/\s+/g, " ").trim();
 }
 
-async function mobileAgents(organizationId: string) {
+async function mobileAgents(organizationId: string, userId: string) {
   const result = await pool.query(
     `with latest_runs as (
        select distinct on (ar.id)
@@ -5408,6 +5448,7 @@ async function mobileAgents(organizationId: string) {
            from users u
            where u.id = c.user_id and u.organization_id = $1
          )
+         and c.user_id = $2
        order by ar.id, ce.created_at desc
      )
      select latest_runs.*,
@@ -5492,9 +5533,9 @@ async function mobileAgents(organizationId: string) {
      ) recent on true
      order by latest_runs.activity_at desc
      limit 50`,
-    [organizationId]
+    [organizationId, userId]
   );
-  const sessions = await mobileAgentSessions(organizationId);
+  const sessions = await mobileAgentSessions(organizationId, userId);
   return {
     ...result,
     rows: result.rows.map((agent) => ({
@@ -5505,7 +5546,7 @@ async function mobileAgents(organizationId: string) {
   };
 }
 
-async function mobileAgentSessions(organizationId: string) {
+async function mobileAgentSessions(organizationId: string, userId: string) {
   const result = await pool.query(
     `with session_groups as (
        select ce.agent_runtime_id,
@@ -5527,6 +5568,7 @@ async function mobileAgentSessions(organizationId: string) {
            select 1 from users u
            where u.id = comp.user_id and u.organization_id = $1
          )
+         and comp.user_id = $2
        group by ce.agent_runtime_id, ce.session_id, coalesce(ce.project_path, '')
        order by max(ce.created_at) desc
        limit 120
@@ -5621,12 +5663,12 @@ async function mobileAgentSessions(organizationId: string) {
        ) item
      ) events on true
      order by sg.last_activity_at desc`,
-    [organizationId]
+    [organizationId, userId]
   );
   return result.rows;
 }
 
-function mobileSessionMetrics(organizationId: string) {
+function mobileSessionMetrics(organizationId: string, userId: string) {
   return pool.query(
     `with sessions as (
        select ce.agent_runtime_id,
@@ -5641,6 +5683,7 @@ function mobileSessionMetrics(organizationId: string) {
            select 1 from users u
            where u.id = comp.user_id and u.organization_id = $1
          )
+         and comp.user_id = $2
        group by ce.agent_runtime_id, ce.session_id, coalesce(ce.project_path, '')
      )
      select
@@ -5653,11 +5696,11 @@ function mobileSessionMetrics(organizationId: string) {
        coalesce(sum(duration_seconds) filter (where last_activity_at >= now() - interval '30 days'), 0)::int as month_seconds,
        count(*) filter (where last_activity_at >= now() - interval '30 days')::int as month_sessions
      from sessions`,
-    [organizationId]
+    [organizationId, userId]
   );
 }
 
-function mobileRecentActivity(organizationId: string) {
+function mobileRecentActivity(organizationId: string, userId: string) {
   return pool.query(
     `select e.id, e.decision, e.resolution, e.summary, e.question, e.created_at,
             ce.event_name, ce.tool_name, ce.project_path, ce.prompt, ce.payload,
@@ -5687,6 +5730,7 @@ function mobileRecentActivity(organizationId: string) {
        from users u
        where u.id = e.user_id and u.organization_id = $1
      )
+       and e.user_id = $2
        and ce.event_name <> 'Stop'
        and not coalesce(e.summary, '') ~* 'all active policies passed'
        and (
@@ -5699,7 +5743,7 @@ function mobileRecentActivity(organizationId: string) {
        )
      order by e.created_at desc
      limit 30`,
-    [organizationId]
+    [organizationId, userId]
   );
 }
 
@@ -6378,6 +6422,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/v1/desktop/agents" ||
     requestPath === "/v1/plugins" ||
     requestPath === "/v1/plugin-marketplace" ||
+    requestPath === "/v1/outcomes" ||
     requestPath === "/v1/plugin-submissions" ||
     /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath) ||
     /^\/v1\/plugins\/[^/]+\/install$/.test(requestPath) ||
@@ -6405,6 +6450,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && requestPath === "/v1/desktop/agents") return "desktopEnroll";
   if (verb === "GET" && requestPath === "/v1/plugins") return "tenantPluginsRead";
   if (verb === "GET" && requestPath === "/v1/plugin-marketplace") return "tenantPluginsRead";
+  if (verb === "GET" && requestPath === "/v1/outcomes") return "authAccountOutcomes";
   if (verb === "GET" && requestPath === "/public/plugins") return "tenantPluginsRead";
   if (verb === "GET" && /^\/public\/plugins\/[^/]+$/.test(requestPath)) return "tenantPluginsRead";
   if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath)) return "adminPluginsWrite";
