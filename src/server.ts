@@ -7,6 +7,7 @@ import cors from "cors";
 import "dotenv/config";
 import express, { type Express } from "express";
 import {
+  buildOpenLeashClientViewModel,
   OPENLEASH_API_CONTRACTS,
   OPENLEASH_API_FUNCTION_HEADER,
   OPENLEASH_API_VERSION_HEADER,
@@ -768,10 +769,17 @@ app.get("/admin/outcomes", async (req, res, next) => {
     );
     const outcomes = rows.rows.map(signalRowToOutcome);
     const summary = outcomeSummary(outcomes);
+    const { plugins } = await pluginCatalogForOrganization(organizationId);
     res.json({
       range: { days, since: start.toISOString() },
       summary,
-      outcomes
+      outcomes,
+      viewModel: buildOpenLeashClientViewModel({
+        plugins,
+        outcomes,
+        summary,
+        shellSections: ["overview", "agents", "activity", "approvals", "policies", "settings", "identity"]
+      })
     });
   } catch (error) {
     next(error);
@@ -809,10 +817,13 @@ app.get("/v1/outcomes", async (req, res, next) => {
       [session.organization.id, session.user.id, start, limit]
     );
     const outcomes = rows.rows.map(signalRowToOutcome);
+    const summary = outcomeSummary(outcomes);
+    const { plugins } = await pluginCatalogForOrganization(session.organization.id, session.user.id);
     res.json({
       range: { days, since: start.toISOString() },
-      summary: outcomeSummary(outcomes),
-      outcomes
+      summary,
+      outcomes,
+      viewModel: buildOpenLeashClientViewModel({ plugins, outcomes, summary })
     });
   } catch (error) {
     next(error);
@@ -872,6 +883,39 @@ function outcomeSummary(outcomes: OpenLeashOutcomeRecord[]) {
       acc[item.domain] = (acc[item.domain] ?? 0) + 1;
       return acc;
     }, {})
+  };
+}
+
+async function userPluginOutcomes(organizationId: string, userId: string, options: { days?: number; limit?: number } = {}) {
+  const days = Math.max(1, Math.min(365, Number(options.days ?? 30) || 30));
+  const limit = Math.max(1, Math.min(100, Number(options.limit ?? 40) || 40));
+  const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const rows = await pool.query(
+    `select ps.id, ps.organization_id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary,
+            ps.decision, ps.status, ps.target, ps.evidence, ps.details, ps.correlation_keys,
+            ps.conversation_event_id, ps.user_id, ps.computer_id, ps.agent_runtime_id,
+            ps.occurred_at, ps.created_at,
+            o.slug as organization_slug,
+            u.email as user_email, u.display_name as user_name,
+            c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
+            ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+     from plugin_signals ps
+     left join organizations o on o.id = ps.organization_id
+     left join users u on u.id = ps.user_id
+     left join computers c on c.id = ps.computer_id
+     left join agent_runtimes ar on ar.id = ps.agent_runtime_id
+     left join conversation_events ce on ce.id = ps.conversation_event_id
+     left join evaluations e on e.conversation_event_id = ce.id
+     where ps.organization_id = $1
+       and ps.user_id = $2
+       and ps.created_at >= $3
+     order by ps.created_at desc
+     limit $4`,
+    [organizationId, userId, start, limit]
+  );
+  return {
+    range: { days, since: start.toISOString() },
+    outcomes: rows.rows.map(signalRowToOutcome)
   };
 }
 
@@ -1659,10 +1703,13 @@ app.get("/auth/account/outcomes", async (req, res, next) => {
       [session.organization.id, session.user.id, start, limit]
     );
     const outcomes = rows.rows.map(signalRowToOutcome);
+    const summary = outcomeSummary(outcomes);
+    const { plugins } = await pluginCatalogForOrganization(session.organization.id, session.user.id);
     res.json({
       range: { days, since: start.toISOString() },
-      summary: outcomeSummary(outcomes),
-      outcomes
+      summary,
+      outcomes,
+      viewModel: buildOpenLeashClientViewModel({ plugins, outcomes, summary })
     });
   } catch (error) {
     next(error);
@@ -1735,7 +1782,10 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
     }
 
     const requestedProviderType = String(body.providerType ?? "google").trim();
-    const providerType = requestedProviderType === "azure_ad" || requestedProviderType === "microsoft" ? "azure_ad" : "google";
+    const providerType = normalizePublicCloudAuthProvider(requestedProviderType);
+    if (providerType === "github" && audience !== "individual") {
+      return res.status(400).json({ error: "GitHub sign-in is available for individual OpenLeash Cloud accounts only." });
+    }
     if (process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
       const authorizationUrl = new URL("/v1/mobile/dev-auth/callback", publicApiUrl(req));
       authorizationUrl.searchParams.set("redirectUri", redirectUri);
@@ -1754,7 +1804,9 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
 
     const exchangeRedirectUri = providerType === "azure_ad"
       ? process.env.OPENLEASH_MICROSOFT_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/microsoft/callback`
-      : process.env.OPENLEASH_GOOGLE_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/google/callback`;
+      : providerType === "github"
+        ? githubRedirectUriForRequest(req)
+        : process.env.OPENLEASH_GOOGLE_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/google/callback`;
     const state = encodeMobileAuthState({
       nonce: crypto.randomBytes(18).toString("base64url"),
       finalRedirectUri: redirectUri,
@@ -1762,13 +1814,21 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
     });
     const authorizationUrl = providerType === "azure_ad"
       ? buildAuthorizationUrl("azure_ad", cloudMicrosoftConfig(), exchangeRedirectUri, state)
-      : buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
+      : providerType === "github"
+        ? buildAuthorizationUrl("github", cloudGithubConfig(exchangeRedirectUri), exchangeRedirectUri, state)
+        : buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
     if (!authorizationUrl) {
       return res.status(501).json({
-        error: providerType === "azure_ad" ? "Managed Microsoft 365 login is not configured" : "Managed Google login is not configured",
+        error: providerType === "azure_ad"
+          ? "Managed Microsoft 365 login is not configured"
+          : providerType === "github"
+            ? "Managed GitHub login is not configured"
+            : "Managed Google login is not configured",
         required: providerType === "azure_ad"
           ? ["OPENLEASH_MICROSOFT_CLIENT_ID", "OPENLEASH_MICROSOFT_CLIENT_SECRET"]
-          : ["OPENLEASH_GOOGLE_CLIENT_ID", "OPENLEASH_GOOGLE_CLIENT_SECRET"]
+          : providerType === "github"
+            ? ["OPENLEASH_GITHUB_CLIENT_ID", "OPENLEASH_GITHUB_CLIENT_SECRET"]
+            : ["OPENLEASH_GOOGLE_CLIENT_ID", "OPENLEASH_GOOGLE_CLIENT_SECRET"]
       });
     }
     res.json({ authorizationUrl, state, providerType, exchangeRedirectUri });
@@ -1831,11 +1891,31 @@ app.get("/v1/auth/microsoft/callback", (req, res) => {
   res.redirect(302, redirect.toString());
 });
 
+app.get("/v1/auth/github/callback", (req, res) => {
+  const state = String(req.query.state ?? "");
+  const callbackState = decodeMobileAuthState(state);
+  const finalRedirectUri = callbackState?.finalRedirectUri;
+  if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
+    return res.status(400).send("OpenLeash sign-in could not continue because the return URL is invalid.");
+  }
+
+  const redirect = new URL(finalRedirectUri);
+  for (const key of ["code", "state", "error", "error_description"]) {
+    const value = req.query[key];
+    if (typeof value === "string" && value) redirect.searchParams.set(key, value);
+  }
+  redirect.searchParams.set(
+    "exchangeRedirectUri",
+    callbackState.exchangeRedirectUri ?? `${publicApiUrl(req)}/v1/auth/github/callback`
+  );
+  res.redirect(302, redirect.toString());
+});
+
 app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
   try {
     const body = req.body as MobileAuthExchangeRequest;
     const audience = body.audience === "organization" ? "organization" : "individual";
-    const providerType = String(body.providerType ?? "google").trim();
+    const providerType = normalizePublicCloudAuthProvider(String(body.providerType ?? "google").trim());
     const redirectUri = String(body.redirectUri ?? "").trim();
     const authorizationCode = String(body.authorizationCode ?? "").trim();
     const idToken = String(body.idToken ?? "").trim();
@@ -1849,7 +1929,7 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
     if ((body.organizationId || body.organizationSlug) && !requestedOrganization) return res.status(404).json({ success: false, message: "Organization not found" });
 
     const isDevelopmentMobileAuthCode = authorizationCode === "development" || authorizationCode === "dev-auth";
-    if ((providerType === "google" || providerType === "azure_ad") && (!authorizationCode || isDevelopmentMobileAuthCode) && !idToken && process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
+    if ((providerType === "google" || providerType === "azure_ad" || providerType === "github") && (!authorizationCode || isDevelopmentMobileAuthCode) && !idToken && process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
       const profile = {
         subject: "mobile-dev-user",
         email: process.env.OPENLEASH_MOBILE_DEV_EMAIL ?? "mobile.user@openleash.com",
@@ -1882,20 +1962,22 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       return res.json({ ...response, authMode: "development" });
     }
 
-    const organizationForProvider = requestedOrganization ?? (providerType === "google" || providerType === "azure_ad" ? undefined : await ensureManagedMobileOrganization());
+    const organizationForProvider = requestedOrganization ?? (providerType === "google" || providerType === "azure_ad" || providerType === "github" ? undefined : await ensureManagedMobileOrganization());
     const publicProviderType = providerType === "google" ? "google_workspace" : providerType;
     const publicProviderConfig = providerType === "google"
-      ? mobileGoogleConfig()
-      : providerType === "azure_ad"
-        ? cloudMicrosoftConfig()
+        ? mobileGoogleConfig()
+        : providerType === "azure_ad"
+          ? cloudMicrosoftConfig()
+        : providerType === "github"
+          ? cloudGithubConfig(redirectUri)
         : {};
-    const tokenSet = providerType === "google" || (providerType === "azure_ad" && !requestedOrganization)
+    const tokenSet = providerType === "google" || providerType === "github" || (providerType === "azure_ad" && !requestedOrganization)
       ? await exchangeAuthorizationCode(publicProviderType, publicProviderConfig, authorizationCode, redirectUri)
       : body.organizationId || body.organizationSlug
         ? await exchangeOrganizationAuthorizationCode(organizationForProvider!.id, providerType, authorizationCode, redirectUri)
         : await exchangeAuthorizationCode(providerType, {}, authorizationCode, redirectUri);
 
-    const profile = providerType === "google" || (providerType === "azure_ad" && !requestedOrganization)
+    const profile = providerType === "google" || providerType === "github" || (providerType === "azure_ad" && !requestedOrganization)
       ? await fetchSsoProfile(publicProviderType, publicProviderConfig, idToken ? { id_token: idToken } : tokenSet)
       : await fetchSsoProfile(providerType, (await configuredSsoProvider(organizationForProvider!.id, providerType))?.config ?? {}, idToken ? { id_token: idToken } : tokenSet);
     if (!profile.email) return res.status(400).json({ success: false, message: "Identity provider did not return an email address" });
@@ -1911,7 +1993,7 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
     const organization: ManagedOrganization = requestedOrganization
       ? { ...requestedOrganization }
       : provisionUser
-        ? (providerType === "google" || providerType === "azure_ad" ? await resolveManagedMobileOrganization(profile, audience) : organizationForProvider!)
+        ? (providerType === "google" || providerType === "azure_ad" || providerType === "github" ? await resolveManagedMobileOrganization(profile, audience) : organizationForProvider!)
         : await resolveExistingMobileOrganizationForProfile(profile);
     const response = await createDashboardSessionFromProfile({
       organizationId: organization.id,
@@ -1921,7 +2003,7 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       provisionUser,
       accountAudience: audience
     });
-    res.json({ ...response, authMode: providerType === "google" ? "google" : "sso" });
+    res.json({ ...response, authMode: providerType });
   } catch (error) {
     next(error);
   }
@@ -2087,14 +2169,16 @@ app.get("/v1/mobile/state", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const [pending, agents, history, sessionMetrics, policies, pluginCatalog] = await Promise.all([
+    const [pending, agents, history, sessionMetrics, policies, pluginCatalog, pluginOutcomes] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       mobileAgents(session.organization.id, session.user.id),
       mobileRecentActivity(session.organization.id, session.user.id),
       mobileSessionMetrics(session.organization.id, session.user.id),
       pool.query(`select id, name, description, severity, natural_language_rule, enabled, locked from policies order by created_at asc`),
-      pluginCatalogForOrganization(session.organization.id, session.user.id)
+      pluginCatalogForOrganization(session.organization.id, session.user.id),
+      userPluginOutcomes(session.organization.id, session.user.id, { limit: 40 })
     ]);
+    const summary = outcomeSummary(pluginOutcomes.outcomes);
     res.json({
       user: session.user,
       organization: session.organization,
@@ -2106,6 +2190,12 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       sessionMetrics: sessionMetrics.rows[0],
       policies: policies.rows,
       plugins: pluginCatalog.plugins,
+      outcomes: pluginOutcomes.outcomes,
+      viewModel: buildOpenLeashClientViewModel({
+        plugins: pluginCatalog.plugins,
+        outcomes: pluginOutcomes.outcomes,
+        summary
+      }),
       clientConfig: {
         approvalNotifications: true,
         managedByOrganization: true
@@ -4745,6 +4835,10 @@ function webMicrosoftRedirectUri(req: express.Request) {
   return process.env.OPENLEASH_MICROSOFT_WEB_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/microsoft/callback`;
 }
 
+function webGithubRedirectUri(req: express.Request) {
+  return githubRedirectUriForRequest(req, "web");
+}
+
 async function ensureDefaultOrganization() {
   const existing = await pool.query(
     `select * from organizations
@@ -5044,6 +5138,13 @@ function ssoProviderType(provider: string) {
   return normalized;
 }
 
+function normalizePublicCloudAuthProvider(provider: string) {
+  const normalized = provider.toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "azure_ad" || normalized === "azuread" || normalized === "microsoft") return "azure_ad";
+  if (normalized === "github") return "github";
+  return "google";
+}
+
 function clientModeFromEnvironment() {
   const mode = String(process.env.OPENLEASH_CLIENT_MODE ?? process.env.OPENLEASH_DEPLOYMENT_MODE ?? "cloud").toLowerCase();
   if (mode.includes("enterprise") || mode.includes("private") || mode.includes("onprem") || mode.includes("on-prem")) return "enterprise";
@@ -5064,6 +5165,39 @@ function cloudMicrosoftConfig() {
     ClientId: process.env.OPENLEASH_MICROSOFT_CLIENT_ID ?? process.env.MICROSOFT_CLIENT_ID ?? process.env.AZURE_CLIENT_ID ?? "",
     ClientSecret: process.env.OPENLEASH_MICROSOFT_CLIENT_SECRET ?? process.env.MICROSOFT_CLIENT_SECRET ?? process.env.AZURE_CLIENT_SECRET ?? ""
   };
+}
+
+function cloudGithubConfig(redirectUri?: string) {
+  const useDev = isLocalhostRedirectUri(redirectUri);
+  return useDev ? {
+    ClientId: process.env.OPENLEASH_GITHUB_DEV_CLIENT_ID ?? process.env.OPENLEASH_GITHUB_CLIENT_ID ?? process.env.GITHUB_CLIENT_ID ?? "",
+    ClientSecret: process.env.OPENLEASH_GITHUB_DEV_CLIENT_SECRET ?? process.env.OPENLEASH_GITHUB_CLIENT_SECRET ?? process.env.GITHUB_CLIENT_SECRET ?? ""
+  } : {
+    ClientId: process.env.OPENLEASH_GITHUB_CLIENT_ID ?? process.env.GITHUB_CLIENT_ID ?? "",
+    ClientSecret: process.env.OPENLEASH_GITHUB_CLIENT_SECRET ?? process.env.GITHUB_CLIENT_SECRET ?? ""
+  };
+}
+
+function githubRedirectUriForRequest(req: express.Request, surface: "desktop" | "web" = "desktop") {
+  const localDefault = `${publicApiUrl(req)}/v1/auth/github/callback`;
+  if (isLocalhostRedirectUri(localDefault)) {
+    return surface === "web"
+      ? process.env.OPENLEASH_GITHUB_DEV_WEB_REDIRECT_URI ?? process.env.OPENLEASH_GITHUB_DEV_REDIRECT_URI ?? localDefault
+      : process.env.OPENLEASH_GITHUB_DEV_REDIRECT_URI ?? localDefault;
+  }
+  return surface === "web"
+    ? process.env.OPENLEASH_GITHUB_WEB_REDIRECT_URI ?? process.env.OPENLEASH_GITHUB_REDIRECT_URI ?? localDefault
+    : process.env.OPENLEASH_GITHUB_REDIRECT_URI ?? localDefault;
+}
+
+function isLocalhostRedirectUri(redirectUri?: string) {
+  if (!redirectUri) return false;
+  try {
+    const url = new URL(redirectUri);
+    return ["localhost", "127.0.0.1"].includes(url.hostname);
+  } catch {
+    return false;
+  }
 }
 
 function buildMobileGoogleAuthorizationUrl(redirectUri: string, state: string) {
@@ -5110,6 +5244,11 @@ function mobileCloudProviders() {
       id: "openleash-cloud-google",
       type: "google",
       label: "Google Workspace"
+    },
+    {
+      id: "openleash-cloud-github",
+      type: "github",
+      label: "GitHub"
     },
     {
       id: "openleash-cloud-microsoft",
@@ -5173,7 +5312,10 @@ async function createDashboardSessionFromProfile({
   const organizationResult = await pool.query(`select id, name, slug, region, setup_completed from organizations where id = $1 limit 1`, [organizationId]);
   const organization = organizationResult.rows[0];
   if (!organization) throw new Error("Organization not found");
-  const displayName = profile.name || profile.email.split("@")[0] || "OpenLeash user";
+  const profileNameParts = splitProfileName(profile.name || "");
+  const firstName = profile.givenName || profileNameParts.givenName;
+  const lastName = profile.familyName || profileNameParts.familyName;
+  const displayName = [firstName, lastName].filter(Boolean).join(" ") || profile.name || profile.email.split("@")[0] || "OpenLeash user";
   const userEmail = profile.email.toLowerCase();
   const userResult = provisionUser
     ? await pool.query<{
@@ -5200,8 +5342,8 @@ async function createDashboardSessionFromProfile({
       userEmail,
       displayName,
       role,
-      profile.givenName,
-      profile.familyName,
+      firstName,
+      lastName,
       profile.subject,
       providerType,
       JSON.stringify({ ssoProfile: profile.raw, mobile: true, accountAudience })
@@ -5792,7 +5934,11 @@ function ssoProviderFromIdp(row: { id: string; provider: string; enabled: boolea
 
 function buildAuthorizationUrl(providerType: string, config: Record<string, unknown>, redirectUri: string, state: string) {
   const clientId = String(config.ClientId ?? config.clientId ?? "");
-  const scope = encodeURIComponent("openid profile email");
+  const scope = encodeURIComponent(providerType === "github" ? "read:user user:email" : "openid profile email");
+  if (providerType === "github") {
+    if (!clientId) return "";
+    return `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scope}&state=${encodeURIComponent(state)}`;
+  }
   if (providerType === "okta") {
     const domain = String(config.Domain ?? config.domain ?? "").replace(/\/+$/, "");
     if (!domain || !clientId) return "";
@@ -5844,6 +5990,7 @@ async function exchangeAuthorizationCode(providerType: string, config: Record<st
 }
 
 async function fetchSsoProfile(providerType: string, config: Record<string, unknown>, tokenSet: { access_token?: string; id_token?: string }) {
+  if (providerType === "github") return fetchGithubProfile(tokenSet);
   const userinfoEndpoint = oauthUserinfoEndpoint(providerType, config);
   let raw: Record<string, unknown> = {};
   if (userinfoEndpoint && tokenSet.access_token) {
@@ -5854,11 +6001,51 @@ async function fetchSsoProfile(providerType: string, config: Record<string, unkn
   return {
     subject: String(raw.sub ?? raw.oid ?? raw.id ?? ""),
     email: String(raw.email ?? raw.preferred_username ?? raw.upn ?? "").toLowerCase(),
-    name: String(raw.name ?? [raw.given_name, raw.family_name].filter(Boolean).join(" ") ?? ""),
+    name: normalizedProfileName(raw),
     givenName: nullableString(raw.given_name),
     familyName: nullableString(raw.family_name),
     raw
   };
+}
+
+async function fetchGithubProfile(tokenSet: { access_token?: string }) {
+  if (!tokenSet.access_token) throw new Error("GitHub token exchange did not return an access token");
+  const headers = {
+    authorization: `Bearer ${tokenSet.access_token}`,
+    accept: "application/vnd.github+json",
+    "user-agent": "OpenLeash"
+  };
+  const [userResponse, emailResponse] = await Promise.all([
+    fetch("https://api.github.com/user", { headers }),
+    fetch("https://api.github.com/user/emails", { headers })
+  ]);
+  if (!userResponse.ok) throw new Error("Could not fetch GitHub profile");
+  const raw = await userResponse.json() as Record<string, unknown>;
+  const emails = emailResponse.ok ? await emailResponse.json().catch(() => []) as Array<Record<string, unknown>> : [];
+  const primaryEmail = emails.find((item) => item.primary === true && item.verified !== false)?.email
+    ?? emails.find((item) => item.verified !== false)?.email
+    ?? raw.email;
+  const fullName = normalizedProfileName(raw) || String(raw.login ?? "");
+  const split = splitProfileName(fullName);
+  return {
+    subject: String(raw.id ?? raw.node_id ?? raw.login ?? ""),
+    email: String(primaryEmail ?? "").toLowerCase(),
+    name: fullName,
+    givenName: split.givenName,
+    familyName: split.familyName,
+    raw: { ...raw, emails }
+  };
+}
+
+function normalizedProfileName(raw: Record<string, unknown>) {
+  return String(raw.name ?? [raw.given_name, raw.family_name].filter(Boolean).join(" ") ?? "").trim();
+}
+
+function splitProfileName(name: string) {
+  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return { givenName: null, familyName: null };
+  if (parts.length === 1) return { givenName: parts[0], familyName: null };
+  return { givenName: parts[0], familyName: parts.slice(1).join(" ") };
 }
 
 function oauthTokenEndpoint(providerType: string, config: Record<string, unknown>) {
@@ -5871,6 +6058,7 @@ function oauthTokenEndpoint(providerType: string, config: Record<string, unknown
     return `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
   }
   if (providerType === "google_workspace") return "https://oauth2.googleapis.com/token";
+  if (providerType === "github") return "https://github.com/login/oauth/access_token";
   return "";
 }
 
@@ -6414,6 +6602,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/v1/enroll" ||
     requestPath === "/v1/auth/google/callback" ||
     requestPath === "/v1/auth/microsoft/callback" ||
+    requestPath === "/v1/auth/github/callback" ||
     requestPath === "/public/plugins" ||
     /^\/public\/plugins\/[^/]+$/.test(requestPath) ||
     requestPath === "/v1/evaluate" ||
@@ -6503,6 +6692,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && requestPath === "/auth/sso/callback") return "authSsoCallback";
   if (verb === "GET" && requestPath === "/v1/auth/google/callback") return "authGoogleCallback";
   if (verb === "GET" && requestPath === "/v1/auth/microsoft/callback") return "authGoogleCallback";
+  if (verb === "GET" && requestPath === "/v1/auth/github/callback") return "authGoogleCallback";
   if (verb === "GET" && requestPath === "/auth/microsoft/start") return "authGoogleCallback";
   if (verb === "GET" && requestPath === "/auth/microsoft/callback") return "authGoogleCallback";
   if (verb === "GET" && requestPath === "/v1/mobile/bootstrap") return "mobileBootstrap";

@@ -15,8 +15,11 @@
     }
   },
   "scripts": {
+    "predev": "npm run build -w @openleash/shared",
     "dev": "tsx watch src/server.ts",
+    "prebuild": "npm run build -w @openleash/shared",
     "build": "tsc -p tsconfig.json",
+    "prestart": "npm run build -w @openleash/shared",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "tsx src/migrate.ts",
