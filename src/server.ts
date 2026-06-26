@@ -2052,7 +2052,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       mobileRecentActivity(session.organization.id),
       mobileSessionMetrics(session.organization.id),
       pool.query(`select id, name, description, severity, natural_language_rule, enabled, locked from policies order by created_at asc`),
-      pluginCatalogForOrganization(session.organization.id)
+      pluginCatalogForOrganization(session.organization.id, session.user.id)
     ]);
     res.json({
       user: session.user,
@@ -2689,7 +2689,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
 	    const skillName = String(body.skillName ?? "").trim();
 	    const skillPath = String(body.skillPath ?? "").trim();
 	    if (!skillName || !skillPath) return res.status(400).json({ error: "skillName and skillPath are required" });
-	    const runtimePlugins = await pluginSettingsForRuntime(organizationId);
+	    const runtimePlugins = await pluginSettingsForRuntime(organizationId, user.id);
 	    if (runtimePlugins.get("openleash.skill-scanner")?.enabled === false) {
 	      return res.json({ ok: true, skipped: true, pluginId: "openleash.skill-scanner" });
 	    }
@@ -3188,7 +3188,7 @@ app.get("/v1/plugins", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    res.json(await pluginCatalogForOrganization(session.organization.id));
+    res.json(await pluginCatalogForOrganization(session.organization.id, session.user.id));
   } catch (error) {
     next(error);
   }
@@ -3198,7 +3198,7 @@ app.get("/v1/plugin-marketplace", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    res.json(await pluginMarketplaceForOrganization(session.organization.id, String(req.query.search ?? "")));
+    res.json(await pluginMarketplaceForOrganization(session.organization.id, String(req.query.search ?? ""), { userId: session.user.id }));
   } catch (error) {
     next(error);
   }
@@ -3266,7 +3266,7 @@ app.post("/v1/plugins/:pluginId/settings", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await savePluginSettingsForOrganization(session.organization.id, req.params.pluginId, req.body);
+    const result = await savePluginSettingsForUser(session.organization.id, session.user.id, req.params.pluginId, req.body);
     if (!result) return res.status(404).json({ error: "plugin not found" });
     res.json(result);
   } catch (error) {
@@ -3278,7 +3278,7 @@ app.post("/v1/plugins/:pluginId/install", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await installMarketplacePluginForUser(session.organization.id, req.params.pluginId, session.source);
+    const result = await installMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId, session.source);
     if (!result) return res.status(404).json({ error: "plugin not found or not installable" });
     res.json(result);
   } catch (error) {
@@ -3290,7 +3290,7 @@ app.post("/v1/plugins/:pluginId/uninstall", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await uninstallMarketplacePluginForUser(session.organization.id, req.params.pluginId, session.source);
+    const result = await uninstallMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId, session.source);
     if (!result) return res.status(404).json({ error: "plugin not found or mandatory" });
     res.json(result);
   } catch (error) {
@@ -3314,7 +3314,7 @@ type ApiUser = { id: string; email?: string; display_name?: string; organization
 async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventName, request: EvaluationRequest, user: ApiUser) {
   const intentKey = triggerIntentKey(request);
   const { conversationEventId, computerId, runtimeId, organizationId } = await recordConversationEvent(request, user, intentKey);
-  const config = await readPromptTransformConfig(organizationId);
+  const config = await readPromptTransformConfig(organizationId, user.id);
   if (!request.event.prompt || !promptTransformsEnabled(config)) {
     return nativeHookDecision(agent, eventName, { decision: "allow", decisionId: "", summary: "OpenLeash logged this prompt intent.", results: [] });
   }
@@ -3327,7 +3327,7 @@ async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventNa
     computerId,
     runtimeId,
     apiKey: process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY,
-    plugins: await pluginSettingsForRuntime(organizationId)
+    plugins: await pluginSettingsForRuntime(organizationId, user.id)
   });
   await recordPromptTransformResult(conversationEventId, user.id, request.event.prompt, result);
   if (result.blocked) {
@@ -3341,14 +3341,32 @@ async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventNa
   return promptTransformHookDecision(agent, eventName, result.finalPrompt, result.summary);
 }
 
-async function readPromptTransformConfig(organizationId: string): Promise<PromptTransformConfig> {
+async function readPromptTransformConfig(organizationId: string, userId?: string): Promise<PromptTransformConfig> {
   const row = await pool.query<{ config: unknown }>(
     "select config from prompt_transform_settings where organization_id = $1",
     [organizationId]
   );
   const config = normalizePromptTransformConfig(row.rows[0]?.config ?? defaultPromptTransformConfig);
-  const pluginSettings = await readPluginSettings(organizationId);
-  const compression = pluginSettings.get("openleash.prompt-compression");
+  const [pluginSettings, userPluginSettings, policy] = await Promise.all([
+    readPluginSettings(organizationId),
+    userId ? readUserPluginSettings(organizationId, userId) : Promise.resolve(new Map<string, PluginSettingRecord>()),
+    readOrganizationPluginPolicy(organizationId)
+  ]);
+  const effectiveTransformPlugin = (pluginId: string) => {
+    const organizationStored = pluginSettings.get(pluginId);
+    const userStored = userPluginSettings.get(pluginId);
+    const pluginPolicy = policy.get(pluginId);
+    const configLocked = Boolean(pluginPolicy?.configLocked);
+    if (!organizationStored && !userStored && !pluginPolicy) return undefined;
+    return {
+      enabled: pluginPolicy?.mandatory ? true : userStored?.enabled ?? organizationStored?.enabled ?? pluginPolicy?.defaultEnabled ?? false,
+      config: {
+        ...(organizationStored?.config ?? {}),
+        ...(configLocked ? {} : userStored?.config ?? {})
+      }
+    };
+  };
+  const compression = effectiveTransformPlugin("openleash.prompt-compression");
   if (compression) {
     config.compression = normalizePromptTransformConfig({
       compression: {
@@ -3358,7 +3376,7 @@ async function readPromptTransformConfig(organizationId: string): Promise<Prompt
       }
     }).compression;
   }
-  const dlp = pluginSettings.get("openleash.dlp");
+  const dlp = effectiveTransformPlugin("openleash.dlp");
   if (dlp) {
     config.dlp = normalizePromptTransformConfig({
       dlp: {
@@ -3384,6 +3402,7 @@ type PluginPolicyRecord = {
   mandatory: boolean;
   defaultEnabled: boolean;
   userInstallAllowed: boolean;
+  configLocked: boolean;
 };
 
 type MarketplacePolicyRecord = {
@@ -3391,8 +3410,11 @@ type MarketplacePolicyRecord = {
   allowUserCommunityPlugins: boolean;
 };
 
-async function pluginCatalogForOrganization(organizationId: string): Promise<{ plugins: PluginCatalogItem[]; marketplacePolicy: MarketplacePolicyRecord }> {
-  const settings = await readPluginSettings(organizationId);
+async function pluginCatalogForOrganization(organizationId: string, userId?: string): Promise<{ plugins: PluginCatalogItem[]; marketplacePolicy: MarketplacePolicyRecord }> {
+  const [settings, userSettings] = await Promise.all([
+    readPluginSettings(organizationId),
+    userId ? readUserPluginSettings(organizationId, userId) : Promise.resolve(new Map<string, PluginSettingRecord>())
+  ]);
   const policy = await readOrganizationPluginPolicy(organizationId);
   const marketplacePolicy = await readOrganizationMarketplacePolicy(organizationId);
   const marketplace = await readMarketplaceListings("");
@@ -3406,7 +3428,7 @@ async function pluginCatalogForOrganization(organizationId: string): Promise<{ p
         const listing = marketplaceById.get(pluginId);
         const manifest = manifestsById.get(pluginId) ?? listing;
         if (!manifest) return undefined;
-        return pluginCatalogItem(manifest, settings.get(pluginId), listing, policy.get(pluginId), marketplacePolicy);
+        return pluginCatalogItem(manifest, settings.get(pluginId), userSettings.get(pluginId), listing, policy.get(pluginId), marketplacePolicy);
       })
       .filter((item): item is PluginCatalogItem => Boolean(item))
   };
@@ -3414,26 +3436,33 @@ async function pluginCatalogForOrganization(organizationId: string): Promise<{ p
 
 function pluginCatalogItem(
   manifest: OpenLeashPluginManifest,
-  settings?: PluginSettingRecord,
+  organizationSettings?: PluginSettingRecord,
+  userSettings?: PluginSettingRecord,
   marketplace?: PluginMarketplaceListing,
   policy?: PluginPolicyRecord,
   marketplacePolicy?: MarketplacePolicyRecord
 ): PluginCatalogItem {
-  const enabled = policy?.mandatory ? true : settings?.enabled ?? policy?.defaultEnabled ?? false;
+  const enabled = policy?.mandatory ? true : userSettings?.enabled ?? organizationSettings?.enabled ?? policy?.defaultEnabled ?? false;
+  const configLocked = Boolean(policy?.configLocked);
   return {
     ...manifest,
     slug: manifest.slug ?? marketplace?.slug,
     marketplace,
     settings: {
       enabled,
-      config: settings?.config ?? manifest.defaultConfig ?? {},
-      orderingPriority: settings?.orderingPriority ?? manifest.ordering?.priority ?? null,
-      updatedAt: settings?.updatedAt
+      config: {
+        ...(manifest.defaultConfig ?? {}),
+        ...(organizationSettings?.config ?? {}),
+        ...(configLocked ? {} : userSettings?.config ?? {})
+      },
+      orderingPriority: userSettings?.orderingPriority ?? organizationSettings?.orderingPriority ?? manifest.ordering?.priority ?? null,
+      updatedAt: userSettings?.updatedAt ?? organizationSettings?.updatedAt
     },
     organizationPolicy: {
       mandatory: Boolean(policy?.mandatory),
       defaultEnabled: Boolean(policy?.defaultEnabled ?? false),
-      userInstallAllowed: Boolean(policy?.userInstallAllowed ?? marketplacePolicy?.allowUserMarketplaceInstalls ?? true)
+      userInstallAllowed: Boolean(policy?.userInstallAllowed ?? marketplacePolicy?.allowUserMarketplaceInstalls ?? true),
+      configLocked
     }
   };
 }
@@ -3463,9 +3492,66 @@ async function savePluginSettingsForOrganization(organizationId: string, pluginI
   return { pluginId: manifest.id, settings: result.rows[0] };
 }
 
-async function pluginMarketplaceForOrganization(organizationId: string, search: string, options: { includePending?: boolean } = {}) {
+async function savePluginSettingsForUser(organizationId: string, userId: string, pluginId: string, body: Record<string, unknown>) {
+  const manifest = await manifestForPluginId(pluginId);
+  if (!manifest) return undefined;
+  const [policy, marketplacePolicy, organizationSettings] = await Promise.all([
+    readOrganizationPluginPolicy(organizationId),
+    readOrganizationMarketplacePolicy(organizationId),
+    readPluginSettings(organizationId)
+  ]);
+  const pluginPolicy = policy.get(manifest.id);
+  if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false) return undefined;
+  if (!pluginPolicy?.mandatory && !marketplacePolicy.allowUserMarketplaceInstalls) return undefined;
+  if (manifest.publisher !== "openleash" && !marketplacePolicy.allowUserCommunityPlugins) return undefined;
+  const enabled = pluginPolicy?.mandatory ? true : typeof body.enabled === "boolean" ? body.enabled : true;
+  const config = body.config && typeof body.config === "object" && !Array.isArray(body.config)
+    ? body.config as Record<string, unknown>
+    : {};
+  const orderingPriority = Number.isFinite(Number(body.orderingPriority))
+    ? Number(body.orderingPriority)
+    : organizationSettings.get(manifest.id)?.orderingPriority ?? manifest.ordering?.priority ?? null;
+  const result = await pool.query<{
+    plugin_id: string;
+    enabled: boolean;
+    config: Record<string, unknown>;
+    orderingPriority: number | null;
+    updated_at: string;
+  }>(
+    `insert into user_plugin_settings (user_id, organization_id, plugin_id, enabled, config, ordering_priority, updated_at)
+     values ($1, $2, $3, $4, $5::jsonb, $6, now())
+     on conflict (user_id, plugin_id) do update set
+       organization_id = excluded.organization_id,
+       enabled = excluded.enabled,
+       config = excluded.config,
+       ordering_priority = excluded.ordering_priority,
+       updated_at = now()
+     returning plugin_id, enabled, config, ordering_priority as "orderingPriority", updated_at`,
+    [userId, organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority]
+  );
+  const stored = result.rows[0];
+  return {
+    pluginId: manifest.id,
+    settings: pluginCatalogItem(
+      manifest,
+      organizationSettings.get(manifest.id),
+      {
+        pluginId: manifest.id,
+        enabled: stored.enabled,
+        config: stored.config ?? {},
+        orderingPriority: stored.orderingPriority,
+        updatedAt: stored.updated_at
+      },
+      undefined,
+      pluginPolicy,
+      marketplacePolicy
+    ).settings
+  };
+}
+
+async function pluginMarketplaceForOrganization(organizationId: string, search: string, options: { includePending?: boolean; userId?: string } = {}) {
   const [plugins, marketplacePolicy] = await Promise.all([
-    pluginCatalogForOrganization(organizationId),
+    pluginCatalogForOrganization(organizationId, options.userId),
     readOrganizationMarketplacePolicy(organizationId)
   ]);
   let listings = await readMarketplaceListings(search, options);
@@ -3570,23 +3656,23 @@ async function manifestForPluginId(pluginId: string): Promise<OpenLeashPluginMan
   return listing;
 }
 
-async function installMarketplacePluginForUser(organizationId: string, pluginId: string, source: "client" | "dashboard") {
+async function installMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string, source: "client" | "dashboard") {
   const policy = await readOrganizationMarketplacePolicy(organizationId);
   const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
   if (source === "client" && !pluginPolicy?.mandatory && !policy.allowUserMarketplaceInstalls) return undefined;
   if (source === "client" && manifest.publisher !== "openleash" && !policy.allowUserCommunityPlugins) return undefined;
-  return savePluginSettingsForOrganization(organizationId, pluginId, { enabled: true, config: manifest.defaultConfig ?? {} });
+  return savePluginSettingsForUser(organizationId, userId, pluginId, { enabled: true, config: manifest.defaultConfig ?? {} });
 }
 
-async function uninstallMarketplacePluginForUser(organizationId: string, pluginId: string, source: "client" | "dashboard") {
+async function uninstallMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string, source: "client" | "dashboard") {
   const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
   if (pluginPolicy?.mandatory) return undefined;
   if (source === "client" && !pluginPolicy?.userInstallAllowed) return undefined;
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
-  return savePluginSettingsForOrganization(organizationId, pluginId, { enabled: false, config: manifest.defaultConfig ?? {} });
+  return savePluginSettingsForUser(organizationId, userId, pluginId, { enabled: false, config: manifest.defaultConfig ?? {} });
 }
 
 async function saveOrganizationPluginPolicy(organizationId: string, pluginId: string, body: Record<string, unknown>) {
@@ -3594,16 +3680,18 @@ async function saveOrganizationPluginPolicy(organizationId: string, pluginId: st
   const mandatory = Boolean(body.mandatory);
   const defaultEnabled = mandatory || Boolean(body.defaultEnabled);
   const userInstallAllowed = body.userInstallAllowed !== false;
+  const configLocked = Boolean(body.configLocked);
   const result = await pool.query(
-    `insert into organization_plugin_policy (organization_id, plugin_id, mandatory, default_enabled, user_install_allowed, updated_at)
-     values ($1, $2, $3, $4, $5, now())
+    `insert into organization_plugin_policy (organization_id, plugin_id, mandatory, default_enabled, user_install_allowed, config_locked, updated_at)
+     values ($1, $2, $3, $4, $5, $6, now())
      on conflict (organization_id, plugin_id) do update set
        mandatory = excluded.mandatory,
        default_enabled = excluded.default_enabled,
        user_install_allowed = excluded.user_install_allowed,
+       config_locked = excluded.config_locked,
        updated_at = now()
-     returning plugin_id as "pluginId", mandatory, default_enabled as "defaultEnabled", user_install_allowed as "userInstallAllowed", updated_at as "updatedAt"`,
-    [organizationId, pluginId, mandatory, defaultEnabled, userInstallAllowed]
+     returning plugin_id as "pluginId", mandatory, default_enabled as "defaultEnabled", user_install_allowed as "userInstallAllowed", config_locked as "configLocked", updated_at as "updatedAt"`,
+    [organizationId, pluginId, mandatory, defaultEnabled, userInstallAllowed, configLocked]
   );
   if (mandatory) await savePluginSettingsForOrganization(organizationId, pluginId, { enabled: true });
   return { pluginId, policy: result.rows[0] };
@@ -3633,8 +3721,9 @@ async function readOrganizationPluginPolicy(organizationId: string) {
     mandatory: boolean;
     default_enabled: boolean;
     user_install_allowed: boolean;
+    config_locked: boolean;
   }>(
-    `select plugin_id, mandatory, default_enabled, user_install_allowed
+    `select plugin_id, mandatory, default_enabled, user_install_allowed, config_locked
      from organization_plugin_policy
      where organization_id = $1`,
     [organizationId]
@@ -3643,7 +3732,8 @@ async function readOrganizationPluginPolicy(organizationId: string) {
     pluginId: row.plugin_id,
     mandatory: row.mandatory,
     defaultEnabled: row.default_enabled,
-    userInstallAllowed: row.user_install_allowed
+    userInstallAllowed: row.user_install_allowed,
+    configLocked: row.config_locked
   }]));
 }
 
@@ -3707,17 +3797,53 @@ async function readPluginSettings(organizationId: string) {
   ]));
 }
 
-async function pluginSettingsForRuntime(organizationId: string) {
-  const settings = await readPluginSettings(organizationId);
+async function readUserPluginSettings(organizationId: string, userId: string) {
+  const rows = await pool.query<{
+    plugin_id: string;
+    enabled: boolean;
+    config: Record<string, unknown>;
+    ordering_priority: number | null;
+    updated_at: string;
+  }>(
+    `select plugin_id, enabled, config, ordering_priority, updated_at
+     from user_plugin_settings
+     where organization_id = $1 and user_id = $2`,
+    [organizationId, userId]
+  );
+  return new Map<string, PluginSettingRecord>(rows.rows.map((row) => [
+    row.plugin_id,
+    {
+      pluginId: row.plugin_id,
+      enabled: row.enabled,
+      config: row.config ?? {},
+      orderingPriority: row.ordering_priority,
+      updatedAt: row.updated_at
+    }
+  ]));
+}
+
+async function pluginSettingsForRuntime(organizationId: string, userId?: string) {
+  const [settings, userSettings, policy] = await Promise.all([
+    readPluginSettings(organizationId),
+    userId ? readUserPluginSettings(organizationId, userId) : Promise.resolve(new Map<string, PluginSettingRecord>()),
+    readOrganizationPluginPolicy(organizationId)
+  ]);
   return new Map(firstPartyPluginManifests.map((manifest) => {
-    const stored = settings.get(manifest.id);
+    const organizationStored = settings.get(manifest.id);
+    const userStored = userSettings.get(manifest.id);
+    const pluginPolicy = policy.get(manifest.id);
+    const configLocked = Boolean(pluginPolicy?.configLocked);
     return [
       manifest.id,
       {
-        enabled: stored?.enabled ?? false,
-        config: stored?.config ?? manifest.defaultConfig ?? {},
-        orderingPriority: stored?.orderingPriority ?? manifest.ordering?.priority ?? null,
-        updatedAt: stored?.updatedAt
+        enabled: pluginPolicy?.mandatory ? true : userStored?.enabled ?? organizationStored?.enabled ?? pluginPolicy?.defaultEnabled ?? false,
+        config: {
+          ...(manifest.defaultConfig ?? {}),
+          ...(organizationStored?.config ?? {}),
+          ...(configLocked ? {} : userStored?.config ?? {})
+        },
+        orderingPriority: userStored?.orderingPriority ?? organizationStored?.orderingPriority ?? manifest.ordering?.priority ?? null,
+        updatedAt: userStored?.updatedAt ?? organizationStored?.updatedAt
       }
     ];
   }));
@@ -3882,7 +4008,7 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
      from policies where enabled = true order by created_at asc`
   );
   const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
-  const runtimePlugins = await pluginSettingsForRuntime(organizationId);
+  const runtimePlugins = await pluginSettingsForRuntime(organizationId, user.id);
   const pipeline = await runEvaluationPipeline({
     request,
     organizationId,

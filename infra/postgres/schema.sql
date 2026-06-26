@@ -230,6 +230,19 @@ create table if not exists plugin_settings (
 
 create index if not exists plugin_settings_org_idx on plugin_settings(organization_id, plugin_id);
 
+create table if not exists user_plugin_settings (
+  user_id uuid references users(id) on delete cascade,
+  organization_id uuid references organizations(id) on delete cascade,
+  plugin_id text not null,
+  enabled boolean not null default true,
+  config jsonb not null default '{}'::jsonb,
+  ordering_priority integer,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, plugin_id)
+);
+
+create index if not exists user_plugin_settings_org_idx on user_plugin_settings(organization_id, plugin_id);
+
 create table if not exists plugin_state (
   organization_id uuid references organizations(id) on delete cascade,
   plugin_id text not null,
@@ -372,6 +385,7 @@ create table if not exists organization_plugin_policy (
   mandatory boolean not null default false,
   default_enabled boolean not null default false,
   user_install_allowed boolean not null default true,
+  config_locked boolean not null default false,
   updated_at timestamptz not null default now(),
   primary key (organization_id, plugin_id)
 );
