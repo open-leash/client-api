@@ -40,6 +40,9 @@ export async function getUserByToken(token: string) {
 export async function ensureDevToken() {
   const token = process.env.OPENLEASH_DEV_TOKEN;
   if (!token) return;
+  if (process.env.NODE_ENV === "production" && process.env.OPENLEASH_ALLOW_PROD_DEV_TOKEN_SEED !== "1") {
+    throw new Error("OPENLEASH_DEV_TOKEN is set in production. Remove it or set OPENLEASH_ALLOW_PROD_DEV_TOKEN_SEED=1 explicitly.");
+  }
   const user = await pool.query<{ id: string }>(
     `insert into users (email, display_name, role, token_hash)
      values ('max.brin@openleash.local', 'Max Brin', 'owner', $1)

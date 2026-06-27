@@ -13,6 +13,9 @@ const appSchemaPath = path.resolve(here, "../infra/postgres/schema.sql");
 const repoSchemaPath = path.resolve(here, "../../../infra/postgres/schema.sql");
 
 const args = new Set(process.argv.slice(2));
+const shouldApply = args.has("--apply") || process.env.OPENLEASH_MIGRATION_APPLY === "1";
+const shouldList = args.has("--list");
+const shouldStatus = args.has("--status") || args.has("--pending");
 const shouldBackup = args.has("--backup") || process.env.OPENLEASH_MIGRATION_BACKUP === "1";
 const backupDir = process.env.OPENLEASH_MIGRATION_BACKUP_DIR
   ?? path.resolve(here, "../../../backups/postgres");
@@ -22,13 +25,31 @@ const databaseUrl =
   "postgres://openleash:openleash@localhost:9543/openleash";
 
 try {
-  if (shouldBackup) {
-    await backupPostgres(databaseUrl, backupDir);
+  if (args.has("--help") || args.has("-h")) {
+    printUsage();
+    process.exit(0);
   }
 
-  await withMigrationLock(async () => {
-    await ensureMigrationLedger();
-    const migrations = await loadMigrations();
+  if (shouldBackup) {
+    await backupPostgres(databaseUrl, backupDir);
+    if (!shouldApply && !shouldList && !shouldStatus) {
+      console.log("[db:migrate] backup complete; no migrations applied.");
+      process.exit(0);
+    }
+  }
+
+  const migrations = await loadMigrations();
+  if (shouldList || shouldStatus) {
+    await printMigrationStatus(migrations);
+  } else if (!shouldApply) {
+    console.error(
+      "[db:migrate] refusing to mutate the database without --apply. " +
+      "Use --status to inspect pending migrations or --apply to run them."
+    );
+    process.exitCode = 2;
+  } else {
+    await withMigrationLock(async () => {
+      await ensureMigrationLedger();
     if (migrations.length === 0) {
       await applyLegacySchemaFallback();
     } else {
@@ -38,9 +59,10 @@ try {
     }
     await removeLegacyMockIdentityRows();
     await ensureDevToken();
-  });
+    });
+  }
 
-  console.log("OpenLeash database schema is ready.");
+  if (shouldApply) console.log("OpenLeash database schema is ready.");
 } finally {
   await pool.end();
 }
@@ -114,6 +136,63 @@ async function applyMigration(migration: Migration) {
   }
 }
 
+async function printMigrationStatus(migrations: Migration[]) {
+  const applied = await readMigrationLedger();
+  const appliedById = new Map(applied.map((row) => [row.id, row]));
+  console.log(`Database: ${redactDatabaseUrl(databaseUrl)}`);
+  console.log(`Migrations: ${migrations.length}`);
+  for (const migration of migrations) {
+    const row = appliedById.get(migration.id);
+    if (!row) {
+      console.log(`pending  ${migration.id}  ${path.basename(migration.path)}`);
+    } else if (row.checksum !== migration.checksum) {
+      console.log(`changed  ${migration.id}  applied=${row.applied_at.toISOString()}`);
+    } else {
+      console.log(`applied  ${migration.id}  ${row.applied_at.toISOString()}`);
+    }
+  }
+  const known = new Set(migrations.map((migration) => migration.id));
+  for (const row of applied) {
+    if (!known.has(row.id)) console.log(`orphan   ${row.id}  ${row.applied_at.toISOString()}`);
+  }
+}
+
+async function readMigrationLedger() {
+  const exists = await pool.query<{ exists: boolean }>("select to_regclass('schema_migrations') is not null as exists");
+  if (!exists.rows[0]?.exists) return [] as { id: string; checksum: string; applied_at: Date }[];
+  const applied = await pool.query<{ id: string; checksum: string; applied_at: Date }>(
+    "select id, checksum, applied_at from schema_migrations order by id asc"
+  );
+  return applied.rows;
+}
+
+function redactDatabaseUrl(value: string) {
+  try {
+    const url = new URL(value);
+    if (url.password) url.password = "****";
+    return url.toString();
+  } catch {
+    return value.replace(/:\/\/([^:\s]+):([^@\s]+)@/, "://$1:****@");
+  }
+}
+
+function printUsage() {
+  console.log(`OpenLeash database migrations
+
+Usage:
+  DATABASE_URL=postgres://... npm run db:migrate -w @openleash/client-api -- --status
+  DATABASE_URL=postgres://... npm run db:migrate -w @openleash/client-api -- --backup
+  DATABASE_URL=postgres://... npm run db:migrate -w @openleash/client-api -- --apply
+  DATABASE_URL=postgres://... npm run db:migrate -w @openleash/client-api -- --backup --apply
+
+Options:
+  --status   Show applied, pending, changed, and orphan migrations.
+  --list     Alias of --status.
+  --backup   Write a schema-only pg_dump before doing anything else.
+  --apply    Apply pending migrations. Required for database mutations.
+`);
+}
+
 async function applyLegacySchemaFallback() {
   const schemaPath = await existingPath(appSchemaPath, repoSchemaPath);
   if (!schemaPath) throw new Error("No Postgres schema or migration directory was found.");
@@ -167,7 +246,13 @@ function run(command: string, commandArgs: string[]) {
       env: process.env
     });
     child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`${command} exited ${code}`)));
-    child.on("error", reject);
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        reject(new Error(`${command} was not found. Install PostgreSQL client tools or set PG_DUMP=/path/to/pg_dump.`));
+      } else {
+        reject(error);
+      }
+    });
   });
 }
 

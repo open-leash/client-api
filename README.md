@@ -73,7 +73,7 @@ Developer docs live in [`src/plugins/README.md`](src/plugins/README.md). Public 
 ```bash
 npm install
 docker compose up -d postgres
-npm run db:migrate
+python3 migrate.py --target local --scope core --apply --yes
 npm run dev:client-api
 ```
 
@@ -88,6 +88,32 @@ Recommended full-mode runner:
 ```bash
 python3 run.py
 ```
+
+---
+
+## 🗄 Database install and upgrades
+
+`client-api` owns the public self-hosted schema. It must be migrated before `client-api` or `dashboard-api` starts.
+
+Fresh self-hosted Postgres database:
+
+```bash
+python3 migrate.py --target custom --database-url 'postgres://...' --scope core --apply --yes
+```
+
+Upgrade an existing self-hosted deployment:
+
+```bash
+python3 migrate.py --target custom --database-url 'postgres://...' --scope core --backup-apply --yes
+```
+
+Read-only status:
+
+```bash
+python3 migrate.py --target custom --database-url 'postgres://...' --scope core --status --yes
+```
+
+Operators should run migrations as a one-shot deployment job, not as API startup logic. Migrations are tracked in `schema_migrations` with checksums and timestamps. Never edit an applied migration; add a new forward migration that performs all needed schema and data changes.
 
 ---
 
