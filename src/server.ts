@@ -924,7 +924,7 @@ function outcomeDomainForSignal(kind: string, pluginId?: string): OpenLeashOutco
   if (kind === "tool.risk" || kind === "mcp.discovery" || pluginId === "openleash.mcp-scanner") return "tool_risk";
   if (kind === "identity.risk") return "identity";
   if (kind === "export.status" || kind === "plugin.health") return "operations";
-  if (kind === "policy.decision" || kind === "security.finding" || pluginId === "openleash.security-evaluator" || pluginId === "openleash.skill-scanner") return "security";
+  if (kind === "policy.decision" || kind === "security.finding" || pluginId === "openleash.rules-enforcer" || pluginId === "openleash.skill-scanner") return "security";
   return "compliance";
 }
 
@@ -997,7 +997,7 @@ function normalizeOutcomeEvidence(value: unknown): OpenLeashOutcomeRecord["evide
 
 function outcomeSourceLabel(pluginId?: string | null) {
   const value = String(pluginId ?? "").trim();
-  if (value === "openleash.security-evaluator") return "Security Evaluation";
+  if (value === "openleash.rules-enforcer") return "Rules Enforcer";
   if (value === "openleash.dlp") return "Data Protection";
   if (value === "openleash.mcp-scanner") return "MCP and Tool Risk";
   if (value === "openleash.skill-scanner") return "Skill Review";
@@ -2213,6 +2213,40 @@ app.post("/v1/mobile/decisions/:id/resolve", async (req, res, next) => {
     const body = req.body as MobileDecisionResolveRequest;
     const resolution = body.resolution === "allow" ? "allow" : "deny";
     const result = await resolveApprovalGroup(req.params.id, resolution, `mobile:${session.user.id}`, {
+      userId: session.user.id
+    }, body.resolutionGuidance);
+    if (!result) return res.status(404).json({ error: "approval not found" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/v1/client/notifications", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const [pending, blocked] = await Promise.all([
+      mobilePendingApprovals(session.user.id, session.organization.id, false),
+      browserBlockedNotifications(session.organization.id, session.user.id)
+    ]);
+    res.json({
+      serverTime: new Date().toISOString(),
+      pendingApprovals: pending.rows,
+      blockedEvents: blocked.rows
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/client/decisions/:id/resolve", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const body = req.body as MobileDecisionResolveRequest;
+    const resolution = body.resolution === "allow" ? "allow" : "deny";
+    const result = await resolveApprovalGroup(req.params.id, resolution, `web:${session.user.id}`, {
       userId: session.user.id
     }, body.resolutionGuidance);
     if (!result) return res.status(404).json({ error: "approval not found" });
@@ -3541,9 +3575,15 @@ type MarketplacePolicyRecord = {
 };
 
 async function pluginCatalogForOrganization(organizationId: string, userId?: string): Promise<{ plugins: PluginCatalogItem[]; marketplacePolicy: MarketplacePolicyRecord }> {
-  const [settings, userSettings] = await Promise.all([
+  const [settings, userSettings, policyRows] = await Promise.all([
     readPluginSettings(organizationId),
-    userId ? readUserPluginSettings(organizationId, userId) : Promise.resolve(new Map<string, PluginSettingRecord>())
+    userId ? readUserPluginSettings(organizationId, userId) : Promise.resolve(new Map<string, PluginSettingRecord>()),
+    pool.query<Policy>(
+      `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
+       from policies
+       where enabled = true
+       order by created_at asc`
+    )
   ]);
   const policy = await readOrganizationPluginPolicy(organizationId);
   const marketplacePolicy = await readOrganizationMarketplacePolicy(organizationId);
@@ -3558,7 +3598,7 @@ async function pluginCatalogForOrganization(organizationId: string, userId?: str
         const listing = marketplaceById.get(pluginId);
         const manifest = manifestsById.get(pluginId) ?? listing;
         if (!manifest) return undefined;
-        return pluginCatalogItem(manifest, settings.get(pluginId), userSettings.get(pluginId), listing, policy.get(pluginId), marketplacePolicy);
+        return pluginCatalogItem(manifest, settings.get(pluginId), userSettings.get(pluginId), listing, policy.get(pluginId), marketplacePolicy, policyRows.rows);
       })
       .filter((item): item is PluginCatalogItem => Boolean(item))
   };
@@ -3570,21 +3610,26 @@ function pluginCatalogItem(
   userSettings?: PluginSettingRecord,
   marketplace?: PluginMarketplaceListing,
   policy?: PluginPolicyRecord,
-  marketplacePolicy?: MarketplacePolicyRecord
+  marketplacePolicy?: MarketplacePolicyRecord,
+  fallbackPolicies: Policy[] = []
 ): PluginCatalogItem {
   const enabled = policy?.mandatory ? true : userSettings?.enabled ?? organizationSettings?.enabled ?? policy?.defaultEnabled ?? false;
   const configLocked = Boolean(policy?.configLocked);
+  const effectiveConfig = {
+    ...(manifest.defaultConfig ?? {}),
+    ...(organizationSettings?.config ?? {}),
+    ...(configLocked ? {} : userSettings?.config ?? {})
+  };
+  if (manifest.id === "openleash.rules-enforcer" && normalizeRuleConfigs(effectiveConfig.rules).length === 0) {
+    effectiveConfig.rules = policyRulesForConfig(fallbackPolicies);
+  }
   return {
     ...manifest,
     slug: manifest.slug ?? marketplace?.slug,
     marketplace,
     settings: {
       enabled,
-      config: {
-        ...(manifest.defaultConfig ?? {}),
-        ...(organizationSettings?.config ?? {}),
-        ...(configLocked ? {} : userSettings?.config ?? {})
-      },
+      config: effectiveConfig,
       orderingPriority: userSettings?.orderingPriority ?? organizationSettings?.orderingPriority ?? manifest.ordering?.priority ?? null,
       updatedAt: userSettings?.updatedAt ?? organizationSettings?.updatedAt
     },
@@ -3915,7 +3960,7 @@ async function readPluginSettings(organizationId: string) {
      where organization_id = $1`,
     [organizationId]
   );
-  return new Map<string, PluginSettingRecord>(rows.rows.map((row) => [
+  return withLegacyRulesEnforcerSetting(new Map<string, PluginSettingRecord>(rows.rows.map((row) => [
     row.plugin_id,
     {
       pluginId: row.plugin_id,
@@ -3924,7 +3969,7 @@ async function readPluginSettings(organizationId: string) {
       orderingPriority: row.ordering_priority,
       updatedAt: row.updated_at
     }
-  ]));
+  ])));
 }
 
 async function readUserPluginSettings(organizationId: string, userId: string) {
@@ -3940,7 +3985,7 @@ async function readUserPluginSettings(organizationId: string, userId: string) {
      where organization_id = $1 and user_id = $2`,
     [organizationId, userId]
   );
-  return new Map<string, PluginSettingRecord>(rows.rows.map((row) => [
+  return withLegacyRulesEnforcerSetting(new Map<string, PluginSettingRecord>(rows.rows.map((row) => [
     row.plugin_id,
     {
       pluginId: row.plugin_id,
@@ -3949,7 +3994,20 @@ async function readUserPluginSettings(organizationId: string, userId: string) {
       orderingPriority: row.ordering_priority,
       updatedAt: row.updated_at
     }
-  ]));
+  ])));
+}
+
+function withLegacyRulesEnforcerSetting(settings: Map<string, PluginSettingRecord>) {
+  if (!settings.has("openleash.rules-enforcer")) {
+    const legacy = settings.get("openleash.security-evaluator");
+    if (legacy) {
+      settings.set("openleash.rules-enforcer", {
+        ...legacy,
+        pluginId: "openleash.rules-enforcer"
+      });
+    }
+  }
+  return settings;
 }
 
 async function pluginSettingsForRuntime(organizationId: string, userId?: string) {
@@ -4133,12 +4191,13 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
       results: []
     };
   }
+  const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
+  const runtimePlugins = await pluginSettingsForRuntime(organizationId, user.id);
   const policies = await pool.query<Policy>(
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
      from policies where enabled = true order by created_at asc`
   );
-  const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
-  const runtimePlugins = await pluginSettingsForRuntime(organizationId, user.id);
+  const runtimePolicies = policiesForRulesEnforcer(runtimePlugins, policies.rows);
   const pipeline = await runEvaluationPipeline({
     request,
     organizationId,
@@ -4146,16 +4205,19 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     userId: user.id,
     computerId,
     runtimeId,
-    policies: policies.rows,
+    policies: runtimePolicies,
     tenantModelKey,
     plugins: runtimePlugins
   });
   const { results: evaluatedResults, model } = pipeline;
-  const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, evaluatedResults);
-  const results = promptOnlyDeferred ? deferPromptOnlyPolicyResults(evaluatedResults) : evaluatedResults;
-  const decision = results.some((r) => r.status === "failed" || r.status === "needs_question")
-    ? "ask"
-    : "allow";
+  const actionedResults = applyConfiguredRuleActions(evaluatedResults, runtimePolicies);
+  const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, actionedResults);
+  const results = promptOnlyDeferred ? deferPromptOnlyPolicyResults(actionedResults) : actionedResults;
+  const decision = results.some((r) => r.status === "failed")
+    ? "deny"
+    : results.some((r) => r.status === "needs_question")
+      ? "ask"
+      : "allow";
   const blockingResult = results.find((r) => r.status === "failed");
   const approvalSummary =
     blockingResult
@@ -4274,6 +4336,14 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     notifyMobileApprovers(user.id, evaluation.rows[0].id, summary, question, purposeSummary).catch((error) => {
       console.warn("mobile approval notification failed", error);
     });
+  } else if (decision === "deny") {
+    notifyMobileEvent(user.id, {
+      title: "OpenLeash blocked an agent action",
+      body: summary,
+      data: { decisionId: evaluation.rows[0].id, kind: "blocked" }
+    }).catch((error) => {
+      console.warn("mobile blocked notification failed", error);
+    });
   }
   return { decision, decisionId: evaluation.rows[0].id, summary, question, results };
 }
@@ -4283,6 +4353,104 @@ function resolvePolicyResultPolicyId(result: PolicyDecision, policies: Policy[])
   if (byId) return byId.id;
   const byName = policies.find((policy) => policy.name === result.policyName);
   return byName?.id ?? null;
+}
+
+function policiesForRulesEnforcer(settings: Map<string, PluginSettingRecord | PluginSettingState>, fallback: Policy[]): Policy[] {
+  const rulesPlugin = settings.get("openleash.rules-enforcer");
+  const rules = normalizeRuleConfigs(rulesPlugin?.config?.rules);
+  if (rules.length === 0) return fallback;
+  return rules.map((rule, index) => ({
+    id: `rules-enforcer-${stableRuleId(rule.text, index)}`,
+    name: summarizePolicyTitle(rule.text),
+    description: rule.text,
+    severity: "medium",
+    naturalLanguageRule: rule.text,
+    enabled: true,
+    locked: false,
+    enforcementAction: rule.action
+  }));
+}
+
+function normalizeRuleConfigs(value: unknown): Array<{ text: string; action: "ask" | "block" }> {
+  if (Array.isArray(value)) {
+    const seen = new Set<string>();
+    const rules: Array<{ text: string; action: "ask" | "block" }> = [];
+    for (const item of value) {
+      const normalized = normalizeRuleConfig(item);
+      if (!normalized || seen.has(normalized.text)) continue;
+      seen.add(normalized.text);
+      rules.push(normalized);
+    }
+    return rules;
+  }
+  if (typeof value === "string") {
+    return [...new Set(splitRuleString(value)
+      .map((line) => line.replace(/^[-*]\s+/, "").trim())
+      .filter(Boolean)
+    )].map((text) => ({ text, action: "ask" }));
+  }
+  return [];
+}
+
+function normalizeRuleConfig(value: unknown): { text: string; action: "ask" | "block" } | undefined {
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text ? { text, action: "ask" } : undefined;
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const text = String(record.text ?? record.rule ?? record.description ?? "").trim();
+  if (!text) return undefined;
+  return {
+    text,
+    action: record.action === "block" ? "block" : "ask"
+  };
+}
+
+function splitRuleString(value: string) {
+  const lines = value.split(/\r?\n/g);
+  if (lines.length > 1) return lines;
+  return value.split(/,\s+(?=Ask before|Never|Do not|Don't|Always|Require|Block|Pause)/gi);
+}
+
+function policyRulesForConfig(policies: Policy[]) {
+  return policies.map((policy) => ({
+    text: String(policy.naturalLanguageRule || policy.description || policy.name || "").trim(),
+    action: policy.enforcementAction === "block" ? "block" : "ask"
+  })).filter((rule) => rule.text);
+}
+
+function applyConfiguredRuleActions(results: PolicyDecision[], policies: Policy[]): PolicyDecision[] {
+  const policyActions = new Map(policies.map((policy) => [policy.id, policy.enforcementAction ?? "ask"]));
+  return results.map((result) => {
+    if (result.status === "passed") return result;
+    const action = policyActions.get(result.policyId) ?? policyActions.get(policyIdForPolicyName(result.policyName, policies)) ?? "ask";
+    if (action === "block") {
+      return {
+        ...result,
+        status: "failed",
+        question: undefined
+      };
+    }
+    return {
+      ...result,
+      status: "needs_question",
+      question: result.question ?? "OpenLeash found a rule match. Allow this action once?"
+    };
+  });
+}
+
+function policyIdForPolicyName(policyName: string, policies: Policy[]) {
+  return policies.find((policy) => policy.name === policyName)?.id ?? "";
+}
+
+function stableRuleId(rule: string, index: number) {
+  const slug = rule
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || `rule-${index + 1}`;
 }
 
 async function tenantModelKeyForEvaluation(organizationId: string) {
@@ -4384,7 +4552,7 @@ async function recordMcpToolCall({
   computerId: string;
   runtimeId: string;
   request: EvaluationRequest;
-  decision: "allow" | "ask";
+  decision: "allow" | "ask" | "deny";
 }) {
   if (!call) return;
   const client = await pool.connect();
@@ -5889,7 +6057,76 @@ function mobileRecentActivity(organizationId: string, userId: string) {
   );
 }
 
+function browserBlockedNotifications(organizationId: string, userId: string) {
+  return pool.query(
+    `select e.id, e.decision, e.resolution, e.summary, e.question, e.created_at,
+            ce.event_name, ce.tool_name, ce.project_path, ce.prompt, ce.payload,
+            ar.display_name as agent_name, ar.kind as agent_kind,
+            c.hostname,
+            coalesce(triggered.items, '[]'::jsonb) as triggered_policies
+     from evaluations e
+     join conversation_events ce on ce.id = e.conversation_event_id
+     join agent_runtimes ar on ar.id = ce.agent_runtime_id
+     join computers c on c.id = ce.computer_id
+     left join lateral (
+       select jsonb_agg(
+         jsonb_build_object(
+           'policy_name', pr.policy_name,
+           'status', pr.status,
+           'severity', pr.severity,
+           'explanation', pr.explanation,
+           'evidence', pr.evidence
+         )
+         order by pr.created_at asc
+       ) as items
+       from policy_results pr
+       where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question')
+     ) triggered on true
+     where e.user_id = $2
+       and exists (
+         select 1
+         from users u
+         where u.id = e.user_id and u.organization_id = $1
+       )
+       and e.decision = 'deny'
+       and e.created_at > now() - interval '30 minutes'
+       and ce.event_name <> 'Stop'
+     order by e.created_at desc
+     limit 10`,
+    [organizationId, userId]
+  );
+}
+
 async function notifyMobileApprovers(userId: string, decisionId: string, summary: string, question?: string, purposeSummary?: string) {
+  await notifyMobileEvent(userId, {
+    title: summary || "OpenLeash approval needed",
+    body: [purposeSummary, question].filter(Boolean).join("\n") || "An AI agent is waiting for your decision.",
+    categoryId: "openleash.approval",
+    data: { decisionId, purposeSummary }
+  });
+}
+
+async function notifyMobileEvent(userId: string, notification: { title: string; body: string; categoryId?: string; data?: Record<string, unknown> }) {
+  const devices = await mobilePushDevicesForUser(userId);
+  const expoMessages = devices
+    .filter((token): token is string => Boolean(token && /^ExponentPushToken\[[^\]]+\]$|^ExpoPushToken\[[^\]]+\]$/.test(token)))
+    .map((token) => ({
+      to: token,
+      title: notification.title,
+      body: notification.body,
+      sound: "default",
+      ...(notification.categoryId ? { categoryId: notification.categoryId } : {}),
+      data: notification.data ?? {}
+    }));
+  if (!expoMessages.length) return;
+  await fetch("https://exp.host/--/api/v2/push/send", {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify(expoMessages)
+  });
+}
+
+async function mobilePushDevicesForUser(userId: string) {
   const devices = await pool.query<{ push_token: string }>(
     `select distinct md.push_token
      from mobile_devices md
@@ -5900,23 +6137,7 @@ async function notifyMobileApprovers(userId: string, decisionId: string, summary
      limit 50`,
     [userId]
   );
-  const expoMessages = devices.rows
-    .map((row) => row.push_token)
-    .filter((token): token is string => Boolean(token && /^ExponentPushToken\[[^\]]+\]$|^ExpoPushToken\[[^\]]+\]$/.test(token)))
-    .map((token) => ({
-      to: token,
-      title: summary || "OpenLeash approval needed",
-      body: [purposeSummary, question].filter(Boolean).join("\n") || "An AI agent is waiting for your decision.",
-      sound: "default",
-      categoryId: "openleash.approval",
-      data: { decisionId, purposeSummary }
-    }));
-  if (!expoMessages.length) return;
-  await fetch("https://exp.host/--/api/v2/push/send", {
-    method: "POST",
-    headers: { accept: "application/json", "content-type": "application/json" },
-    body: JSON.stringify(expoMessages)
-  });
+  return devices.rows.map((row) => row.push_token);
 }
 
 function ssoProviderFromIdp(row: { id: string; provider: string; enabled: boolean; config: Record<string, unknown> }, organizationId: string) {
@@ -6485,6 +6706,18 @@ function isHookEventName(value: string): value is HookEventName {
 
 function nativeHookDecision(agent: HookAgentSlug, eventName: HookEventName, decision: EvaluationResponse) {
   const reason = humanDecisionReason(decision);
+  if (agent === "copilot") {
+    if (eventName === "PreToolUse") {
+      return {
+        permissionDecision: decision.decision,
+        permissionDecisionReason: reason
+      };
+    }
+    if (eventName === "Stop" || eventName === "SubagentStop") {
+      return { decision: decision.decision === "deny" ? "block" : "allow", reason };
+    }
+    return {};
+  }
   if (agent === "claude" || agent === "nanoclaw") {
     if (eventName === "PreToolUse") {
       return {
@@ -6702,6 +6935,8 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && requestPath === "/v1/mobile/devices") return "mobileDeviceRegister";
   if (verb === "GET" && requestPath === "/v1/mobile/state") return "mobileState";
   if (verb === "POST" && /^\/v1\/mobile\/decisions\/[^/]+\/resolve$/.test(requestPath)) return "mobileDecisionResolve";
+  if (verb === "GET" && requestPath === "/v1/client/notifications") return "clientNotifications";
+  if (verb === "POST" && /^\/v1\/client\/decisions\/[^/]+\/resolve$/.test(requestPath)) return "clientDecisionResolve";
   if (verb === "GET" && /^\/organizations\/[^/]+\/sso-providers$/.test(requestPath)) return "organizationSsoProviders";
   if (verb === "GET" && /^\/organizations\/[^/]+$/.test(requestPath)) return "organizationsRead";
   if (verb === "POST" && requestPath === "/organizations") return "organizationsWrite";

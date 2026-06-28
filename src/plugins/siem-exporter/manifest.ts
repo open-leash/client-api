@@ -12,7 +12,7 @@ export const siemExporterManifest: OpenLeashPluginManifest = {
   events: ["prompt.beforeSubmit", "agent.response", "tool.beforeUse", "tool.afterUse", "session.started", "session.ended", "skill.changed", "log.emitted"],
   permissions: ["event:read", "prompt:read", "tool:read", "network:access", "audit:write", "log:write"],
   effects: ["observe", "notify"],
-  ordering: { priority: 900, after: ["openleash.security-evaluator", "openleash.mcp-scanner"] },
+  ordering: { priority: 900, after: ["openleash.rules-enforcer", "openleash.mcp-scanner"] },
   configSchema: {
     type: "object",
     additionalProperties: false,

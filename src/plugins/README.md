@@ -9,7 +9,7 @@ Current first-party plugins:
 
 - `prompt-compression` runs on `prompt.beforeSubmit` and may modify the prompt.
 - `dlp` runs after compression on `prompt.beforeSubmit` and may mask or block.
-- `security-evaluator` evaluates active policies for prompts, agent responses, and tool actions.
+- `rules-enforcer` evaluates active policies for prompts, agent responses, and tool actions.
 - `mcp-scanner` observes MCP tool calls and records inventory.
 - `skill-scanner` observes skill changes and can create a review finding.
 
@@ -38,7 +38,7 @@ Compression runs first so DLP checks the final prompt that would be sent to the 
 For tool events:
 
 ```text
-security-evaluator -> mcp-scanner
+rules-enforcer -> mcp-scanner
 ```
 
 The security evaluator decides whether human review is needed. The MCP scanner then records inventory with the resulting decision context.
@@ -51,7 +51,8 @@ Permissions are declarative and should match what the implementation actually ne
 - `tool:read`
 - `decision:write`
 - `model:invoke`
-- `filesystem:read` / `filesystem:write`
+- `instructions:read`
+- `filesystem:read` / `filesystem:write` only for reviewed first-party or explicitly approved plugins
 - `storage:read` / `storage:write`
 - `audit:write`
 - `log:write`
@@ -70,6 +71,7 @@ Instead, plugin code receives stable capabilities from the runtime:
 ```ts
 await capabilities.prompt.compress({ prompt, level: "standard" });
 await capabilities.dlp.inspect({ prompt, action: "mask", categories: ["pii"] });
+const instructionFiles = await capabilities.context.instructions.list({ scope: "project" });
 await capabilities.storage.set({ key: "last-risk", value: { score: 82 } });
 const recent = await capabilities.storage.list({ keyPrefix: "sessions/", limit: 25 });
 await capabilities.log.emit({ level: "security", message: "Custom evaluator flagged a risky action." });
@@ -78,6 +80,31 @@ await capabilities.usage.record({ kind: "llm.tokens", inputTokens: 8000, savedTo
 ```
 
 If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, plugin/system logs, SIEM export, security signals, usage records, or other approved services.
+
+## Host Context And Instruction Files
+
+External plugins do not get general access to the computer running the agent. They should not walk the host filesystem, read arbitrary files, shell out to local tools, or assume they run beside the user's project. OpenLeash owns host discovery and exposes only reviewed context through explicit capabilities or event payloads.
+
+Agent instruction files are the canonical example. Files such as `CLAUDE.md`, `AGENTS.md`, Cursor rules, Cline rules, OpenCode rules, Windsurf rules, and Copilot instructions may be useful to a plugin, but they are still host files. OpenLeash discovers known global and project instruction locations, normalizes the results, and serves them through:
+
+```ts
+const files = await capabilities.context.instructions.list();
+```
+
+Each item contains:
+
+```ts
+{
+  agent: "Claude Code",
+  scope: "project",
+  label: "Project CLAUDE.md",
+  path: "/workspace/CLAUDE.md",
+  content: "...",
+  parsedLines: ["Ask before publishing changes", "..."]
+}
+```
+
+Plugins may use the raw `content`, use `parsedLines`, or parse the content themselves. The important boundary is that OpenLeash decides which files are discoverable and when they are attached to the plugin context. A plugin that wants one more host-derived data source should request a new narrow capability such as `context.instructions`, not a broad filesystem permission.
 
 ## Build A Plugin
 

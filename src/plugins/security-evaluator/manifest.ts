@@ -1,13 +1,13 @@
 import type { OpenLeashPluginManifest } from "@openleash/shared";
 
 export const securityEvaluatorManifest: OpenLeashPluginManifest = {
-  id: "openleash.security-evaluator",
-  name: "sec-evaluator",
-  description: "Approve, deny, or log risky agent actions.",
+  id: "openleash.rules-enforcer",
+  name: "rules-enforcer",
+  description: "Watch agent conversations and pause when configured rules are violated.",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",
-  entrypoint: "plugins/security-evaluator",
+  entrypoint: "plugins/rules-enforcer",
   events: ["prompt.beforeSubmit", "agent.response", "tool.beforeUse", "tool.afterUse"],
   permissions: ["event:read", "prompt:read", "tool:read", "decision:write", "model:invoke", "audit:write", "log:write", "signal:write", "usage:write", "notification:send"],
   effects: ["observe", "ask", "deny"],
@@ -20,12 +20,22 @@ export const securityEvaluatorManifest: OpenLeashPluginManifest = {
     additionalProperties: false,
     properties: {
       enabled: { type: "boolean" },
-      policySet: { type: "string" }
+      rules: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            text: { type: "string" },
+            action: { type: "string", enum: ["ask", "block"] }
+          }
+        }
+      }
     }
   },
   defaultConfig: {
     enabled: true,
-    policySet: "active"
+    rules: []
   },
-  tags: ["security", "policy", "approval"]
+  tags: ["security", "rules", "policy", "approval"]
 };

@@ -173,7 +173,7 @@ function slugForPlugin(manifest: OpenLeashPluginManifest, item: PluginImport) {
   const npmName = item.packageName?.split("/").pop()?.replace(/^plugin-/, "");
   const folderName = path.basename(item.root);
   const base = npmName || folderName || manifest.id;
-  if (manifest.id === "openleash.security-evaluator") return "sec-evaluator";
+  if (manifest.id === "openleash.rules-enforcer") return "rules-enforcer";
   if (manifest.id === "openleash.prompt-compression") return "token-saver";
   if (manifest.id === "openleash.dlp") return "data-leakage-prevention";
   return slugify(base);

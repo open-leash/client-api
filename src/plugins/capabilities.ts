@@ -1,6 +1,7 @@
 import type {
   EvaluationRequest,
   PluginCapabilities,
+  PluginInstructionFile,
   PluginLogRecord,
   PluginLogLevel,
   PluginLogRequest,
@@ -106,6 +107,20 @@ export function createPluginCapabilities({
   };
 
   return {
+    context: {
+      instructions: {
+        async list({ agent, scope } = {}) {
+          const rawFiles = Array.isArray((request?.event.raw as { instructionFiles?: unknown })?.instructionFiles)
+            ? (request?.event.raw as { instructionFiles: unknown[] }).instructionFiles
+            : [];
+          return rawFiles
+            .map(normalizeInstructionFile)
+            .filter((file): file is NonNullable<ReturnType<typeof normalizeInstructionFile>> => Boolean(file))
+            .filter((file) => !agent || file.agent.toLowerCase() === agent.toLowerCase())
+            .filter((file) => !scope || file.scope === scope);
+        }
+      }
+    },
     prompt: {
       compress(request) {
         return compressPromptCapability({ ...request, apiKey });
@@ -189,6 +204,25 @@ export function createPluginCapabilities({
         });
       }
     }
+  };
+}
+
+function normalizeInstructionFile(value: unknown): PluginInstructionFile | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const content = typeof record.content === "string" ? record.content : "";
+  if (!content) return undefined;
+  const scope: PluginInstructionFile["scope"] = record.scope === "global" || record.scope === "project" ? record.scope : "project";
+  const parsedLines = Array.isArray(record.parsedLines)
+    ? record.parsedLines.filter((line): line is string => typeof line === "string" && line.trim().length > 0).map((line) => line.trim())
+    : undefined;
+  return {
+    agent: typeof record.agent === "string" && record.agent.trim() ? record.agent.trim() : "unknown",
+    scope,
+    label: typeof record.label === "string" ? record.label : undefined,
+    path: typeof record.path === "string" ? record.path : undefined,
+    content,
+    parsedLines
   };
 }
 

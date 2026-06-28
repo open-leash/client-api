@@ -474,6 +474,10 @@ create table if not exists skills (
   risk_score integer not null default 0,
   reasons jsonb not null default '[]'::jsonb,
   content_hash text not null,
+  content text,
+  content_preview text,
+  purpose_summary text,
+  content_updated_at timestamptz,
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -497,6 +501,7 @@ create table if not exists skill_events (
   risk_score integer not null default 0,
   reasons jsonb not null default '[]'::jsonb,
   content_preview text,
+  purpose_summary text,
   occurred_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
