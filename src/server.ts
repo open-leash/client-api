@@ -77,6 +77,12 @@ import {
 } from "./model-keys.js";
 import { assertReleaseAdmin, checkForClientUpdate, updateRequestSchema, upsertRelease } from "./releases.js";
 
+class HttpError extends Error {
+  constructor(public statusCode: number, message: string) {
+    super(message);
+  }
+}
+
 export type ApiSurface = "client" | "dashboard" | "all";
 export type OpenLeashApiExtension = (context: OpenLeashApiContext) => void | Promise<void>;
 export type OpenLeashApiContext = {
@@ -517,24 +523,68 @@ app.post("/admin/evaluation-key", async (req, res, next) => {
   }
 });
 
-app.get("/admin/overview", async (_req, res, next) => {
+app.get("/admin/overview", async (req, res, next) => {
   try {
+      const session = await getDashboardSession(req.header("authorization") ?? "");
+      if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+      const dashboardRole = isDashboardAccessRole(session.user.role);
+      const scopeParams = [session.organization.id, session.user.id, dashboardRole];
+      const eventScope = `exists (
+          select 1
+          from computers scope_c
+          where scope_c.id = ce.computer_id
+            and scope_c.user_id is not null
+            and exists (
+              select 1
+              from users scope_u
+              where scope_u.id = scope_c.user_id
+                and scope_u.organization_id = $1
+            )
+            and ($3::boolean or scope_c.user_id = $2)
+        )`;
       const [metrics, sessionMetrics, agentSessions, usageSessions, agents, recent, policies, users] = await Promise.all([
       pool.query(`select
-        (select count(*) from computers) as computers,
-        (select count(*) from agent_runtimes where kind not in ('openclaw', 'nanoclaw')) as agents,
-        (select count(*) from conversation_events where created_at > now() - interval '30 days') as events,
-        (select count(*) from evaluations where decision = 'deny' and created_at > now() - interval '30 days') as denied,
-        (select count(*) from evaluations where decision = 'ask' and created_at > now() - interval '30 days') as questions`),
-      dashboardSessionMetrics(),
-      dashboardAgentSessions(),
-      dashboardUsageSessions(),
+        (select count(*)
+         from computers c
+         join users u on u.id = c.user_id
+         where u.organization_id = $1 and ($3::boolean or c.user_id = $2)) as computers,
+        (select count(*)
+         from agent_runtimes ar
+         join computers c on c.id = ar.computer_id
+         join users u on u.id = c.user_id
+         where u.organization_id = $1 and ($3::boolean or c.user_id = $2) and ar.kind not in ('openclaw', 'nanoclaw')) as agents,
+        (select count(*)
+         from conversation_events ce
+         join computers c on c.id = ce.computer_id
+         join users u on u.id = c.user_id
+         where u.organization_id = $1 and ($3::boolean or c.user_id = $2) and ce.created_at > now() - interval '30 days') as events,
+        (select count(*)
+         from evaluations e
+         join conversation_events ce on ce.id = e.conversation_event_id
+         join computers c on c.id = ce.computer_id
+         join users u on u.id = c.user_id
+         where u.organization_id = $1 and ($3::boolean or c.user_id = $2) and e.decision = 'deny' and e.created_at > now() - interval '30 days') as denied,
+        (select count(*)
+         from evaluations e
+         join conversation_events ce on ce.id = e.conversation_event_id
+         join computers c on c.id = ce.computer_id
+         join users u on u.id = c.user_id
+         where u.organization_id = $1 and ($3::boolean or c.user_id = $2) and e.decision = 'ask' and e.created_at > now() - interval '30 days') as questions`,
+        scopeParams
+      ),
+      dashboardSessionMetrics(eventScope, scopeParams),
+      dashboardAgentSessions(eventScope, scopeParams),
+      dashboardUsageSessions(eventScope, scopeParams),
       pool.query(`select ar.*, c.hostname, u.display_name as user_name
         from agent_runtimes ar
         join computers c on c.id = ar.computer_id
         left join users u on u.id = c.user_id
         where ar.kind not in ('openclaw', 'nanoclaw')
-        order by ar.last_seen_at desc limit 20`),
+          and u.organization_id = $1
+          and ($3::boolean or c.user_id = $2)
+        order by ar.last_seen_at desc limit 20`,
+        scopeParams
+      ),
       pool.query(`select e.id, e.decision, e.resolution, e.summary, e.question, e.created_at, ce.event_name, ce.tool_name, ce.project_path, ce.prompt,
           ar.kind as agent_kind, ar.display_name as agent_name, c.hostname, u.display_name as user_name,
           coalesce(triggered.items, '[]'::jsonb) as triggered_policies
@@ -565,8 +615,17 @@ app.get("/admin/overview", async (_req, res, next) => {
             where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question')
           )
         )
-        order by e.created_at desc limit 30`),
-      pool.query(policyInventorySql()),
+          and exists (
+            select 1
+            from users scope_u
+            where scope_u.id = c.user_id
+              and scope_u.organization_id = $1
+          )
+          and ($3::boolean or c.user_id = $2)
+        order by e.created_at desc limit 30`,
+        scopeParams
+      ),
+      pool.query(policyInventorySql("u.organization_id = $1 and ($3::boolean or e.user_id = $2)"), scopeParams),
       pool.query(`select u.id, u.email, u.display_name, u.role, u.created_at,
           u.department, u.title as hr_title, u.idp_provider, u.status,
           count(distinct c.id) as endpoint_count,
@@ -577,8 +636,12 @@ app.get("/admin/overview", async (_req, res, next) => {
         from users u
         left join computers c on c.user_id = u.id
         left join agent_runtimes ar on ar.computer_id = c.id
+        where u.organization_id = $1
+          and ($3::boolean or u.id = $2)
         group by u.id
-        order by u.display_name asc`)
+        order by u.display_name asc`,
+        scopeParams
+      )
     ]);
     res.json({
       metrics: { ...metrics.rows[0], session_time: sessionMetrics.rows[0] },
@@ -1012,7 +1075,7 @@ function outcomeDomainLabel(domain: OpenLeashOutcomeDomain) {
   return domain.charAt(0).toUpperCase() + domain.slice(1);
 }
 
-function dashboardSessionMetrics() {
+function dashboardSessionMetrics(whereClause = "true", params: unknown[] = []) {
   return pool.query(
     `with sessions as (
        select ce.agent_runtime_id,
@@ -1022,6 +1085,7 @@ function dashboardSessionMetrics() {
               max(ce.created_at) as last_activity_at,
               greatest(0, extract(epoch from max(ce.created_at) - min(ce.created_at)))::int as duration_seconds
        from conversation_events ce
+       where ${whereClause}
        group by ce.agent_runtime_id, ce.session_id, coalesce(ce.project_path, '')
      )
      select
@@ -1033,11 +1097,12 @@ function dashboardSessionMetrics() {
        count(*) filter (where last_activity_at >= now() - interval '7 days')::int as week_sessions,
        coalesce(sum(duration_seconds) filter (where last_activity_at >= now() - interval '30 days'), 0)::int as month_seconds,
        count(*) filter (where last_activity_at >= now() - interval '30 days')::int as month_sessions
-     from sessions`
+     from sessions`,
+    params
   );
 }
 
-function dashboardAgentSessions() {
+function dashboardAgentSessions(whereClause = "true", params: unknown[] = []) {
   return pool.query(
     `with session_groups as (
        select ce.agent_runtime_id,
@@ -1051,6 +1116,7 @@ function dashboardAgentSessions() {
               count(e.id) filter (where e.decision = 'deny' or e.resolution = 'deny')::int as denied_count
        from conversation_events ce
        left join evaluations e on e.conversation_event_id = ce.id
+       where ${whereClause}
        group by ce.agent_runtime_id, ce.session_id, coalesce(ce.project_path, '')
        order by max(ce.created_at) desc
        limit 200
@@ -1082,13 +1148,14 @@ function dashboardAgentSessions() {
        order by case when ce.prompt is not null and length(ce.prompt) > 0 then 0 else 1 end, ce.created_at asc
        limit 1
      ) title_item on true
-     order by sg.last_activity_at desc`
+     order by sg.last_activity_at desc`,
+    params
   );
 }
 
-function dashboardUsageSessions() {
+function dashboardUsageSessions(whereClause = "true", params: unknown[] = []) {
   return pool.query(
-    usageSessionsSql("true", [], "limit 500")
+    usageSessionsSql(whereClause, params, "limit 500")
   );
 }
 
@@ -1503,10 +1570,6 @@ app.post("/auth/sso/callback", async (req, res, next) => {
         JSON.stringify({ ssoProfile: profile.raw })
       ]
     );
-    if (!isDashboardAccessRole(userResult.rows[0].role)) {
-      return res.status(403).json({ success: false, message: "Dashboard access has not been assigned for this user." });
-    }
-
     const sessionToken = `ols_${crypto.randomBytes(32).toString("base64url")}`;
     const expiresAt = new Date(Date.now() + Number(process.env.OPENLEASH_DASHBOARD_SESSION_DAYS ?? 14) * 86400000);
     await pool.query(
@@ -1622,11 +1685,25 @@ app.get("/auth/session", async (req, res, next) => {
   try {
     const session = await getDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ authenticated: false });
+    const desktop = await pool.query(
+      `select id, hostname, platform, os_release, enrolled_at, last_seen_at
+       from computers
+       where user_id = $1
+         and enrolled_at is not null
+         and last_seen_at > now() - interval '90 days'
+       order by last_seen_at desc
+       limit 1`,
+      [session.user.id]
+    );
     res.json({
       authenticated: true,
       user: session.user,
       organization: session.organization,
-      account: session.account
+      account: session.account,
+      desktop: {
+        connected: Boolean(desktop.rows[0]),
+        computer: desktop.rows[0] ?? null
+      }
     });
   } catch (error) {
     next(error);
@@ -1802,11 +1879,7 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
       });
     }
 
-    const exchangeRedirectUri = providerType === "azure_ad"
-      ? process.env.OPENLEASH_MICROSOFT_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/microsoft/callback`
-      : providerType === "github"
-        ? githubRedirectUriForRequest(req)
-        : process.env.OPENLEASH_GOOGLE_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/google/callback`;
+    const exchangeRedirectUri = publicCloudAuthRedirectUri(req, providerType, redirectUri);
     const state = encodeMobileAuthState({
       nonce: crypto.randomBytes(18).toString("base64url"),
       finalRedirectUri: redirectUri,
@@ -2082,7 +2155,7 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
        returning id, hostname, platform, os_release, enrolled_at, last_seen_at`,
       [session.user.id, hostname, platform, osRelease]
     );
-    await upsertDesktopAgentInventory(computer.rows[0].id, agents);
+    await upsertDesktopAgentInventory(computer.rows[0].id, agents, clientVersion);
     res.status(201).json({
       token: agentToken,
       user: user.rows[0],
@@ -2116,24 +2189,65 @@ app.post("/v1/desktop/agents", async (req, res, next) => {
        returning id, hostname, platform, os_release, enrolled_at, last_seen_at`,
       [session.user.id, hostname, platform, osRelease]
     );
-    await upsertDesktopAgentInventory(computer.rows[0].id, agents);
+    const clientVersion = typeof req.body?.clientVersion === "string" ? req.body.clientVersion : null;
+    await upsertDesktopAgentInventory(computer.rows[0].id, agents, clientVersion);
     res.json({ ok: true, computer: computer.rows[0], agents });
   } catch (error) {
     next(error);
   }
 });
 
-async function upsertDesktopAgentInventory(computerId: string, agents: ReturnType<typeof normalizeEnrollmentAgents>) {
+app.post("/v1/agents/:kind/monitoring", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const kind = normalizeAgentKindForSettings(req.params.kind);
+    if (!kind) return res.status(400).json({ error: "agent kind is required" });
+    const monitored = Boolean(req.body?.monitored);
+    await pool.query(
+      `insert into agent_monitoring_settings (user_id, organization_id, kind, monitored, updated_at)
+       values ($1, $2, $3, $4, now())
+       on conflict (user_id, kind) do update set
+         organization_id = excluded.organization_id,
+         monitored = excluded.monitored,
+         updated_at = now()`,
+      [session.user.id, session.organization.id, kind, monitored]
+    );
+    res.json({ kind, monitored });
+  } catch (error) {
+    next(error);
+  }
+});
+
+async function upsertDesktopAgentInventory(computerId: string, agents: ReturnType<typeof normalizeEnrollmentAgents>, clientVersion?: string | null) {
   for (const agent of agents) {
     await pool.query(
-      `insert into agent_runtimes (computer_id, kind, display_name, executable_path, last_seen_at)
-       values ($1, $2, $3, $4, now())
+      `insert into agent_runtimes (computer_id, kind, display_name, executable_path, version, installed, protected, detail, last_seen_at)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, now())
        on conflict (computer_id, kind, executable_path_key) do update set
          display_name = excluded.display_name,
+         version = coalesce($5, agent_runtimes.version),
+         installed = excluded.installed,
+         protected = excluded.protected,
+         detail = excluded.detail,
          last_seen_at = now()`,
-      [computerId, agent.kind, agent.displayName, agent.executablePath]
+      [computerId, agent.kind, agent.displayName, agent.executablePath, clientVersion, agent.installed, agent.protected, agent.detail || null]
     );
   }
+}
+
+function normalizeAgentKindForSettings(value: unknown) {
+  const text = String(value ?? "").trim().toLowerCase().replace(/_/g, "-");
+  if (!text) return "";
+  if (text.includes("claude")) return "claude-code";
+  if (text.includes("copilot")) return "github-copilot";
+  if (text.includes("gemini")) return "gemini";
+  if (text.includes("opencode")) return "opencode";
+  if (text.includes("codex") || text.includes("openai")) return "codex";
+  if (text.includes("cline")) return "cline";
+  if (text.includes("cursor")) return "cursor";
+  if (text.includes("windsurf")) return "windsurf";
+  return text;
 }
 
 function normalizeEnrollmentAgents(value: unknown) {
@@ -2150,7 +2264,16 @@ function normalizeEnrollmentAgents(value: unknown) {
     const executablePath = typeof item === "object" && item && typeof (item as { executablePath?: unknown }).executablePath === "string"
       ? (item as { executablePath: string }).executablePath.trim()
       : "";
-    return [{ kind: cleanKind, displayName: displayName || enrollmentAgentDisplayName(cleanKind), executablePath }];
+    const installed = typeof item === "object" && item && typeof (item as { installed?: unknown }).installed === "boolean"
+      ? Boolean((item as { installed: boolean }).installed)
+      : true;
+    const protectedByOpenLeash = typeof item === "object" && item && typeof (item as { protected?: unknown }).protected === "boolean"
+      ? Boolean((item as { protected: boolean }).protected)
+      : false;
+    const detail = typeof item === "object" && item && typeof (item as { detail?: unknown }).detail === "string"
+      ? (item as { detail: string }).detail.trim()
+      : "";
+    return [{ kind: cleanKind, displayName: displayName || enrollmentAgentDisplayName(cleanKind), executablePath, installed, protected: protectedByOpenLeash, detail }];
   });
 }
 
@@ -3442,7 +3565,7 @@ app.post("/v1/plugins/:pluginId/install", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await installMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId, session.source);
+    const result = await installMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId);
     if (!result) return res.status(404).json({ error: "plugin not found or not installable" });
     res.json(result);
   } catch (error) {
@@ -3454,7 +3577,7 @@ app.post("/v1/plugins/:pluginId/uninstall", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await uninstallMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId, session.source);
+    const result = await uninstallMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId);
     if (!result) return res.status(404).json({ error: "plugin not found or mandatory" });
     res.json(result);
   } catch (error) {
@@ -3680,9 +3803,11 @@ async function savePluginSettingsForUser(organizationId: string, userId: string,
   if (!pluginPolicy?.mandatory && !marketplacePolicy.allowUserMarketplaceInstalls) return undefined;
   if (manifest.publisher !== "openleash" && !marketplacePolicy.allowUserCommunityPlugins) return undefined;
   const enabled = pluginPolicy?.mandatory ? true : typeof body.enabled === "boolean" ? body.enabled : true;
-  const config = body.config && typeof body.config === "object" && !Array.isArray(body.config)
-    ? body.config as Record<string, unknown>
-    : {};
+  const config = pluginPolicy?.configLocked
+    ? {}
+    : body.config && typeof body.config === "object" && !Array.isArray(body.config)
+      ? body.config as Record<string, unknown>
+      : {};
   const orderingPriority = Number.isFinite(Number(body.orderingPriority))
     ? Number(body.orderingPriority)
     : organizationSettings.get(manifest.id)?.orderingPriority ?? manifest.ordering?.priority ?? null;
@@ -3831,20 +3956,21 @@ async function manifestForPluginId(pluginId: string): Promise<OpenLeashPluginMan
   return listing;
 }
 
-async function installMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string, source: "client" | "dashboard") {
+async function installMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
   const policy = await readOrganizationMarketplacePolicy(organizationId);
   const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
-  if (source === "client" && !pluginPolicy?.mandatory && !policy.allowUserMarketplaceInstalls) return undefined;
-  if (source === "client" && manifest.publisher !== "openleash" && !policy.allowUserCommunityPlugins) return undefined;
+  if (!pluginPolicy?.mandatory && !policy.allowUserMarketplaceInstalls) return undefined;
+  if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false) return undefined;
+  if (manifest.publisher !== "openleash" && !policy.allowUserCommunityPlugins) return undefined;
   return savePluginSettingsForUser(organizationId, userId, pluginId, { enabled: true, config: manifest.defaultConfig ?? {} });
 }
 
-async function uninstallMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string, source: "client" | "dashboard") {
+async function uninstallMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
   const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
   if (pluginPolicy?.mandatory) return undefined;
-  if (source === "client" && !pluginPolicy?.userInstallAllowed) return undefined;
+  if (!pluginPolicy?.userInstallAllowed) return undefined;
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
   return savePluginSettingsForUser(organizationId, userId, pluginId, { enabled: false, config: manifest.defaultConfig ?? {} });
@@ -3854,8 +3980,8 @@ async function saveOrganizationPluginPolicy(organizationId: string, pluginId: st
   if (!await manifestForPluginId(pluginId)) return undefined;
   const mandatory = Boolean(body.mandatory);
   const defaultEnabled = mandatory || Boolean(body.defaultEnabled);
-  const userInstallAllowed = body.userInstallAllowed !== false;
-  const configLocked = Boolean(body.configLocked);
+  const userInstallAllowed = mandatory ? false : body.userInstallAllowed !== false;
+  const configLocked = mandatory || Boolean(body.configLocked);
   const result = await pool.query(
     `insert into organization_plugin_policy (organization_id, plugin_id, mandatory, default_enabled, user_install_allowed, config_locked, updated_at)
      values ($1, $2, $3, $4, $5, $6, now())
@@ -4038,12 +4164,14 @@ async function pluginSettingsForRuntime(organizationId: string, userId?: string)
 }
 
 async function organizationIdForAdminRequest(req: express.Request) {
+  const session = await getDashboardSession(req.header("authorization") ?? "");
+  if (!session) throw new HttpError(401, "dashboard session required");
+  if (!isDashboardAccessRole(session.user.role)) throw new HttpError(403, "dashboard admin role required");
   const slug = typeof req.query.organizationSlug === "string" ? req.query.organizationSlug : undefined;
-  if (slug) {
-    const organization = await pool.query<{ id: string }>("select id from organizations where slug = $1", [slug]);
-    if (organization.rows[0]?.id) return organization.rows[0].id;
+  if (slug && slug !== session.organization.slug) {
+    throw new HttpError(403, "cannot access another organization");
   }
-  return (await ensureDefaultOrganization()).id;
+  return session.organization.id;
 }
 
 async function recordPromptTransformResult(conversationEventId: string, userId: string, originalPrompt: string, result: PromptPipelineResult) {
@@ -5007,6 +5135,28 @@ function webGithubRedirectUri(req: express.Request) {
   return githubRedirectUriForRequest(req, "web");
 }
 
+function publicCloudAuthRedirectUri(req: express.Request, providerType: "google" | "azure_ad" | "github", finalRedirectUri: string) {
+  const surface = isMainWebAccountCallbackRedirect(finalRedirectUri) ? "web" : "desktop";
+  if (providerType === "azure_ad") {
+    return surface === "web"
+      ? `${publicApiUrl(req)}/v1/auth/microsoft/callback`
+      : process.env.OPENLEASH_MICROSOFT_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/microsoft/callback`;
+  }
+  if (providerType === "github") return githubRedirectUriForRequest(req, surface);
+  return surface === "web"
+    ? `${publicApiUrl(req)}/v1/auth/google/callback`
+    : process.env.OPENLEASH_GOOGLE_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/google/callback`;
+}
+
+function isMainWebAccountCallbackRedirect(redirectUri: string) {
+  try {
+    const url = new URL(redirectUri);
+    return url.pathname === "/account/callback";
+  } catch {
+    return false;
+  }
+}
+
 async function ensureDefaultOrganization() {
   const existing = await pool.query(
     `select * from organizations
@@ -5732,6 +5882,10 @@ async function mobileAgents(organizationId: string, userId: string) {
               ar.kind,
               ar.display_name,
               ar.version,
+              ar.installed,
+              ar.protected,
+              coalesce(ams.monitored, ar.protected) as desired_monitored,
+              ar.detail,
               ar.last_seen_at,
               c.hostname,
               c.platform,
@@ -5751,6 +5905,9 @@ async function mobileAgents(organizationId: string, userId: string) {
        from conversation_events ce
        join agent_runtimes ar on ar.id = ce.agent_runtime_id
        join computers c on c.id = ce.computer_id
+       left join agent_monitoring_settings ams on ams.user_id = c.user_id
+        and ams.organization_id = $1
+        and ams.kind = ar.kind
        left join evaluations ev on ev.conversation_event_id = ce.id
        where ce.event_name <> 'Stop'
          and exists (
@@ -5846,9 +6003,55 @@ async function mobileAgents(organizationId: string, userId: string) {
     [organizationId, userId]
   );
   const sessions = await mobileAgentSessions(organizationId, userId);
+  const seenRuntimeIds = new Set(result.rows.map((agent) => String(agent.agent_runtime_id || agent.id)));
+  const inventory = await pool.query(
+    `select ar.id,
+            ar.id as agent_runtime_id,
+            ar.kind,
+            ar.display_name,
+            ar.version,
+            ar.installed,
+            ar.protected,
+            coalesce(ams.monitored, ar.protected) as desired_monitored,
+            ar.detail,
+            ar.last_seen_at,
+            c.hostname,
+            c.platform,
+            null::text as session_id,
+            null::text as event_name,
+            null::text as tool_name,
+            null::text as project_path,
+            null::text as prompt,
+            null::jsonb as payload,
+            null::timestamptz as activity_at,
+            null::uuid as decision_id,
+            null::text as decision,
+            null::text as resolution,
+            null::timestamptz as resolved_at,
+            null::text as decision_summary,
+            null::text as question,
+            '[]'::jsonb as triggered_policies,
+            '[]'::jsonb as recent_activity
+     from agent_runtimes ar
+     join computers c on c.id = ar.computer_id
+     join users u on u.id = c.user_id
+     left join agent_monitoring_settings ams on ams.user_id = c.user_id
+      and ams.organization_id = $1
+      and ams.kind = ar.kind
+     where u.organization_id = $1
+       and c.user_id = $2
+       and ar.last_seen_at > now() - interval '90 days'
+     order by ar.last_seen_at desc
+     limit 50`,
+    [organizationId, userId]
+  );
+  const rows = [
+    ...result.rows,
+    ...inventory.rows.filter((agent) => !seenRuntimeIds.has(String(agent.agent_runtime_id || agent.id)))
+  ];
   return {
     ...result,
-    rows: result.rows.map((agent) => ({
+    rows: rows.map((agent) => ({
       ...agent,
       sessions: sessions.filter((session) => session.agent_runtime_id === agent.agent_runtime_id).slice(0, 8),
       short_summary: summarizeAgentActivity(agent)
@@ -6842,6 +7045,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath) ||
     requestPath === "/v1/desktop/enroll" ||
     requestPath === "/v1/desktop/agents" ||
+    /^\/v1\/agents\/[^/]+\/monitoring$/.test(requestPath) ||
     requestPath === "/v1/plugins" ||
     requestPath === "/v1/plugin-marketplace" ||
     requestPath === "/v1/outcomes" ||
@@ -6870,6 +7074,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && requestPath === "/v1/enroll") return "tenantEnroll";
   if (verb === "POST" && requestPath === "/v1/desktop/enroll") return "desktopEnroll";
   if (verb === "POST" && requestPath === "/v1/desktop/agents") return "desktopEnroll";
+  if (verb === "POST" && /^\/v1\/agents\/[^/]+\/monitoring$/.test(requestPath)) return "mobileState";
   if (verb === "GET" && requestPath === "/v1/plugins") return "tenantPluginsRead";
   if (verb === "GET" && requestPath === "/v1/plugin-marketplace") return "tenantPluginsRead";
   if (verb === "GET" && requestPath === "/v1/outcomes") return "authAccountOutcomes";
@@ -7029,6 +7234,13 @@ function policyInventorySql(organizationWhere = "") {
     ) stats on true
     order by p.category asc, p.created_at asc`;
 }
+
+app.use((error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) return next(error);
+  const statusCode = error instanceof HttpError ? error.statusCode : 500;
+  const message = error instanceof Error ? error.message : "OpenLeash API error";
+  res.status(statusCode).json({ error: message });
+});
 
 export async function prepareOpenLeashApi(options: PrepareOpenLeashApiOptions = {}) {
   const runningApp = options.app ?? app;
