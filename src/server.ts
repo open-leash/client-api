@@ -1505,7 +1505,7 @@ app.post("/auth/sso/authorize", async (req, res, next) => {
     if (!row) return res.status(404).json({ error: "SSO provider not found or disabled" });
     const redirectUri = process.env.OPENLEASH_SSO_REDIRECT_URI ?? `${process.env.OPENLEASH_TENANT_URL ?? "http://localhost:9300"}/auth/sso/callback`;
     const state = crypto.randomBytes(18).toString("base64url");
-    const authorizationUrl = buildAuthorizationUrl(providerType, row.config ?? {}, redirectUri, state);
+    const authorizationUrl = await buildAuthorizationUrl(providerType, row.config ?? {}, redirectUri, state);
     if (!authorizationUrl) return res.status(400).json({ error: `Unsupported provider type: ${providerType}` });
     res.json({ authorizationUrl, state, providerType, organizationId });
   } catch (error) {
@@ -1592,7 +1592,7 @@ app.post("/auth/sso/callback", async (req, res, next) => {
   }
 });
 
-app.get("/auth/google/start", (req, res) => {
+app.get("/auth/google/start", async (req, res) => {
   const finalRedirectUri = String(req.query.redirectUri ?? "").trim();
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
     return res.status(400).json({ error: "redirectUri is required and must be an allowed OpenLeash dashboard URL" });
@@ -1610,7 +1610,7 @@ app.get("/auth/google/start", (req, res) => {
     finalRedirectUri,
     exchangeRedirectUri
   });
-  const authorizationUrl = buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
+  const authorizationUrl = await buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
   if (!authorizationUrl) {
     return res.status(501).json({
       error: "Managed Google login is not configured",
@@ -1620,7 +1620,7 @@ app.get("/auth/google/start", (req, res) => {
   res.redirect(302, authorizationUrl);
 });
 
-app.get("/auth/microsoft/start", (req, res) => {
+app.get("/auth/microsoft/start", async (req, res) => {
   const finalRedirectUri = String(req.query.redirectUri ?? "").trim();
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
     return res.status(400).json({ error: "redirectUri is required and must be an allowed OpenLeash dashboard URL" });
@@ -1638,7 +1638,7 @@ app.get("/auth/microsoft/start", (req, res) => {
     finalRedirectUri,
     exchangeRedirectUri
   });
-  const authorizationUrl = buildAuthorizationUrl("azure_ad", cloudMicrosoftConfig(), exchangeRedirectUri, state);
+  const authorizationUrl = await buildAuthorizationUrl("azure_ad", cloudMicrosoftConfig(), exchangeRedirectUri, state);
   if (!authorizationUrl) {
     return res.status(501).json({
       error: "Managed Microsoft 365 login is not configured",
@@ -1817,7 +1817,7 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
       const provider = await configuredSsoProvider(organization.id, providerType);
       if (!provider) return res.status(404).json({ error: "Identity provider is not configured for this organization" });
       const state = crypto.randomBytes(18).toString("base64url");
-      const authorizationUrl = buildAuthorizationUrl(provider.providerType, provider.config, redirectUri, state);
+      const authorizationUrl = await buildAuthorizationUrl(provider.providerType, provider.config, redirectUri, state);
       if (!authorizationUrl) return res.status(400).json({ error: `Identity provider ${provider.providerType} is missing OAuth configuration` });
       return res.json({ authorizationUrl, state, providerType: provider.providerType, organizationId: organization.id });
     }
@@ -1850,10 +1850,10 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
       exchangeRedirectUri
     });
     const authorizationUrl = providerType === "azure_ad"
-      ? buildAuthorizationUrl("azure_ad", cloudMicrosoftConfig(), exchangeRedirectUri, state)
+      ? await buildAuthorizationUrl("azure_ad", cloudMicrosoftConfig(), exchangeRedirectUri, state)
       : providerType === "github"
-        ? buildAuthorizationUrl("github", cloudGithubConfig(exchangeRedirectUri), exchangeRedirectUri, state)
-        : buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
+        ? await buildAuthorizationUrl("github", cloudGithubConfig(exchangeRedirectUri), exchangeRedirectUri, state)
+        : await buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
     if (!authorizationUrl) {
       return res.status(501).json({
         error: providerType === "azure_ad"
@@ -5577,6 +5577,7 @@ function ssoProviderType(provider: string) {
   if (normalized === "okta") return "okta";
   if (normalized === "google") return "google_workspace";
   if (normalized === "ping") return "ping";
+  if (normalized === "oidc" || normalized === "openidconnect" || normalized === "openid_connect" || normalized === "generic_oidc") return "oidc";
   if (normalized === "activedirectory") return "active_directory";
   return normalized;
 }
@@ -5643,7 +5644,7 @@ function isLocalhostRedirectUri(redirectUri?: string) {
   }
 }
 
-function buildMobileGoogleAuthorizationUrl(redirectUri: string, state: string) {
+async function buildMobileGoogleAuthorizationUrl(redirectUri: string, state: string) {
   return buildAuthorizationUrl("google_workspace", mobileGoogleConfig(), redirectUri, state);
 }
 
@@ -5712,7 +5713,7 @@ async function mobileProvidersForOrganization(organizationId: string, organizati
   return result.rows.map((row) => ({
     id: row.id,
     type: ssoProviderType(row.provider),
-    label: row.provider === "AzureAD" ? "Microsoft Entra ID" : row.provider === "Google" ? "Google Workspace" : row.provider,
+    label: ssoProviderLabel(row.provider),
     organizationId,
     organizationSlug
   }));
@@ -6470,18 +6471,24 @@ async function mobilePushDevicesForUser(userId: string) {
 
 function ssoProviderFromIdp(row: { id: string; provider: string; enabled: boolean; config: Record<string, unknown> }, organizationId: string) {
   const providerType = ssoProviderType(row.provider);
-  const label = row.provider === "AzureAD" ? "Microsoft Entra ID" : row.provider === "Google" ? "Google Workspace" : row.provider;
   return {
     id: row.id,
     organizationId,
     providerType,
-    providerName: label,
+    providerName: ssoProviderLabel(row.provider),
     enabled: row.enabled,
     isPrimary: true
   };
 }
 
-function buildAuthorizationUrl(providerType: string, config: Record<string, unknown>, redirectUri: string, state: string) {
+function ssoProviderLabel(provider: string) {
+  if (provider === "AzureAD") return "Microsoft Entra ID";
+  if (provider === "Google") return "Google Workspace";
+  if (provider === "OIDC") return "Generic OIDC";
+  return provider;
+}
+
+async function buildAuthorizationUrl(providerType: string, config: Record<string, unknown>, redirectUri: string, state: string) {
   const clientId = String(config.ClientId ?? config.clientId ?? "");
   const scope = encodeURIComponent(providerType === "github" ? "read:user user:email" : "openid profile email");
   if (providerType === "github") {
@@ -6502,11 +6509,16 @@ function buildAuthorizationUrl(providerType: string, config: Record<string, unkn
     if (!clientId) return "";
     return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scope}&state=${encodeURIComponent(state)}&access_type=offline&prompt=select_account`;
   }
+  if (providerType === "oidc") {
+    const authorizationEndpoint = await oidcEndpoint(config, "authorization_endpoint");
+    if (!authorizationEndpoint || !clientId) return "";
+    return `${authorizationEndpoint}?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scope}&state=${encodeURIComponent(state)}`;
+  }
   return "";
 }
 
 async function exchangeAuthorizationCode(providerType: string, config: Record<string, unknown>, code: string, redirectUri: string) {
-  const tokenEndpoint = oauthTokenEndpoint(providerType, config);
+  const tokenEndpoint = await oauthTokenEndpoint(providerType, config);
   const clientId = String(config.ClientId ?? config.clientId ?? "");
   const clientSecret = String(config.ClientSecret ?? config.clientSecret ?? "");
   if (!tokenEndpoint || !clientId) throw new Error(`SSO token exchange is not configured for ${providerType}`);
@@ -6540,7 +6552,7 @@ async function exchangeAuthorizationCode(providerType: string, config: Record<st
 
 async function fetchSsoProfile(providerType: string, config: Record<string, unknown>, tokenSet: { access_token?: string; id_token?: string }) {
   if (providerType === "github") return fetchGithubProfile(tokenSet);
-  const userinfoEndpoint = oauthUserinfoEndpoint(providerType, config);
+  const userinfoEndpoint = await oauthUserinfoEndpoint(providerType, config);
   let raw: Record<string, unknown> = {};
   if (userinfoEndpoint && tokenSet.access_token) {
     const response = await fetch(userinfoEndpoint, { headers: { authorization: `Bearer ${tokenSet.access_token}`, accept: "application/json" } });
@@ -6597,7 +6609,7 @@ function splitProfileName(name: string) {
   return { givenName: parts[0], familyName: parts.slice(1).join(" ") };
 }
 
-function oauthTokenEndpoint(providerType: string, config: Record<string, unknown>) {
+async function oauthTokenEndpoint(providerType: string, config: Record<string, unknown>) {
   if (providerType === "okta") {
     const domain = String(config.Domain ?? config.domain ?? "").replace(/\/+$/, "");
     return domain ? `${domain}/oauth2/v1/token` : "";
@@ -6608,17 +6620,54 @@ function oauthTokenEndpoint(providerType: string, config: Record<string, unknown
   }
   if (providerType === "google_workspace") return "https://oauth2.googleapis.com/token";
   if (providerType === "github") return "https://github.com/login/oauth/access_token";
+  if (providerType === "oidc") return oidcEndpoint(config, "token_endpoint");
   return "";
 }
 
-function oauthUserinfoEndpoint(providerType: string, config: Record<string, unknown>) {
+async function oauthUserinfoEndpoint(providerType: string, config: Record<string, unknown>) {
   if (providerType === "okta") {
     const domain = String(config.Domain ?? config.domain ?? "").replace(/\/+$/, "");
     return domain ? `${domain}/oauth2/v1/userinfo` : "";
   }
   if (providerType === "azure_ad") return "https://graph.microsoft.com/oidc/userinfo";
   if (providerType === "google_workspace") return "https://openidconnect.googleapis.com/v1/userinfo";
+  if (providerType === "oidc") return oidcEndpoint(config, "userinfo_endpoint");
   return "";
+}
+
+async function oidcEndpoint(config: Record<string, unknown>, key: "authorization_endpoint" | "token_endpoint" | "userinfo_endpoint") {
+  const explicit = String(
+    config[key] ??
+    config[camelCaseOidcKey(key)] ??
+    config[pascalCaseOidcKey(key)] ??
+    ""
+  ).trim();
+  if (explicit) return explicit;
+  const discovery = await oidcDiscovery(config);
+  return typeof discovery[key] === "string" ? discovery[key] : "";
+}
+
+const oidcDiscoveryCache = new Map<string, { expiresAt: number; data: Record<string, unknown> }>();
+
+async function oidcDiscovery(config: Record<string, unknown>) {
+  const issuer = String(config.IssuerUrl ?? config.issuerUrl ?? config.issuer ?? "").replace(/\/+$/, "");
+  if (!issuer) return {};
+  const cached = oidcDiscoveryCache.get(issuer);
+  if (cached && cached.expiresAt > Date.now()) return cached.data;
+  const response = await fetch(`${issuer}/.well-known/openid-configuration`, { headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error("OIDC discovery failed. Check the issuer URL and network access from the API.");
+  const data = await response.json() as Record<string, unknown>;
+  oidcDiscoveryCache.set(issuer, { expiresAt: Date.now() + 10 * 60_000, data });
+  return data;
+}
+
+function camelCaseOidcKey(value: string) {
+  return value.replace(/_([a-z])/g, (_match, char: string) => char.toUpperCase());
+}
+
+function pascalCaseOidcKey(value: string) {
+  const camel = camelCaseOidcKey(value);
+  return `${camel[0]?.toUpperCase() ?? ""}${camel.slice(1)}`;
 }
 
 function clientAssertion(providerType: string, config: Record<string, unknown>, audience: string) {
@@ -6882,6 +6931,7 @@ function normalizeIdpProvider(provider: unknown) {
   const value = String(provider ?? "").toLowerCase().replace(/[\s_-]+/g, "");
   const providers = [
     { keys: ["azure", "azuread", "entra", "entraid", "microsoftentra"], idpType: "AzureAD", label: "Microsoft Entra ID" },
+    { keys: ["oidc", "openid", "openidconnect", "genericopenid", "genericoidc"], idpType: "OIDC", label: "Generic OIDC" },
     { keys: ["okta"], idpType: "Okta", label: "Okta" },
     { keys: ["ping", "pingone"], idpType: "Ping", label: "Ping Identity" },
     { keys: ["google", "googleworkspace", "workspace"], idpType: "Google", label: "Google Workspace" },
@@ -6896,6 +6946,15 @@ function providerCredentials(provider: ReturnType<typeof normalizeIdpProvider>, 
   switch (provider.idpType) {
     case "AzureAD":
       return { TenantId: value("tenantId") || value("TenantId"), ClientId: value("clientId") || value("ClientId"), ClientSecret: value("clientSecret") || value("ClientSecret") };
+    case "OIDC":
+      return {
+        IssuerUrl: value("issuerUrl") || value("issuer") || value("IssuerUrl"),
+        ClientId: value("clientId") || value("ClientId"),
+        ClientSecret: value("clientSecret") || value("ClientSecret"),
+        AuthorizationEndpoint: value("authorizationEndpoint") || value("AuthorizationEndpoint"),
+        TokenEndpoint: value("tokenEndpoint") || value("TokenEndpoint"),
+        UserinfoEndpoint: value("userinfoEndpoint") || value("UserinfoEndpoint")
+      };
     case "Okta":
       return { Domain: value("domain") || value("Domain"), ClientId: value("clientId") || value("oktaClientId") || value("ClientId"), PrivateKey: value("privateKey") || value("oktaPrivateKey") || value("PrivateKey") || value("apiToken") || value("ApiToken") };
     case "Ping":
