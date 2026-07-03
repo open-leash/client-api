@@ -1538,55 +1538,14 @@ app.post("/auth/sso/callback", async (req, res, next) => {
     const profile = await fetchSsoProfile(providerType, row.config ?? {}, tokenSet);
     if (!profile.email) return res.status(400).json({ success: false, message: "Identity provider did not return an email address" });
 
-    const displayName = profile.name || profile.email.split("@")[0] || "OpenLeash user";
-    const userResult = await pool.query<{
-      id: string;
-      email: string;
-      display_name: string;
-      role: string;
-      first_name: string | null;
-      last_name: string | null;
-      department: string | null;
-      title: string | null;
-    }>(
-      `insert into users (organization_id, email, display_name, role, first_name, last_name, idp_user_id, idp_provider, status, last_login_at, metadata)
-       values ($1, $2, $3, 'engineer', $4, $5, $6, $7, 'active', now(), $8)
-       on conflict (email) do update set
-         organization_id = excluded.organization_id,
-         display_name = excluded.display_name,
-         first_name = excluded.first_name,
-         last_name = excluded.last_name,
-         idp_user_id = excluded.idp_user_id,
-         idp_provider = excluded.idp_provider,
-         status = 'active',
-         last_login_at = now(),
-         metadata = excluded.metadata
-       returning id, email, display_name, role, first_name, last_name, department, title`,
-      [
-        organizationId,
-       profile.email.toLowerCase(),
-        displayName,
-        profile.givenName,
-        profile.familyName,
-        profile.subject,
-        providerType,
-        JSON.stringify({ ssoProfile: profile.raw })
-      ]
-    );
-    const sessionToken = `ols_${crypto.randomBytes(32).toString("base64url")}`;
-    const expiresAt = new Date(Date.now() + Number(process.env.OPENLEASH_DASHBOARD_SESSION_DAYS ?? 14) * 86400000);
-    await pool.query(
-      `insert into dashboard_sessions (organization_id, user_id, token_hash, provider, expires_at)
-       values ($1, $2, $3, $4, $5)`,
-      [organizationId, userResult.rows[0].id, hashToken(sessionToken), providerType, expiresAt.toISOString()]
-    );
-
-    res.json({
-      success: true,
-      tokens: { accessToken: sessionToken, expiresAt: expiresAt.toISOString() },
-      user: userResult.rows[0],
-      organization
+    const response = await createDashboardSessionFromProfile({
+      organizationId,
+      providerType,
+      profile,
+      provisionUser: false,
+      accountAudience: "organization"
     });
+    res.json(response);
   } catch (error) {
     next(error);
   }
@@ -1802,7 +1761,7 @@ app.get("/v1/mobile/bootstrap", async (req, res, next) => {
 app.post("/v1/mobile/auth/start", async (req, res, next) => {
   try {
     const body = req.body as MobileAuthStartRequest;
-    const audience = body.audience === "organization" ? "organization" : "individual";
+    const audience = body.audience === "organization" || body.organizationId || body.organizationSlug ? "organization" : "individual";
     const redirectUri = String(body.redirectUri ?? "").trim();
     if (!redirectUri) return res.status(400).json({ error: "redirectUri is required" });
 
@@ -1951,8 +1910,8 @@ app.get("/v1/auth/github/callback", (req, res) => {
 app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
   try {
     const body = req.body as MobileAuthExchangeRequest;
-    const audience = body.audience === "organization" ? "organization" : "individual";
-    const providerType = normalizePublicCloudAuthProvider(String(body.providerType ?? "google").trim());
+    const audience = body.audience === "organization" || body.organizationId || body.organizationSlug ? "organization" : "individual";
+    const requestedProviderType = String(body.providerType ?? "").trim();
     const redirectUri = String(body.redirectUri ?? "").trim();
     const authorizationCode = String(body.authorizationCode ?? "").trim();
     const idToken = String(body.idToken ?? "").trim();
@@ -1965,14 +1924,15 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
         : undefined;
     if ((body.organizationId || body.organizationSlug) && !requestedOrganization) return res.status(404).json({ success: false, message: "Organization not found" });
 
+    const developmentProviderType = normalizePublicCloudAuthProvider(requestedProviderType || "google");
     const isDevelopmentMobileAuthCode = authorizationCode === "development" || authorizationCode === "dev-auth";
-    if ((providerType === "google" || providerType === "azure_ad" || providerType === "github") && (!authorizationCode || isDevelopmentMobileAuthCode) && !idToken && process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
+    if ((developmentProviderType === "google" || developmentProviderType === "azure_ad" || developmentProviderType === "github") && (!authorizationCode || isDevelopmentMobileAuthCode) && !idToken && process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
       const profile = {
         subject: "mobile-dev-user",
-        email: process.env.OPENLEASH_MOBILE_DEV_EMAIL ?? "mobile.user@openleash.com",
-        name: process.env.OPENLEASH_MOBILE_DEV_NAME ?? "Mobile User",
-        givenName: "Mobile",
-        familyName: "User",
+        email: process.env.OPENLEASH_MOBILE_DEV_EMAIL ?? (requestedOrganization ? "ava.chen@example.com" : "mobile.user@openleash.com"),
+        name: process.env.OPENLEASH_MOBILE_DEV_NAME ?? (requestedOrganization ? "Ava Chen" : "Mobile User"),
+        givenName: requestedOrganization ? "Ava" : "Mobile",
+        familyName: requestedOrganization ? "Chen" : "User",
         raw: { development: true }
       };
       if (
@@ -1982,7 +1942,7 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       ) {
         return res.status(400).json({ success: false, message: "Use your company Google Workspace or Microsoft 365 account, not a personal email address." });
       }
-      const provisionUser = body.provisionUser !== false;
+      const provisionUser = requestedOrganization ? false : body.provisionUser !== false;
       const organization: ManagedOrganization = requestedOrganization
         ? { ...requestedOrganization }
         : provisionUser
@@ -1990,7 +1950,7 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
           : await resolveExistingMobileOrganizationForProfile(profile);
       const response = await createDashboardSessionFromProfile({
         organizationId: organization.id,
-        providerType,
+        providerType: developmentProviderType,
         profile,
         role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer",
         provisionUser,
@@ -1999,6 +1959,14 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       return res.json({ ...response, authMode: "development" });
     }
 
+    const organizationSsoProvider = requestedOrganization
+      ? await configuredSsoProvider(requestedOrganization.id, requestedProviderType ? ssoProviderType(requestedProviderType) : undefined)
+      : undefined;
+    if (requestedOrganization && !organizationSsoProvider) {
+      return res.status(404).json({ success: false, message: "Identity provider is not configured for this organization" });
+    }
+
+    const providerType = organizationSsoProvider?.providerType ?? normalizePublicCloudAuthProvider(requestedProviderType || "google");
     const organizationForProvider = requestedOrganization ?? (providerType === "google" || providerType === "azure_ad" || providerType === "github" ? undefined : await ensureManagedMobileOrganization());
     const publicProviderType = providerType === "google" ? "google_workspace" : providerType;
     const publicProviderConfig = providerType === "google"
@@ -2008,15 +1976,17 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
         : providerType === "github"
           ? cloudGithubConfig(redirectUri)
         : {};
-    const tokenSet = providerType === "google" || providerType === "github" || (providerType === "azure_ad" && !requestedOrganization)
+    const tokenSet = organizationSsoProvider
+      ? await exchangeAuthorizationCode(organizationSsoProvider.providerType, organizationSsoProvider.config, authorizationCode, redirectUri)
+      : providerType === "google" || providerType === "github" || (providerType === "azure_ad" && !requestedOrganization)
       ? await exchangeAuthorizationCode(publicProviderType, publicProviderConfig, authorizationCode, redirectUri)
-      : body.organizationId || body.organizationSlug
-        ? await exchangeOrganizationAuthorizationCode(organizationForProvider!.id, providerType, authorizationCode, redirectUri)
-        : await exchangeAuthorizationCode(providerType, {}, authorizationCode, redirectUri);
+      : await exchangeAuthorizationCode(providerType, {}, authorizationCode, redirectUri);
 
-    const profile = providerType === "google" || providerType === "github" || (providerType === "azure_ad" && !requestedOrganization)
+    const profile = organizationSsoProvider
+      ? await fetchSsoProfile(organizationSsoProvider.providerType, organizationSsoProvider.config, idToken ? { id_token: idToken } : tokenSet)
+      : providerType === "google" || providerType === "github" || (providerType === "azure_ad" && !requestedOrganization)
       ? await fetchSsoProfile(publicProviderType, publicProviderConfig, idToken ? { id_token: idToken } : tokenSet)
-      : await fetchSsoProfile(providerType, (await configuredSsoProvider(organizationForProvider!.id, providerType))?.config ?? {}, idToken ? { id_token: idToken } : tokenSet);
+      : await fetchSsoProfile(providerType, {}, idToken ? { id_token: idToken } : tokenSet);
     if (!profile.email) return res.status(400).json({ success: false, message: "Identity provider did not return an email address" });
     if (
       audience === "organization" &&
@@ -2026,7 +1996,7 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       return res.status(400).json({ success: false, message: "Use your company Google Workspace or Microsoft 365 account, not a personal email address." });
     }
 
-    const provisionUser = body.provisionUser !== false;
+    const provisionUser = requestedOrganization ? false : body.provisionUser !== false;
     const organization: ManagedOrganization = requestedOrganization
       ? { ...requestedOrganization }
       : provisionUser
@@ -5058,7 +5028,8 @@ app.put("/admin/policies/:id", async (req, res, next) => {
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);
   const status = typeof (err as { status?: unknown })?.status === "number" ? (err as { status: number }).status : 500;
-  res.status(status).json({ error: err instanceof Error ? err.message : "unknown error" });
+  const message = err instanceof Error ? err.message : "unknown error";
+  res.status(status).json({ success: false, error: message, message });
 });
 
 function summarizeAgentActivity(agent: {
@@ -5799,16 +5770,27 @@ async function createDashboardSessionFromProfile({
         display_name: string;
         role: string;
       }>(
-        `select id, email, display_name, role
-         from users
+        `update users
+         set last_login_at = now(),
+             idp_user_id = coalesce(users.idp_user_id, $3),
+             idp_provider = coalesce(users.idp_provider, $4),
+             metadata = coalesce(users.metadata, '{}'::jsonb) || $5::jsonb
          where organization_id = $1
            and lower(email) = lower($2)
            and status = 'active'
-         limit 1`,
-        [organizationId, userEmail]
+         returning id, email, display_name, role`,
+        [
+          organizationId,
+          userEmail,
+          profile.subject || null,
+          providerType || null,
+          JSON.stringify({ ssoProfile: profile.raw, accountAudience })
+        ]
       );
   if (!userResult.rows[0] && !provisionUser) {
-    const error = new Error("No OpenLeash account exists for this email. Create your account from desktop or the web, then sign in on mobile.");
+    const error = new Error(accountAudience === "organization"
+      ? "This account is not provisioned for this OpenLeash organization. Ask an admin to sync or invite your identity first."
+      : "No OpenLeash account exists for this email. Create your account from desktop or the web, then sign in on mobile.");
     (error as Error & { status?: number }).status = 403;
     throw error;
   }
@@ -7423,7 +7405,7 @@ app.use((error: unknown, _req: express.Request, res: express.Response, next: exp
   if (res.headersSent) return next(error);
   const statusCode = error instanceof HttpError ? error.statusCode : 500;
   const message = error instanceof Error ? error.message : "OpenLeash API error";
-  res.status(statusCode).json({ error: message });
+  res.status(statusCode).json({ success: false, error: message, message });
 });
 
 export async function prepareOpenLeashApi(options: PrepareOpenLeashApiOptions = {}) {
