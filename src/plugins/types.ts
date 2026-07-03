@@ -30,7 +30,7 @@ export type PromptPipelineInput = {
   userId?: string;
   computerId?: string;
   runtimeId?: string;
-  apiKey?: string;
+  tenantModelKey?: TenantModelKey;
   plugins?: Map<string, PluginSettingState>;
 };
 

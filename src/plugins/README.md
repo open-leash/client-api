@@ -7,11 +7,14 @@ OpenLeash features run as ordered pipeline plugins. A plugin is a folder with:
 
 Current first-party plugins:
 
-- `prompt-compression` runs on `prompt.beforeSubmit` and may modify the prompt.
-- `dlp` runs after compression on `prompt.beforeSubmit` and may mask or block.
+- `token-saver` runs on `prompt.beforeSubmit` and may modify the prompt.
+- `data-leakage-prevention` runs after token-saver on `prompt.beforeSubmit` and may mask or block.
+- `sensitive-access` reviews env-file reads, secret exposure, env dumps, and exfiltration attempts.
+- `blast-radius` guards destructive tools and broad data operations.
 - `rules-enforcer` evaluates active policies for prompts, agent responses, and tool actions.
 - `mcp-scanner` observes MCP tool calls and records inventory.
 - `skill-scanner` observes skill changes and can create a review finding.
+- `siem-exporter` sends events and plugin logs to configured SIEM targets.
 
 ## Ordering
 
@@ -30,18 +33,18 @@ ordering: {
 For prompts, ordering matters:
 
 ```text
-prompt-compression -> dlp
+token-saver -> data-leakage-prevention -> sensitive-access
 ```
 
-Compression runs first so DLP checks the final prompt that would be sent to the model.
+Token-saver runs first so data-leakage-prevention checks the final prompt that would be sent to the model.
 
 For tool events:
 
 ```text
-rules-enforcer -> mcp-scanner
+sensitive-access -> blast-radius -> rules-enforcer -> mcp-scanner
 ```
 
-The security evaluator decides whether human review is needed. The MCP scanner then records inventory with the resulting decision context.
+Sensitive-access and blast-radius catch specialized risks before rules-enforcer applies general policy. The MCP scanner then records inventory with the resulting decision context.
 
 ## Permissions
 
@@ -66,11 +69,23 @@ The current runtime uses these for catalog and UI clarity. External plugin isola
 
 Plugins must not import OpenLeash internals such as evaluators, database modules, prompt transforms, server handlers, or model-key readers. Those files are implementation details and can change without becoming a plugin breaking change.
 
-Instead, plugin code receives stable capabilities from the runtime:
+Instead, plugin code receives stable primitive capabilities from the runtime. Product logic belongs in the plugin. For example, a DLP plugin owns its detectors, prompt, schema, masking rules, and parser; OpenLeash only supplies the configured evaluator LLM and trusted sinks.
 
 ```ts
-await capabilities.prompt.compress({ prompt, level: "standard" });
-await capabilities.dlp.inspect({ prompt, action: "mask", categories: ["pii"] });
+const review = await capabilities.llm.evaluateJson({
+  purpose: "acme-risk-review",
+  system: "You are the Acme risk plugin. Return JSON only.",
+  prompt: JSON.stringify({ text: event.prompt, rules: config.rules }),
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["risk", "reason"],
+    properties: {
+      risk: { type: "string", enum: ["low", "medium", "high"] },
+      reason: { type: "string" }
+    }
+  }
+});
 const instructionFiles = await capabilities.context.instructions.list({ scope: "project" });
 await capabilities.storage.set({ key: "last-risk", value: { score: 82 } });
 const recent = await capabilities.storage.list({ keyPrefix: "sessions/", limit: 25 });
@@ -79,7 +94,7 @@ await capabilities.signals.emit({ kind: "security.finding", severity: "high", ti
 await capabilities.usage.record({ kind: "llm.tokens", inputTokens: 8000, savedTokens: 2400 });
 ```
 
-If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, plugin/system logs, SIEM export, security signals, usage records, or other approved services.
+If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. Do not add broad domain capabilities such as `dlp.inspect`, `prompt.compress`, or `security.evaluatePolicies`; those make plugins thin wrappers over OpenLeash internals and prevent third-party developers from shipping real plugin logic. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, plugin/system logs, SIEM export, security signals, usage records, or other approved services.
 
 ## Host Context And Instruction Files
 
@@ -113,7 +128,7 @@ Start from the manifest, then write one handler per event. Keep the plugin under
 1. Pick the narrowest event.
 2. Declare only the permissions the plugin needs.
 3. Expose settings through `configSchema` and `defaultConfig`.
-4. Use runtime capabilities for model calls, prompt transforms, DLP, storage, notifications, and audit.
+4. Put plugin-specific model prompts, parsing, prompt transforms, DLP rules, and decisions in the plugin; use runtime capabilities only for primitive services such as LLM calls, storage, notifications, signals, usage, and audit logs.
 5. Return a typed plugin run/result. Do not write directly to OpenLeash product tables.
 
 Minimal manifest:
@@ -181,7 +196,7 @@ export async function run(input, capabilities) {
 }
 ```
 
-External examples live in `open-leash/plugins`. The first-party plugin repos mirror the preinstalled plugins and are intended to be readable reference implementations.
+External examples should live in their own public GitHub repositories. First-party plugins use one repository per plugin under the `open-leash/plugin-*` pattern and mirror the preinstalled plugins as readable reference implementations.
 
 ## Plugin Storage
 
@@ -284,7 +299,7 @@ agent_runtime_id
 
 Plugin code can describe what happened, but it cannot choose a different organization, impersonate another user, or write raw dashboard rows. Identity sync stays in OpenLeash core: users and groups come from the configured IdP, endpoint enrollment links devices to users, and the runtime attaches that context to plugin records.
 
-Example security evaluator output:
+Example rules-enforcer output:
 
 ```ts
 await capabilities.signals.emit({
@@ -309,7 +324,7 @@ The dashboard reads OpenLeash-owned `plugin_signals`, not plugin databases. It c
 - contained or blocked outcomes;
 - cross-plugin correlations by shared user, conversation, device, or explicit `correlationKeys`.
 
-This means a better third-party security evaluator can coexist with the first-party evaluator. Each plugin emits its own signals, OpenLeash stores them with trusted context, and the dashboard correlates normalized data without letting plugins access each other's tables.
+This means a better third-party rules plugin can coexist with the first-party rules-enforcer. Each plugin emits its own signals, OpenLeash stores them with trusted context, and the dashboard correlates normalized data without letting plugins access each other's tables.
 
 ## Usage And Cost Reporting
 

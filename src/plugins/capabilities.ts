@@ -2,6 +2,8 @@ import type {
   EvaluationRequest,
   PluginCapabilities,
   PluginInstructionFile,
+  PluginLlmJsonRequest,
+  PluginLlmJsonResult,
   PluginLogRecord,
   PluginLogLevel,
   PluginLogRequest,
@@ -15,13 +17,15 @@ import type {
   PluginUsageRecord,
   PluginUsageRecordRequest
 } from "@openleash/shared";
+import OpenAI from "openai";
 import { pool } from "../db.js";
-import { evaluatePolicies } from "../evaluator.js";
 import type { TenantModelKey } from "../model-keys.js";
-import { compressPromptCapability, inspectDlpCapability } from "../prompt-transforms.js";
+
+const pluginLlmModel = process.env.OPENLEASH_PLUGIN_LLM_MODEL ?? process.env.OPENAI_EVAL_MODEL ?? "gpt-5.2";
+const pluginAnthropicModel = process.env.ANTHROPIC_EVAL_MODEL ?? "claude-3-5-sonnet-latest";
+const pluginDeepseekModel = process.env.DEEPSEEK_EVAL_MODEL ?? "deepseek-chat";
 
 export function createPluginCapabilities({
-  apiKey,
   tenantModelKey,
   organizationId,
   pluginId,
@@ -31,7 +35,6 @@ export function createPluginCapabilities({
   computerId,
   runtimeId
 }: {
-  apiKey?: string;
   tenantModelKey?: TenantModelKey;
   organizationId?: string;
   pluginId: string;
@@ -121,19 +124,9 @@ export function createPluginCapabilities({
         }
       }
     },
-    prompt: {
-      compress(request) {
-        return compressPromptCapability({ ...request, apiKey });
-      }
-    },
-    dlp: {
-      inspect(request) {
-        return inspectDlpCapability({ ...request, apiKey });
-      }
-    },
-    security: {
-      evaluatePolicies({ request, policies }) {
-        return evaluatePolicies(request, policies, tenantModelKey);
+    llm: {
+      evaluateJson(request) {
+        return evaluatePluginJson(request, tenantModelKey);
       }
     },
     storage,
@@ -224,6 +217,115 @@ function normalizeInstructionFile(value: unknown): PluginInstructionFile | undef
     content,
     parsedLines
   };
+}
+
+async function evaluatePluginJson<T = unknown>(
+  request: PluginLlmJsonRequest,
+  tenantModelKey?: TenantModelKey
+): Promise<PluginLlmJsonResult<T> | undefined> {
+  const config = pluginModelConfig(tenantModelKey);
+  if (!config) return undefined;
+  const prompt = String(request.prompt ?? "").trim();
+  if (!prompt) return undefined;
+
+  if (config.provider === "anthropic") {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": config.apiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: pluginAnthropicModel,
+        max_tokens: normalizedMaxTokens(request.maxOutputTokens),
+        system: request.system ?? "Return only valid JSON.",
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+    if (!response.ok) throw new Error(`Plugin LLM evaluation failed (${response.status})`);
+    const body = await response.json() as { content?: Array<{ type?: string; text?: string }> };
+    const text = body.content?.find((item) => item.type === "text" && item.text)?.text ?? "";
+    return {
+      json: JSON.parse(text) as T,
+      model: pluginAnthropicModel,
+      provider: config.provider,
+      source: config.source
+    };
+  }
+
+  const client = new OpenAI({
+    apiKey: config.apiKey,
+    ...(config.baseURL ? { baseURL: config.baseURL } : {})
+  });
+  if (config.provider === "deepseek") {
+    const response = await client.chat.completions.create({
+      model: pluginDeepseekModel,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: request.system ?? "Return only valid JSON." },
+        { role: "user", content: prompt }
+      ],
+      temperature: normalizedTemperature(request.temperature)
+    });
+    return {
+      json: JSON.parse(response.choices[0]?.message?.content ?? "{}") as T,
+      model: pluginDeepseekModel,
+      provider: config.provider,
+      source: config.source
+    };
+  }
+
+  const response = await client.responses.create({
+    model: pluginLlmModel,
+    input: [
+      { role: "system", content: request.system ?? "Return only valid JSON." },
+      { role: "user", content: prompt }
+    ],
+    text: request.schema
+      ? {
+          format: {
+            type: "json_schema",
+            name: "openleash_plugin_json",
+            strict: true,
+            schema: request.schema
+          }
+        }
+      : { format: { type: "json_object" } },
+    temperature: normalizedTemperature(request.temperature),
+    max_output_tokens: normalizedMaxTokens(request.maxOutputTokens)
+  });
+  return {
+    json: JSON.parse(response.output_text) as T,
+    model: pluginLlmModel,
+    provider: config.provider,
+    source: config.source
+  };
+}
+
+function pluginModelConfig(tenantModelKey?: TenantModelKey):
+  | { provider: "openai" | "anthropic" | "deepseek"; apiKey: string; baseURL?: string; source: "tenant-byok" | "openleash-managed" }
+  | undefined {
+  if (tenantModelKey?.apiKey) {
+    if (tenantModelKey.provider === "deepseek") {
+      return { provider: "deepseek", apiKey: tenantModelKey.apiKey, baseURL: "https://api.deepseek.com", source: "tenant-byok" };
+    }
+    return { provider: tenantModelKey.provider, apiKey: tenantModelKey.apiKey, source: "tenant-byok" };
+  }
+  const apiKey = process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY;
+  return apiKey ? { provider: "openai", apiKey, source: "openleash-managed" } : undefined;
+}
+
+function normalizedMaxTokens(value: unknown) {
+  const parsed = Number(value ?? 500);
+  if (!Number.isFinite(parsed)) return 500;
+  return Math.max(80, Math.min(2000, Math.round(parsed)));
+}
+
+function normalizedTemperature(value: unknown) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(1, parsed));
 }
 
 async function emitPluginLog({

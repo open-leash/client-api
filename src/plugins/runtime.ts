@@ -1,9 +1,11 @@
 import { createPluginCapabilities } from "./capabilities.js";
+import { runBlastRadius } from "./blast-radius/index.js";
 import { runDlp } from "./dlp/index.js";
 import { runMcpScanner } from "./mcp-scanner/index.js";
 import { runPromptCompression } from "./prompt-compression/index.js";
 import { pluginsForEvent, orderPlugins } from "./registry.js";
 import { runSecurityEvaluator } from "./security-evaluator/index.js";
+import { runSensitiveAccess } from "./sensitive-access/index.js";
 import { eventForHookEvent } from "./events.js";
 import {
   type EvaluationPipelineInput,
@@ -22,7 +24,7 @@ export async function runPromptPipeline(input: PromptPipelineInput): Promise<Pro
 
   for (const plugin of enabledPluginsForEvent("prompt.beforeSubmit", input.plugins)) {
     const capabilities = createPluginCapabilities({
-      apiKey: input.apiKey,
+      tenantModelKey: input.tenantModelKey,
       organizationId: input.organizationId,
       pluginId: plugin.id,
       request: input.request,
@@ -99,9 +101,23 @@ export async function runEvaluationPipeline(input: EvaluationPipelineInput): Pro
       computerId: input.computerId,
       runtimeId: input.runtimeId
     });
+    if (plugin.id === "openleash.sensitive-access") {
+      const sensitive = await runSensitiveAccess(input, capabilities);
+      results = [...results, ...sensitive.results];
+      runs.push(sensitive.run);
+      continue;
+    }
+
+    if (plugin.id === "openleash.blast-radius") {
+      const blastRadius = await runBlastRadius(input, capabilities);
+      results = [...results, ...blastRadius.results];
+      runs.push(blastRadius.run);
+      continue;
+    }
+
     if (plugin.id === "openleash.rules-enforcer") {
       const security = await runSecurityEvaluator(input, capabilities);
-      results = security.results;
+      results = [...results, ...security.results];
       model = security.model;
       runs.push(security.run);
       continue;

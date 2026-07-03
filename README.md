@@ -64,7 +64,7 @@ mobile-client
 
 Core protections are implemented as pipeline plugins. Each plugin declares a manifest with metadata, events, permissions, settings, effects, and ordering. Implementations use stable runtime capabilities instead of importing OpenLeash internals.
 
-Developer docs live in [`src/plugins/README.md`](src/plugins/README.md). Public examples live in [`open-leash/plugins`](https://github.com/open-leash/plugins).
+Developer docs live in [`src/plugins/README.md`](src/plugins/README.md). First-party plugin examples live as one public repository per plugin under the `open-leash/plugin-*` pattern.
 
 ---
 

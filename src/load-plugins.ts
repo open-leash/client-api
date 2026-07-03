@@ -12,7 +12,7 @@ type PluginImport = {
 };
 
 const args = parseArgs(process.argv.slice(2));
-const pluginsDir = path.resolve(String(args.dir ?? args.pluginsDir ?? path.join(process.cwd(), "..", "..", "plugin-repos", "plugins", "plugins")));
+const pluginsDir = path.resolve(String(args.dir ?? args.pluginsDir ?? path.join(process.cwd(), "..", "..", "plugin-repos")));
 const reviewStatus = String(args.reviewStatus ?? "approved") as PluginMarketplaceListing["reviewStatus"];
 const sourceOverride = args.source ? String(args.source) as PluginMarketplaceListing["source"] : undefined;
 const dryRun = Boolean(args.dryRun);
@@ -75,7 +75,7 @@ function toMarketplaceListing(item: PluginImport, index: number): PluginMarketpl
     longDescription,
     heroTagline: shortDescription,
     packageUrl: item.packageName ? `npm:${item.packageName}` : `openleash:plugin/${slug}`,
-    repositoryUrl: "https://github.com/open-leash/openleash",
+    repositoryUrl: manifest.repositoryUrl,
     documentationUrl: `https://docs.openleash.com/plugins/${slug}`,
     iconText: iconText(slug),
     visualPng: `/plugins/${slug}.png`,

@@ -1,11 +1,4 @@
 import OpenAI from "openai";
-import type {
-  PluginDlpInspectionRequest,
-  PluginDlpInspectionResult,
-  PluginPromptCompressionRequest,
-  PluginPromptCompressionResult
-} from "@openleash/shared";
-
 export type CompressionLevel = "light" | "standard" | "maximum";
 export type DlpCategory = "pii" | "phi" | "tokens" | "keys" | "credentials";
 export type DlpAction = "block" | "mask";
@@ -145,62 +138,6 @@ export async function transformPrompt({
     model: [...models].join(", ") || "none",
     compression,
     dlp
-  };
-}
-
-export async function compressPromptCapability({
-  prompt,
-  level,
-  conciseResponse,
-  model,
-  apiKey
-}: PluginPromptCompressionRequest & { apiKey?: string }): Promise<PluginPromptCompressionResult> {
-  const config = normalizePromptTransformConfig({
-    compression: {
-      enabled: true,
-      level,
-      conciseResponse: Boolean(conciseResponse),
-      model
-    }
-  });
-  const compressed = await compressPrompt({ prompt, config, apiKey });
-  let finalPrompt = compressed.text;
-  if (config.compression.conciseResponse) {
-    finalPrompt = `${finalPrompt.trim()}\n\nRespond concisely. Be short, direct, and avoid filler.`;
-  }
-  return {
-    prompt: finalPrompt,
-    model: compressed.model,
-    originalLength: prompt.length,
-    compressedLength: finalPrompt.length,
-    ratio: prompt.length > 0 ? finalPrompt.length / prompt.length : 1
-  };
-}
-
-export async function inspectDlpCapability({
-  prompt,
-  action,
-  categories,
-  model,
-  apiKey
-}: PluginDlpInspectionRequest & { apiKey?: string }): Promise<PluginDlpInspectionResult> {
-  const config = normalizePromptTransformConfig({
-    dlp: {
-      enabled: true,
-      action,
-      categories,
-      model
-    }
-  });
-  const checked = await checkDlp({ prompt, config, apiKey });
-  return {
-    prompt: checked.text,
-    blocked: checked.blocked,
-    matched: checked.matched,
-    masked: checked.masked,
-    model: checked.model,
-    categories: checked.categories,
-    findings: checked.findings
   };
 }
 

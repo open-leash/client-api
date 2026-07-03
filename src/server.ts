@@ -132,7 +132,10 @@ app.use((req, res, next) => {
   res.setHeader(OPENLEASH_API_FUNCTION_HEADER, functionName);
   res.setHeader(OPENLEASH_API_VERSION_HEADER, OPENLEASH_API_CONTRACTS[functionName]);
   const requestedVersion = req.header(OPENLEASH_API_VERSION_HEADER);
-  if (requestedVersion && requestedVersion !== OPENLEASH_API_CONTRACTS[functionName]) {
+  const acceptsLegacyLocalHookVersion = functionName === "tenantHookEvaluate" &&
+    /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(req.path) &&
+    requestedVersion === OPENLEASH_API_CONTRACTS.localHookEvaluate;
+  if (requestedVersion && requestedVersion !== OPENLEASH_API_CONTRACTS[functionName] && !acceptsLegacyLocalHookVersion) {
     return res.status(426).json({
       error: "unsupported OpenLeash API contract version",
       function: functionName,
@@ -2914,6 +2917,77 @@ app.get("/admin/logs", async (req, res, next) => {
   }
 });
 
+app.get("/admin/debug", async (req, res, next) => {
+  try {
+    const organization = await resolveOnboardingOrganization(req);
+    const filters: string[] = ["ple.organization_id = $1"];
+    const values: unknown[] = [organization.id];
+    const add = (value: unknown) => {
+      values.push(value);
+      return `$${values.length}`;
+    };
+    if (typeof req.query.q === "string" && req.query.q.trim()) {
+      const param = add(`%${req.query.q.trim()}%`);
+      filters.push(`(
+        ple.message ilike ${param}
+        or ple.code ilike ${param}
+        or ple.category ilike ${param}
+        or ple.plugin_id ilike ${param}
+        or ple.data::text ilike ${param}
+        or ple.scope::text ilike ${param}
+        or ce.session_id ilike ${param}
+        or ce.project_path ilike ${param}
+        or ce.event_name ilike ${param}
+        or ce.tool_name ilike ${param}
+        or ar.display_name ilike ${param}
+        or ar.kind ilike ${param}
+        or c.hostname ilike ${param}
+        or u.display_name ilike ${param}
+        or u.email ilike ${param}
+      )`);
+    }
+    if (typeof req.query.plugin === "string" && req.query.plugin.trim()) {
+      const param = add(`%${req.query.plugin.trim()}%`);
+      filters.push(`ple.plugin_id ilike ${param}`);
+    }
+    if (typeof req.query.level === "string" && ["debug", "info", "warn", "error", "security"].includes(req.query.level)) {
+      filters.push(`ple.level = ${add(req.query.level)}`);
+    }
+    if (typeof req.query.category === "string" && req.query.category.trim()) {
+      filters.push(`ple.category = ${add(req.query.category.trim())}`);
+    }
+    if (typeof req.query.session === "string" && req.query.session.trim()) {
+      filters.push(`coalesce(ce.session_id, ple.scope->>'sessionId') = ${add(req.query.session.trim())}`);
+    }
+    if (typeof req.query.dateFrom === "string" && req.query.dateFrom.trim()) {
+      filters.push(`ple.created_at >= ${add(req.query.dateFrom)}`);
+    }
+    if (typeof req.query.dateTo === "string" && req.query.dateTo.trim()) {
+      filters.push(`ple.created_at <= ${add(req.query.dateTo)}`);
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 150), 1), 500);
+    const result = await pool.query(
+      `select ple.id, ple.plugin_id, ple.level, ple.category, ple.code, ple.message, ple.scope, ple.data, ple.created_at,
+              ce.id as conversation_event_id, ce.session_id, ce.event_name, ce.tool_name, ce.project_path, ce.occurred_at,
+              ar.display_name as agent_name, ar.kind as agent_kind, ar.version as agent_version,
+              c.hostname, c.platform,
+              u.id as user_id, u.display_name as user_name, u.email as user_email
+       from plugin_log_events ple
+       left join conversation_events ce on ce.id = ple.conversation_event_id
+       left join agent_runtimes ar on ar.id = coalesce(ple.agent_runtime_id, ce.agent_runtime_id)
+       left join computers c on c.id = coalesce(ple.computer_id, ce.computer_id)
+       left join users u on u.id = coalesce(ple.user_id, ce.user_id)
+       where ${filters.join(" and ")}
+       order by ple.created_at desc
+       limit ${add(limit)}`,
+      values
+    );
+    res.json({ debugLogs: result.rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/admin/logs/:id", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
@@ -3601,31 +3675,92 @@ type ApiUser = { id: string; email?: string; display_name?: string; organization
 async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventName, request: EvaluationRequest, user: ApiUser) {
   const intentKey = triggerIntentKey(request);
   const { conversationEventId, computerId, runtimeId, organizationId } = await recordConversationEvent(request, user, intentKey);
-  const config = await readPromptTransformConfig(organizationId, user.id);
-  if (!request.event.prompt || !promptTransformsEnabled(config)) {
-    return nativeHookDecision(agent, eventName, { decision: "allow", decisionId: "", summary: "OpenLeash logged this prompt intent.", results: [] });
+  const [config, runtimePlugins, tenantModelKey, policies] = await Promise.all([
+    readPromptTransformConfig(organizationId, user.id),
+    pluginSettingsForRuntime(organizationId, user.id),
+    tenantModelKeyForEvaluation(organizationId),
+    pool.query<Policy>(
+      `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
+       from policies where enabled = true order by created_at asc`
+    )
+  ]);
+  const promptResult = request.event.prompt && promptTransformsEnabled(config)
+    ? await runPromptPipeline({
+        request,
+        config,
+        organizationId,
+        conversationEventId,
+        userId: user.id,
+        computerId,
+        runtimeId,
+        tenantModelKey,
+        plugins: runtimePlugins
+      })
+    : undefined;
+  if (promptResult) {
+    await recordPromptTransformResult(conversationEventId, user.id, request.event.prompt ?? "", promptResult);
   }
-  const result = await runPromptPipeline({
+
+  const runtimePolicies = policiesForRulesEnforcer(runtimePlugins, policies.rows);
+  const pipeline = await runEvaluationPipeline({
     request,
-    config,
     organizationId,
     conversationEventId,
     userId: user.id,
     computerId,
     runtimeId,
-    apiKey: process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY,
-    plugins: await pluginSettingsForRuntime(organizationId, user.id)
+    policies: runtimePolicies,
+    tenantModelKey,
+    plugins: runtimePlugins
   });
-  await recordPromptTransformResult(conversationEventId, user.id, request.event.prompt, result);
-  if (result.blocked) {
-    return nativeHookDecision(agent, eventName, {
-      decision: "deny",
-      decisionId: "",
-      summary: result.summary,
-      results: []
+  const results = applyConfiguredRuleActions(pipeline.results, runtimePolicies);
+  const decision = promptResult?.blocked || results.some((result) => result.status === "failed")
+    ? "deny"
+    : results.some((result) => result.status === "needs_question")
+      ? "ask"
+      : "allow";
+  const blockingResult = results.find((result) => result.status === "failed");
+  const reviewResult = results.find((result) => result.status === "needs_question");
+  const summary = promptResult?.blocked
+    ? promptResult.summary
+    : blockingResult?.explanation ?? reviewResult?.explanation ?? promptResult?.summary ?? "OpenLeash logged this prompt intent.";
+  const question = reviewResult?.question ?? (decision === "ask" ? `${request.agent.displayName} wants to proceed with sensitive access. Allow it once?` : undefined);
+  const evaluation = await pool.query<{ id: string }>(
+    `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
+     values ($1, $2, $3, $4, $5, $6) returning id`,
+    [conversationEventId, user.id, decision, summary, question ?? null, pipeline.model]
+  );
+  for (const result of results) {
+    const policyId = resolvePolicyResultPolicyId(result, policies.rows);
+    await pool.query(
+      `insert into policy_results
+       (evaluation_id, policy_id, policy_name, status, severity, explanation, evidence, question)
+       values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        evaluation.rows[0].id,
+        policyId,
+        result.policyName,
+        result.status,
+        result.severity,
+        result.explanation,
+        JSON.stringify(result.evidence ?? []),
+        result.question ?? null
+      ]
+    );
+  }
+  await recordPluginRuns(conversationEventId, [...(promptResult?.runs ?? []), ...pipeline.runs]);
+  if (decision === "ask") {
+    const purposeSummary = await summarizeActionPurpose(request, tenantModelKey);
+    notifyMobileApprovers(user.id, evaluation.rows[0].id, summary, question, purposeSummary).catch((error) => {
+      console.warn("mobile approval notification failed", error);
     });
   }
-  return promptTransformHookDecision(agent, eventName, result.finalPrompt, result.summary);
+  const response: EvaluationResponse = { decision, decisionId: evaluation.rows[0].id, summary, question, results };
+  const resolvedDecision = await waitForHookDecision(user, response);
+  if (resolvedDecision.decision === "allow" && promptResult && promptResult.finalPrompt !== request.event.prompt) {
+    return promptTransformHookDecision(agent, eventName, promptResult.finalPrompt, promptResult.summary);
+  }
+  return nativeHookDecision(agent, eventName, resolvedDecision);
 }
 
 async function readPromptTransformConfig(organizationId: string, userId?: string): Promise<PromptTransformConfig> {
@@ -3749,6 +3884,7 @@ function pluginCatalogItem(
   return {
     ...manifest,
     slug: manifest.slug ?? marketplace?.slug,
+    repositoryUrl: manifest.repositoryUrl ?? marketplace?.repositoryUrl,
     marketplace,
     settings: {
       enabled,
@@ -4058,8 +4194,14 @@ async function createPluginSubmission(organizationId: string, submittedBy: strin
   const slug = slugify(String(body.slug ?? body.name ?? ""));
   const pluginId = String(body.pluginId ?? `community.${slug}`).trim();
   const developerName = String(body.developerName ?? "").trim();
+  const repositoryUrl = normalizeGithubRepositoryUrl(body.repositoryUrl);
   if (!slug || !developerName) {
     const error = new Error("Plugin slug and developer name are required.");
+    (error as Error & { status?: number }).status = 400;
+    throw error;
+  }
+  if (!repositoryUrl) {
+    const error = new Error("A public GitHub repository URL is required.");
     (error as Error & { status?: number }).status = 400;
     throw error;
   }
@@ -4068,7 +4210,7 @@ async function createPluginSubmission(organizationId: string, submittedBy: strin
     `insert into plugin_submissions (organization_id, submitted_by, plugin_id, slug, name, developer_name, package_url, repository_url, manifest)
      values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
      returning id, plugin_id as "pluginId", slug, name, developer_name as "developerName", status, created_at as "createdAt"`,
-    [organizationId, submittedBy, pluginId, slug, slug, developerName, optionalString(body.packageUrl), optionalString(body.repositoryUrl), JSON.stringify(manifest)]
+    [organizationId, submittedBy, pluginId, slug, slug, developerName, optionalString(body.packageUrl), repositoryUrl, JSON.stringify(manifest)]
   );
   return { submission: result.rows[0] };
 }
@@ -4174,7 +4316,7 @@ async function organizationIdForAdminRequest(req: express.Request) {
   return session.organization.id;
 }
 
-async function recordPromptTransformResult(conversationEventId: string, userId: string, originalPrompt: string, result: PromptPipelineResult) {
+async function recordPromptTransformResult(conversationEventId: string, _userId: string, originalPrompt: string, result: PromptPipelineResult) {
   await pool.query(
     `update conversation_events
      set payload = payload || $2::jsonb
@@ -4189,11 +4331,6 @@ async function recordPromptTransformResult(conversationEventId: string, userId: 
       },
       openleashPluginRuns: result.runs
     })]
-  );
-  await pool.query(
-    `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
-     values ($1, $2, $3, $4, null, $5)`,
-    [conversationEventId, userId, result.blocked ? "deny" : "allow", result.summary, result.model]
   );
 }
 
@@ -4552,7 +4689,8 @@ function applyConfiguredRuleActions(results: PolicyDecision[], policies: Policy[
   const policyActions = new Map(policies.map((policy) => [policy.id, policy.enforcementAction ?? "ask"]));
   return results.map((result) => {
     if (result.status === "passed") return result;
-    const action = policyActions.get(result.policyId) ?? policyActions.get(policyIdForPolicyName(result.policyName, policies)) ?? "ask";
+    const action = policyActions.get(result.policyId) ?? policyActions.get(policyIdForPolicyName(result.policyName, policies));
+    if (!action) return result;
     if (action === "block") {
       return {
         ...result,
@@ -5395,6 +5533,23 @@ function slugify(value: string) {
 function optionalString(value: unknown) {
   const text = typeof value === "string" ? value.trim() : "";
   return text || undefined;
+}
+
+function normalizeGithubRepositoryUrl(value: unknown) {
+  const raw = optionalString(value);
+  if (!raw) return undefined;
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || host !== "github.com") return undefined;
+    const parts = url.pathname.replace(/^\/+|\/+$/g, "").split("/");
+    const owner = parts[0];
+    const repo = parts[1]?.replace(/\.git$/i, "");
+    if (!owner || !repo || owner.startsWith(".") || repo.startsWith(".")) return undefined;
+    return `https://github.com/${owner}/${repo}`;
+  } catch {
+    return undefined;
+  }
 }
 
 function arrayValue(value: unknown): string[] {
@@ -6998,6 +7153,7 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath.startsWith("/admin/plugins/") ||
     requestPath === "/admin/plugin-marketplace" ||
     requestPath === "/admin/plugin-marketplace/policy" ||
+    requestPath === "/admin/debug" ||
     requestPath === "/admin/logs" ||
     /^\/admin\/logs\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/triggers" ||
@@ -7102,6 +7258,7 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/policy$/.test(requestPath)) return "adminPluginsWrite";
   if (verb === "POST" && requestPath === "/admin/plugin-marketplace/policy") return "adminPluginsWrite";
   if (verb === "GET" && requestPath === "/admin/logs") return "adminLogs";
+  if (verb === "GET" && requestPath === "/admin/debug") return "adminLogs";
   if (verb === "GET" && /^\/admin\/logs\/[^/]+$/.test(requestPath)) return "adminLogDetail";
   if (verb === "GET" && requestPath === "/admin/triggers") return "adminTriggers";
   if (verb === "GET" && /^\/admin\/triggers\/[^/]+$/.test(requestPath)) return "adminTriggerDetail";
