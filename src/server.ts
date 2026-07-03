@@ -1713,45 +1713,6 @@ app.get("/auth/session", async (req, res, next) => {
   }
 });
 
-app.post("/auth/account/package", async (req, res, next) => {
-  try {
-    const session = await getDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const packageId = normalizeCloudPackage(req.body?.packageId ?? req.body?.plan);
-    if (!packageId) return res.status(400).json({ error: "packageId must be personal-byok, personal-managed, work-byok, or work-managed" });
-    const audience = packageId.startsWith("work-") ? "organization" : "individual";
-    await pool.query(
-      `update users
-       set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
-         'accountAudience', $2::text,
-         'cloudPackage', $3::text,
-         'cloudPackageSelectedAt', now()
-       )
-       where id = $1`,
-      [session.user.id, audience, packageId]
-    );
-    await pool.query(
-      `update organizations
-       set infrastructure_config = coalesce(infrastructure_config, '{}'::jsonb) || jsonb_build_object(
-         'cloudPackage', $2::text,
-         'cloudPackageSelectedAt', now()
-       ),
-       updated_at = now()
-       where id = $1`,
-      [session.organization.id, packageId]
-    );
-    res.json({
-      ok: true,
-      account: {
-        audience,
-        packageId
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
 app.get("/auth/account/outcomes", async (req, res, next) => {
   try {
     const session = await getDashboardSession(req.header("authorization") ?? "");
@@ -1818,7 +1779,7 @@ app.get("/v1/mobile/bootstrap", async (req, res, next) => {
     }
     const providers = organization
       ? await mobileProvidersForOrganization(organization.id, organization.slug)
-      : mobileCloudProviders();
+      : defaultMobileProviders();
     res.json({
       mode: clientModeFromEnvironment(),
       apiUrl: publicApiUrl(req),
@@ -1864,7 +1825,7 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
     const requestedProviderType = String(body.providerType ?? "google").trim();
     const providerType = normalizePublicCloudAuthProvider(requestedProviderType);
     if (providerType === "github" && audience !== "individual") {
-      return res.status(400).json({ error: "GitHub sign-in is available for individual OpenLeash Cloud accounts only." });
+      return res.status(400).json({ error: "GitHub sign-in is available for individual accounts only." });
     }
     if (process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
       const authorizationUrl = new URL("/v1/mobile/dev-auth/callback", publicApiUrl(req));
@@ -2530,7 +2491,7 @@ app.post("/admin/onboarding/company", async (req, res, next) => {
     if ((existingSlug.rowCount ?? 0) > 0) {
       return res.status(409).json({ success: false, error: "That dashboard URL is already taken." });
     }
-    const packageId = normalizeCloudPackage(req.body.packageId ?? req.body.plan) ?? "work-managed";
+    const packageId = normalizeAccountPackage(req.body.packageId ?? req.body.plan) ?? "work-managed";
     const result = await pool.query(
       `update organizations
        set name = $2,
@@ -2538,8 +2499,8 @@ app.post("/admin/onboarding/company", async (req, res, next) => {
            region = $4,
            logo_url = $5,
            infrastructure_config = coalesce(infrastructure_config, '{}'::jsonb) || jsonb_build_object(
-             'cloudPackage', $6::text,
-             'cloudPackageSelectedAt', now()
+             'accountPackage', $6::text,
+             'accountPackageSelectedAt', now()
            ),
            current_step = greatest(current_step, 2),
            updated_at = now()
@@ -5574,7 +5535,7 @@ function normalizeDeploymentMode(value: unknown) {
   return normalized.includes("private") || normalized.includes("onprem") || normalized.includes("on-prem") ? "private" : "cloud";
 }
 
-function normalizeCloudPackage(value: unknown) {
+function normalizeAccountPackage(value: unknown) {
   const normalized = String(value ?? "").trim();
   if (["personal-byok", "personal-managed", "work-byok", "work-managed"].includes(normalized)) {
     return normalized as "personal-byok" | "personal-managed" | "work-byok" | "work-managed";
@@ -5720,20 +5681,20 @@ function isAllowedAuthRedirectUri(redirectUri: string) {
   }
 }
 
-function mobileCloudProviders() {
+function defaultMobileProviders() {
   return [
     {
-      id: "openleash-cloud-google",
+      id: "openleash-google",
       type: "google",
       label: "Google Workspace"
     },
     {
-      id: "openleash-cloud-github",
+      id: "openleash-github",
       type: "github",
       label: "GitHub"
     },
     {
-      id: "openleash-cloud-microsoft",
+      id: "openleash-microsoft",
       type: "azure_ad",
       label: "Microsoft 365"
     }
@@ -6713,7 +6674,7 @@ async function getDashboardSession(authHeader: string) {
   const userMetadata = row.user_metadata ?? {};
   const organizationConfig = row.infrastructure_config ?? {};
   const accountAudience = userMetadata.accountAudience === "individual" ? "individual" : "organization";
-  const packageId = normalizeCloudPackage(userMetadata.cloudPackage ?? organizationConfig.cloudPackage);
+  const packageId = normalizeAccountPackage(userMetadata.accountPackage ?? organizationConfig.accountPackage);
   return {
     user: { id: row.user_id, email: row.email, display_name: row.display_name, role: row.role },
     organization: { id: row.organization_id, name: row.organization_name, slug: row.organization_slug, region: row.region },
@@ -7183,7 +7144,6 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     /^\/admin\/policies\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/prompt-transforms" ||
     requestPath === "/auth/session" ||
-    requestPath === "/auth/account/package" ||
     requestPath === "/auth/account/outcomes" ||
     requestPath === "/auth/logout" ||
     requestPath === "/auth/sso/authorize" ||
@@ -7289,7 +7249,6 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsRead";
   if (verb === "POST" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsWrite";
   if (verb === "GET" && requestPath === "/auth/session") return "authSession";
-  if (verb === "POST" && requestPath === "/auth/account/package") return "authSession";
   if (verb === "GET" && requestPath === "/auth/account/outcomes") return "authAccountOutcomes";
   if (verb === "POST" && requestPath === "/auth/logout") return "authLogout";
   if (verb === "POST" && requestPath === "/auth/sso/authorize") return "authSsoAuthorize";
