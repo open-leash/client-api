@@ -5,6 +5,7 @@ export const sensitiveAccessManifest: OpenLeashPluginManifest = {
   slug: "sensitive-access",
   name: "sensitive-access",
   description: "Catch agents reading secrets, printing env vars, or touching credential files.",
+  repositoryUrl: "https://github.com/open-leash/plugin-sensitive-access",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

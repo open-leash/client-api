@@ -4,6 +4,7 @@ export const promptCompressionManifest: OpenLeashPluginManifest = {
   id: "openleash.prompt-compression",
   name: "token-saver",
   description: "Trim noisy context before every model call.",
+  repositoryUrl: "https://github.com/open-leash/plugin-token-saver",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

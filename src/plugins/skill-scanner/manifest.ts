@@ -4,6 +4,7 @@ export const skillScannerManifest: OpenLeashPluginManifest = {
   id: "openleash.skill-scanner",
   name: "skill-scanner",
   description: "Catch suspicious instructions before they spread.",
+  repositoryUrl: "https://github.com/open-leash/plugin-skill-scanner",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

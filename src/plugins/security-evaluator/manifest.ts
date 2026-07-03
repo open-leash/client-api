@@ -4,6 +4,7 @@ export const securityEvaluatorManifest: OpenLeashPluginManifest = {
   id: "openleash.rules-enforcer",
   name: "rules-enforcer",
   description: "Watch agent conversations and pause when configured rules are violated.",
+  repositoryUrl: "https://github.com/open-leash/plugin-rules-enforcer",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

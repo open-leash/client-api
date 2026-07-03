@@ -75,7 +75,7 @@ function toMarketplaceListing(item: PluginImport, index: number): PluginMarketpl
     longDescription,
     heroTagline: shortDescription,
     packageUrl: item.packageName ? `npm:${item.packageName}` : `openleash:plugin/${slug}`,
-    repositoryUrl: manifest.repositoryUrl,
+    repositoryUrl: manifest.repositoryUrl ?? firstPartyRepositoryUrl(manifest.id, slug),
     documentationUrl: `https://docs.openleash.com/plugins/${slug}`,
     iconText: iconText(slug),
     visualPng: `/plugins/${slug}.png`,
@@ -177,6 +177,13 @@ function slugForPlugin(manifest: OpenLeashPluginManifest, item: PluginImport) {
   if (manifest.id === "openleash.prompt-compression") return "token-saver";
   if (manifest.id === "openleash.dlp") return "data-leakage-prevention";
   return slugify(base);
+}
+
+function firstPartyRepositoryUrl(pluginId: string, slug: string) {
+  if (pluginId === "openleash.prompt-compression") return "https://github.com/open-leash/plugin-token-saver";
+  if (pluginId === "openleash.dlp") return "https://github.com/open-leash/plugin-data-leakage-prevention";
+  if (pluginId.startsWith("openleash.")) return `https://github.com/open-leash/plugin-${slug}`;
+  return undefined;
 }
 
 function descriptionFromReadme(readme?: string) {

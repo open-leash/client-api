@@ -4057,7 +4057,7 @@ function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketpl
     longDescription: String(row.long_description),
     heroTagline: String(row.hero_tagline),
     packageUrl: optionalString(row.package_url),
-    repositoryUrl: optionalString(row.repository_url),
+    repositoryUrl: normalizedPluginRepositoryUrl(String(row.plugin_id), slug, optionalString(row.repository_url)),
     documentationUrl: optionalString(row.documentation_url),
     runtime: String(row.runtime) as PluginMarketplaceListing["runtime"],
     entrypoint: String(row.entrypoint),
@@ -4082,6 +4082,15 @@ function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketpl
     createdAt: optionalString(row.created_at),
     updatedAt: optionalString(row.updated_at)
   };
+}
+
+function normalizedPluginRepositoryUrl(pluginId: string, slug: string, repositoryUrl?: string) {
+  if (pluginId === "openleash.prompt-compression") return "https://github.com/open-leash/plugin-token-saver";
+  if (pluginId === "openleash.dlp") return "https://github.com/open-leash/plugin-data-leakage-prevention";
+  if (pluginId.startsWith("openleash.")) return `https://github.com/open-leash/plugin-${slug}`;
+  if (repositoryUrl === "https://github.com/open-leash/open-leash") return undefined;
+  if (repositoryUrl === "https://github.com/open-leash/plugins") return undefined;
+  return repositoryUrl;
 }
 
 async function manifestForPluginId(pluginId: string): Promise<OpenLeashPluginManifest | undefined> {

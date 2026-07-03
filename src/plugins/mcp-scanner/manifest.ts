@@ -4,6 +4,7 @@ export const mcpScannerManifest: OpenLeashPluginManifest = {
   id: "openleash.mcp-scanner",
   name: "mcp-scanner",
   description: "See every MCP server, tool, and call.",
+  repositoryUrl: "https://github.com/open-leash/plugin-mcp-scanner",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

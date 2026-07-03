@@ -4,6 +4,7 @@ export const dlpManifest: OpenLeashPluginManifest = {
   id: "openleash.dlp",
   name: "data-leakage-prevention",
   description: "Mask secrets before agents send them.",
+  repositoryUrl: "https://github.com/open-leash/plugin-data-leakage-prevention",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",

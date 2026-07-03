@@ -5,6 +5,7 @@ export const blastRadiusManifest: OpenLeashPluginManifest = {
   slug: "blast-radius",
   name: "blast-radius",
   description: "Block destructive tool use before agents damage files, databases, or infrastructure.",
+  repositoryUrl: "https://github.com/open-leash/plugin-blast-radius",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",
