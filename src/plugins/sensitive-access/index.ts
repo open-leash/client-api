@@ -29,7 +29,7 @@ type SensitiveLlmResult = {
 
 const SECRET_FILE_PATTERN = /(^|[\/\s"'`])(\.env(\.[\w-]+)?|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|kubeconfig|credentials|secrets?\.ya?ml|service-account[^\/\s"'`]*\.json|firebase[^\/\s"'`]*\.json)(?=$|[\/\s"'`:;])/i;
 const SENSITIVE_RESOURCE_PHRASE_PATTERN = /\b(?:read|print|show|display|dump|open|inspect|cat|copy|expose)\b[\s\S]{0,80}\b(?:env(?:ironment)?\s+file|dotenv|secret(?:s)?\s+file|credential(?:s)?\s+file|private\s+key|api\s+key|token(?:s)?\s+file)\b|\b(?:env(?:ironment)?\s+file|dotenv|secret(?:s)?\s+file|credential(?:s)?\s+file|private\s+key|api\s+key|token(?:s)?\s+file)\b[\s\S]{0,80}\b(?:read|print|show|display|dump|open|inspect|cat|copy|expose)\b/i;
-const ENV_DUMP_PATTERN = /\b(printenv|env\s*(?:$|[|;&>])|set\s*(?:$|[|;&>])|export\s+-p|Get-ChildItem\s+Env:|gci\s+env:|dir\s+env:|process\.env|os\.environ)\b/i;
+const ENV_DUMP_PATTERN = /\b(?:printenv\b|(?<!\.)env\s*(?:$|[|;&>"'])|set\s*(?:$|[|;&>"'])|export\s+-p\b|Get-ChildItem\s+Env:|gci\s+env:|dir\s+env:|process\.env\b|os\.environ\b)/i;
 const SECRET_VALUE_PATTERN = /\b(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|GOOGLE_APPLICATION_CREDENTIALS|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|NPM_TOKEN|DATABASE_URL|PRIVATE_KEY|KUBECONFIG|SLACK_BOT_TOKEN)\b/i;
 const EXFIL_PATTERN = /\b(curl|wget|nc|netcat|scp|rsync|httpie|Invoke-WebRequest|iwr)\b|https?:\/\/|webhook|pastebin|requestbin|ngrok/i;
 
@@ -43,7 +43,7 @@ export async function runSensitiveAccess(input: EvaluationPipelineInput, capabil
     error: error instanceof Error ? error.message : String(error)
   }));
   if (llm && "decision" in llm) {
-    for (const match of matchesFromLlm(llm.decision, config)) {
+    for (const match of matchesFromLlm(llm.decision, config, text)) {
       if (!matches.some((item) => item.policyId === match.policyId)) matches.push(match);
     }
   }
@@ -159,22 +159,25 @@ async function evaluateSensitiveAccess(context: ReturnType<typeof eventContext>,
   return result ? { decision: normalizeLlmDecision(result.json), model: result.model, provider: result.provider, source: result.source } : undefined;
 }
 
-function matchesFromLlm(result: SensitiveLlmResult, config: ReturnType<typeof pluginConfig>): Match[] {
+function matchesFromLlm(result: SensitiveLlmResult, config: ReturnType<typeof pluginConfig>, text: string): Match[] {
   if (!result.sensitiveResourceAccess && !result.environmentDump && !result.secretExposure && !result.exfiltrationAttempt && !result.shouldAsk && !result.shouldBlock) {
     return [];
   }
-  const action = result.shouldBlock || result.exfiltrationAttempt || result.secretExposure
+  const hasSecretFile = SECRET_FILE_PATTERN.test(text) || SENSITIVE_RESOURCE_PHRASE_PATTERN.test(text);
+  const hasEnvDump = ENV_DUMP_PATTERN.test(text) || SECRET_VALUE_PATTERN.test(text);
+  const hasExternalExfiltration = EXFIL_PATTERN.test(text);
+  const action = result.exfiltrationAttempt && hasExternalExfiltration
     ? config.exfiltrationAction
-    : result.environmentDump
+    : result.environmentDump && hasEnvDump && !hasSecretFile
       ? config.envDumpAction
       : config.secretFileAction;
   return [{
-    policyId: "sensitive-access.llm-review",
+    policyId: hasSecretFile ? "sensitive-access.llm-secret-file-review" : "sensitive-access.llm-review",
     policyName: result.exfiltrationAttempt || result.secretExposure ? "Sensitive data exposure" : "Sensitive access review",
     severity: result.severity,
     explanation: result.reasons.slice(0, 3).join(" ") || "The OpenLeash evaluation model identified sensitive resource access.",
     evidence: result.evidence.slice(0, 4),
-    action: result.shouldBlock ? "block" : action,
+    action,
     source: "llm"
   }];
 }
@@ -210,13 +213,14 @@ function detectSensitiveAccess(text: string, config: ReturnType<typeof pluginCon
     });
   }
   if (/cat\s+[^\n;&|]*(\.env|id_rsa|id_ed25519|credentials|kubeconfig)|grep\s+-R\s+[^\n;&|]*(token|secret|password|api[_-]?key)/i.test(text)) {
+    const exfil = EXFIL_PATTERN.test(text);
     add({
       policyId: "sensitive-access.secret-harvest",
       policyName: "Secret harvesting command",
       severity: "critical",
       explanation: "The agent is using shell patterns commonly used to harvest secrets from local files.",
       evidence: snippets(text, [/cat\s+[^\n;&|]*/i, /grep\s+-R\s+[^\n;&|]*/i]),
-      action: config.exfiltrationAction
+      action: exfil ? config.exfiltrationAction : config.secretFileAction
     });
   }
   return matches;

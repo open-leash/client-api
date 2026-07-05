@@ -180,14 +180,15 @@ function heuristicEvaluation(input: EvaluationPipelineInput): PolicyDecision[] {
       /(curl|wget|upload|pastebin|gist|webhook|scp\s|rsync\s|nc\s|netcat|post .*secret|https?:\/\/(?!localhost|127\.0\.0\.1))/i.test(text);
     const needsQuestion = destructiveHit || externalSharingHit;
     if (credentialHit) {
+      const action = policy.enforcementAction ?? "ask";
       return {
         policyId: policy.id,
         policyName: policy.name,
-        status: policy.enforcementAction === "ask" ? "needs_question" : "failed",
+        status: action === "ask" ? "needs_question" : "failed",
         severity: policy.severity,
         explanation: "The agent event appears to access, display, copy, or send protected credential material.",
         evidence: [evidence],
-        question: policy.enforcementAction === "ask" ? "Approve this access to credential-like material?" : undefined
+        question: action === "ask" ? "Approve this access to credential-like material?" : undefined
       };
     }
     if (needsQuestion) {
