@@ -42,18 +42,45 @@ async function discoverPlugins(dir: string): Promise<PluginImport[]> {
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     const root = path.join(dir, entry.name);
-    const manifestPath = path.join(root, "src", "manifest.ts");
+    const manifestPath = await firstExisting([
+      path.join(root, "src", "manifest.ts"),
+      path.join(root, "manifest.ts")
+    ]);
     if (!await exists(manifestPath)) continue;
-    const imported = await import(pathToFileURL(manifestPath).href) as { manifest?: OpenLeashPluginManifest };
-    if (!imported.manifest?.id) continue;
+    const imported = await import(pathToFileURL(manifestPath).href) as Record<string, unknown>;
+    const manifest = findManifestExport(imported);
+    if (!manifest?.id) continue;
     imports.push({
-      manifest: imported.manifest,
+      manifest,
       root,
       packageName: await readPackageName(root),
       readme: await readOptional(path.join(root, "README.md"))
     });
   }
   return imports.sort((left, right) => left.manifest.id.localeCompare(right.manifest.id));
+}
+
+async function firstExisting(paths: string[]): Promise<string> {
+  for (const candidate of paths) {
+    if (await exists(candidate)) return candidate;
+  }
+  return paths[0] ?? "";
+}
+
+function findManifestExport(imported: Record<string, unknown>): OpenLeashPluginManifest | undefined {
+  const direct = imported.manifest ?? imported.default;
+  if (isManifest(direct)) return direct;
+  return Object.values(imported).find(isManifest);
+}
+
+function isManifest(value: unknown): value is OpenLeashPluginManifest {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    "id" in value &&
+    "name" in value &&
+    "version" in value
+  );
 }
 
 function toMarketplaceListing(item: PluginImport, index: number): PluginMarketplaceListing {
