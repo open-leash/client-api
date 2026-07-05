@@ -7721,6 +7721,13 @@ function apiSurfaceFromEnv(): ApiSurface {
 function surfaceForRequest(method: string, requestPath: string): ApiSurface | undefined {
   const verb = method.toUpperCase();
   if (requestPath === "/health") return "all";
+  if (
+    requestPath === "/auth/session" ||
+    requestPath === "/auth/account/outcomes" ||
+    requestPath === "/auth/logout"
+  ) {
+    return "all";
+  }
 
   if (
     requestPath === "/admin/overview" ||
@@ -7755,9 +7762,6 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/admin/policies" ||
     /^\/admin\/policies\/[^/]+$/.test(requestPath) ||
     requestPath === "/admin/prompt-transforms" ||
-    requestPath === "/auth/session" ||
-    requestPath === "/auth/account/outcomes" ||
-    requestPath === "/auth/logout" ||
     requestPath === "/auth/sso/authorize" ||
     requestPath === "/auth/sso/callback" ||
     requestPath === "/auth/google/start" ||
