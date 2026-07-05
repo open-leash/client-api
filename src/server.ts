@@ -3523,11 +3523,64 @@ app.get("/admin/plugin-marketplace", async (req, res, next) => {
   }
 });
 
+app.get("/admin/plugin-releases", async (req, res, next) => {
+  try {
+    await organizationIdForAdminRequest(req);
+    res.json({ releases: await listPluginReleases(String(req.query.status ?? "")) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/plugin-releases/:id/approve", async (req, res, next) => {
+  try {
+    const reviewer = await adminUserForRequest(req);
+    const result = await approvePluginRelease(req.params.id, reviewer?.id, req.body);
+    if (!result) return res.status(404).json({ error: "plugin release not found" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/plugin-releases/:id/reject", async (req, res, next) => {
+  try {
+    const reviewer = await adminUserForRequest(req);
+    const result = await reviewPluginRelease(req.params.id, "rejected", reviewer?.id, req.body?.reviewerNote);
+    if (!result) return res.status(404).json({ error: "plugin release not found" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/plugin-releases/:id/yank", async (req, res, next) => {
+  try {
+    const reviewer = await adminUserForRequest(req);
+    const result = await reviewPluginRelease(req.params.id, "yanked", reviewer?.id, req.body?.reviewerNote);
+    if (!result) return res.status(404).json({ error: "plugin release not found" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/admin/plugins/:pluginId/settings", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
     const result = await savePluginSettingsForOrganization(organizationId, req.params.pluginId, req.body);
     if (!result) return res.status(404).json({ error: "plugin not found" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/plugins/:pluginId/update", async (req, res, next) => {
+  try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const result = await updateMarketplacePluginForOrganization(organizationId, req.params.pluginId);
+    if (!result) return res.status(404).json({ error: "plugin not found or not installed" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -3578,6 +3631,18 @@ app.post("/v1/plugins/:pluginId/install", async (req, res, next) => {
   }
 });
 
+app.post("/v1/plugins/:pluginId/update", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const result = await updateMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId);
+    if (!result) return res.status(404).json({ error: "plugin not found or not installed" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/v1/plugins/:pluginId/uninstall", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
@@ -3596,6 +3661,17 @@ app.post("/v1/plugin-submissions", async (req, res, next) => {
     if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
     const submission = await createPluginSubmission(session.organization.id, session.user.id, req.body);
     res.status(201).json(submission);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/plugin-releases", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
+    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const release = await createPluginReleaseSubmission(session.organization.id, session.user.id, req.body);
+    res.status(201).json(release);
   } catch (error) {
     next(error);
   }
@@ -3747,6 +3823,8 @@ type PluginSettingRecord = {
   enabled: boolean;
   config: Record<string, unknown>;
   orderingPriority: number | null;
+  installedVersion?: string;
+  updatePolicy?: "manual" | "patch" | "minor" | "locked";
   updatedAt?: string;
 };
 
@@ -3804,6 +3882,8 @@ function pluginCatalogItem(
 ): PluginCatalogItem {
   const enabled = policy?.mandatory ? true : userSettings?.enabled ?? organizationSettings?.enabled ?? policy?.defaultEnabled ?? false;
   const configLocked = Boolean(policy?.configLocked);
+  const availableVersion = marketplace?.version ?? manifest.version;
+  const installedVersion = userSettings?.installedVersion ?? organizationSettings?.installedVersion ?? (enabled ? availableVersion : undefined);
   const effectiveConfig = {
     ...(manifest.defaultConfig ?? {}),
     ...(organizationSettings?.config ?? {}),
@@ -3821,6 +3901,10 @@ function pluginCatalogItem(
       enabled,
       config: effectiveConfig,
       orderingPriority: userSettings?.orderingPriority ?? organizationSettings?.orderingPriority ?? manifest.ordering?.priority ?? null,
+      installedVersion,
+      availableVersion,
+      updateAvailable: Boolean(enabled && installedVersion && installedVersion !== availableVersion),
+      updatePolicy: userSettings?.updatePolicy ?? organizationSettings?.updatePolicy ?? "manual",
       updatedAt: userSettings?.updatedAt ?? organizationSettings?.updatedAt
     },
     organizationPolicy: {
@@ -3843,16 +3927,22 @@ async function savePluginSettingsForOrganization(organizationId: string, pluginI
   const orderingPriority = Number.isFinite(Number(body.orderingPriority))
     ? Number(body.orderingPriority)
     : manifest.ordering?.priority ?? null;
+  const requestedInstalledVersion = optionalString(body.installedVersion);
+  const availableVersion = manifest.version;
+  const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
   const result = await pool.query(
-    `insert into plugin_settings (organization_id, plugin_id, enabled, config, ordering_priority, updated_at)
-     values ($1, $2, $3, $4::jsonb, $5, now())
+    `insert into plugin_settings (organization_id, plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at)
+     values ($1, $2, $3, $4::jsonb, $5, coalesce($6, $8), coalesce($7, 'manual'), now())
      on conflict (organization_id, plugin_id) do update set
        enabled = excluded.enabled,
        config = excluded.config,
        ordering_priority = excluded.ordering_priority,
+       installed_version = coalesce($6, plugin_settings.installed_version, excluded.installed_version),
+       update_policy = coalesce($7, plugin_settings.update_policy, 'manual'),
        updated_at = now()
-     returning plugin_id, enabled, config, ordering_priority as "orderingPriority", updated_at`,
-    [organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority]
+     returning plugin_id, enabled, config, ordering_priority as "orderingPriority",
+               installed_version as "installedVersion", update_policy as "updatePolicy", updated_at`,
+    [organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority, requestedInstalledVersion, updatePolicy, availableVersion]
   );
   return { pluginId: manifest.id, settings: result.rows[0] };
 }
@@ -3878,23 +3968,31 @@ async function savePluginSettingsForUser(organizationId: string, userId: string,
   const orderingPriority = Number.isFinite(Number(body.orderingPriority))
     ? Number(body.orderingPriority)
     : organizationSettings.get(manifest.id)?.orderingPriority ?? manifest.ordering?.priority ?? null;
+  const requestedInstalledVersion = optionalString(body.installedVersion);
+  const availableVersion = manifest.version;
+  const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
   const result = await pool.query<{
     plugin_id: string;
     enabled: boolean;
     config: Record<string, unknown>;
     orderingPriority: number | null;
+    installedVersion: string | null;
+    updatePolicy: "manual" | "patch" | "minor" | "locked";
     updated_at: string;
   }>(
-    `insert into user_plugin_settings (user_id, organization_id, plugin_id, enabled, config, ordering_priority, updated_at)
-     values ($1, $2, $3, $4, $5::jsonb, $6, now())
+    `insert into user_plugin_settings (user_id, organization_id, plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at)
+     values ($1, $2, $3, $4, $5::jsonb, $6, coalesce($7, $9), coalesce($8, 'manual'), now())
      on conflict (user_id, plugin_id) do update set
        organization_id = excluded.organization_id,
        enabled = excluded.enabled,
        config = excluded.config,
        ordering_priority = excluded.ordering_priority,
+       installed_version = coalesce($7, user_plugin_settings.installed_version, excluded.installed_version),
+       update_policy = coalesce($8, user_plugin_settings.update_policy, 'manual'),
        updated_at = now()
-     returning plugin_id, enabled, config, ordering_priority as "orderingPriority", updated_at`,
-    [userId, organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority]
+     returning plugin_id, enabled, config, ordering_priority as "orderingPriority",
+               installed_version as "installedVersion", update_policy as "updatePolicy", updated_at`,
+    [userId, organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority, requestedInstalledVersion, updatePolicy, availableVersion]
   );
   const stored = result.rows[0];
   return {
@@ -3907,6 +4005,8 @@ async function savePluginSettingsForUser(organizationId: string, userId: string,
         enabled: stored.enabled,
         config: stored.config ?? {},
         orderingPriority: stored.orderingPriority,
+        installedVersion: stored.installedVersion ?? undefined,
+        updatePolicy: stored.updatePolicy,
         updatedAt: stored.updated_at
       },
       undefined,
@@ -4040,7 +4140,25 @@ async function installMarketplacePluginForUser(organizationId: string, userId: s
   if (!pluginPolicy?.mandatory && !policy.allowUserMarketplaceInstalls) return undefined;
   if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false) return undefined;
   if (manifest.publisher !== "openleash" && !policy.allowUserCommunityPlugins) return undefined;
-  return savePluginSettingsForUser(organizationId, userId, pluginId, { enabled: true, config: manifest.defaultConfig ?? {} });
+  return savePluginSettingsForUser(organizationId, userId, pluginId, {
+    enabled: true,
+    config: manifest.defaultConfig ?? {},
+    installedVersion: manifest.version
+  });
+}
+
+async function updateMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
+  const manifest = await manifestForPluginId(pluginId);
+  if (!manifest) return undefined;
+  const settings = (await readUserPluginSettings(organizationId, userId)).get(manifest.id);
+  if (!settings?.enabled) return undefined;
+  return savePluginSettingsForUser(organizationId, userId, pluginId, {
+    enabled: true,
+    config: settings.config,
+    orderingPriority: settings.orderingPriority,
+    installedVersion: manifest.version,
+    updatePolicy: settings.updatePolicy
+  });
 }
 
 async function uninstallMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
@@ -4050,6 +4168,20 @@ async function uninstallMarketplacePluginForUser(organizationId: string, userId:
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
   return savePluginSettingsForUser(organizationId, userId, pluginId, { enabled: false, config: manifest.defaultConfig ?? {} });
+}
+
+async function updateMarketplacePluginForOrganization(organizationId: string, pluginId: string) {
+  const manifest = await manifestForPluginId(pluginId);
+  if (!manifest) return undefined;
+  const settings = (await readPluginSettings(organizationId)).get(manifest.id);
+  if (!settings?.enabled) return undefined;
+  return savePluginSettingsForOrganization(organizationId, pluginId, {
+    enabled: true,
+    config: settings.config,
+    orderingPriority: settings.orderingPriority,
+    installedVersion: manifest.version,
+    updatePolicy: settings.updatePolicy
+  });
 }
 
 async function saveOrganizationPluginPolicy(organizationId: string, pluginId: string, body: Record<string, unknown>) {
@@ -4155,15 +4287,432 @@ async function createPluginSubmission(organizationId: string, submittedBy: strin
   return { submission: result.rows[0] };
 }
 
+async function createPluginReleaseSubmission(organizationId: string, submittedBy: string, body: Record<string, unknown>) {
+  const repositoryUrl = normalizeGithubRepositoryUrl(body.repositoryUrl);
+  if (!repositoryUrl) throw new HttpError(400, "A public GitHub repository URL is required.");
+  const manifestPath = optionalString(body.manifestPath) ?? "openleash.plugin.json";
+  const gitRef = optionalString(body.gitRef) ?? optionalString(body.version);
+  if (!gitRef) throw new HttpError(400, "gitRef is required for an immutable plugin release.");
+  const rawManifest = body.manifest && typeof body.manifest === "object" && !Array.isArray(body.manifest)
+    ? body.manifest as Record<string, unknown>
+    : await fetchGithubPluginManifest(repositoryUrl, gitRef, manifestPath);
+  const release = pluginReleaseFieldsFromManifest(rawManifest, {
+    repositoryUrl,
+    gitRef,
+    manifestPath,
+    commitSha: optionalString(body.commitSha),
+    source: body.source === "private" ? "private" : "community",
+    developerName: optionalString(body.developerName)
+  });
+  const result = await pool.query(
+    `insert into plugin_releases (
+       plugin_id, version, slug, name, description, publisher, developer_name, developer_url,
+       source, review_status, short_description, long_description, hero_tagline, package_url,
+       repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
+       ordering, config_schema, default_config, tags, icon_text, visual_png,
+       git_ref, commit_sha, manifest_path, manifest, submitted_by, updated_at
+     )
+     values (
+       $1, $2, $3, $4, $5, $6, $7, $8,
+       $9, 'pending_review', $10, $11, $12, $13,
+       $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20::jsonb,
+       $21::jsonb, $22::jsonb, $23::jsonb, $24::jsonb, $25, $26,
+       $27, $28, $29, $30::jsonb, $31, now()
+     )
+     on conflict (plugin_id, version) do update set
+       slug = excluded.slug,
+       name = excluded.name,
+       description = excluded.description,
+       publisher = excluded.publisher,
+       developer_name = excluded.developer_name,
+       developer_url = excluded.developer_url,
+       source = excluded.source,
+       review_status = 'pending_review',
+       short_description = excluded.short_description,
+       long_description = excluded.long_description,
+       hero_tagline = excluded.hero_tagline,
+       package_url = excluded.package_url,
+       repository_url = excluded.repository_url,
+       documentation_url = excluded.documentation_url,
+       runtime = excluded.runtime,
+       entrypoint = excluded.entrypoint,
+       events = excluded.events,
+       permissions = excluded.permissions,
+       effects = excluded.effects,
+       ordering = excluded.ordering,
+       config_schema = excluded.config_schema,
+       default_config = excluded.default_config,
+       tags = excluded.tags,
+       icon_text = excluded.icon_text,
+       visual_png = excluded.visual_png,
+       git_ref = excluded.git_ref,
+       commit_sha = excluded.commit_sha,
+       manifest_path = excluded.manifest_path,
+       manifest = excluded.manifest,
+       submitted_by = excluded.submitted_by,
+       reviewed_by = null,
+       reviewer_note = null,
+       approved_at = null,
+       updated_at = now()
+     returning *`,
+    [
+      release.pluginId,
+      release.version,
+      release.slug,
+      release.name,
+      release.description,
+      release.publisher,
+      release.developerName,
+      release.developerUrl ?? null,
+      release.source,
+      release.shortDescription,
+      release.longDescription,
+      release.heroTagline,
+      release.packageUrl ?? null,
+      release.repositoryUrl,
+      release.documentationUrl ?? null,
+      release.runtime,
+      release.entrypoint,
+      JSON.stringify(release.events),
+      JSON.stringify(release.permissions),
+      JSON.stringify(release.effects),
+      JSON.stringify(release.ordering ?? null),
+      JSON.stringify(release.configSchema ?? null),
+      JSON.stringify(release.defaultConfig ?? {}),
+      JSON.stringify(release.tags ?? []),
+      release.iconText,
+      release.visualPng ?? null,
+      release.gitRef,
+      release.commitSha ?? null,
+      release.manifestPath,
+      JSON.stringify(rawManifest),
+      submittedBy
+    ]
+  );
+  await pool.query(
+    `insert into plugin_submissions (organization_id, submitted_by, plugin_id, slug, name, developer_name, package_url, repository_url, manifest, status, updated_at)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'pending_review', now())
+     on conflict do nothing`,
+    [organizationId, submittedBy, release.pluginId, release.slug, release.name, release.developerName, release.packageUrl ?? null, release.repositoryUrl, JSON.stringify(rawManifest)]
+  );
+  return { release: pluginReleaseFromRow(result.rows[0]) };
+}
+
+async function listPluginReleases(status: string) {
+  const params: unknown[] = [];
+  const where: string[] = [];
+  if (status === "pending_review" || status === "approved" || status === "rejected" || status === "yanked") {
+    params.push(status);
+    where.push(`review_status = $${params.length}`);
+  }
+  const rows = await pool.query(
+    `select * from plugin_releases
+     ${where.length ? `where ${where.join(" and ")}` : ""}
+     order by created_at desc
+     limit 100`,
+    params
+  );
+  return rows.rows.map(pluginReleaseFromRow);
+}
+
+async function approvePluginRelease(id: string, reviewerId: string | undefined, body: Record<string, unknown>) {
+  const reviewed = await reviewPluginRelease(id, "approved", reviewerId, body?.reviewerNote);
+  if (!reviewed) return undefined;
+  const release = reviewed.release;
+  await pool.query(
+    `insert into plugin_marketplace (
+       plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
+       source, review_status, short_description, long_description, hero_tagline, package_url,
+       repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
+       ordering, config_schema, default_config, tags, icon_text, visual_png,
+       featured_rank, seo_title, seo_description, updated_at
+     )
+     values (
+       $1, $2, $3, $4, $5, $6, $7, $8,
+       $9, 'approved', $10, $11, $12, $13,
+       $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20::jsonb,
+       $21::jsonb, $22::jsonb, $23::jsonb, $24::jsonb, $25, $26,
+       null, $27, $28, now()
+     )
+     on conflict (plugin_id) do update set
+       slug = excluded.slug,
+       name = excluded.name,
+       description = excluded.description,
+       version = excluded.version,
+       publisher = excluded.publisher,
+       developer_name = excluded.developer_name,
+       developer_url = excluded.developer_url,
+       source = excluded.source,
+       review_status = 'approved',
+       short_description = excluded.short_description,
+       long_description = excluded.long_description,
+       hero_tagline = excluded.hero_tagline,
+       package_url = excluded.package_url,
+       repository_url = excluded.repository_url,
+       documentation_url = excluded.documentation_url,
+       runtime = excluded.runtime,
+       entrypoint = excluded.entrypoint,
+       events = excluded.events,
+       permissions = excluded.permissions,
+       effects = excluded.effects,
+       ordering = excluded.ordering,
+       config_schema = excluded.config_schema,
+       default_config = excluded.default_config,
+       tags = excluded.tags,
+       icon_text = excluded.icon_text,
+       visual_png = excluded.visual_png,
+       seo_title = excluded.seo_title,
+       seo_description = excluded.seo_description,
+       updated_at = now()`,
+    [
+      release.pluginId,
+      release.slug,
+      release.slug,
+      release.description,
+      release.version,
+      release.publisher,
+      release.developerName,
+      release.developerUrl ?? null,
+      release.source,
+      release.shortDescription,
+      release.longDescription,
+      release.heroTagline,
+      release.packageUrl ?? null,
+      release.repositoryUrl,
+      release.documentationUrl ?? null,
+      release.runtime,
+      release.entrypoint,
+      JSON.stringify(release.events),
+      JSON.stringify(release.permissions),
+      JSON.stringify(release.effects),
+      JSON.stringify(release.ordering ?? null),
+      JSON.stringify(release.configSchema ?? null),
+      JSON.stringify(release.defaultConfig ?? {}),
+      JSON.stringify(release.tags ?? []),
+      release.iconText,
+      release.visualPng ?? null,
+      `${release.slug} Plugin for OpenLeash`,
+      `Install ${release.slug} for OpenLeash. ${release.shortDescription}`
+    ]
+  );
+  await pool.query(
+    "update plugin_submissions set status = 'approved', updated_at = now() where plugin_id = $1 and status = 'pending_review'",
+    [release.pluginId]
+  );
+  return reviewed;
+}
+
+async function reviewPluginRelease(id: string, status: "approved" | "rejected" | "yanked", reviewerId?: string, reviewerNote?: unknown) {
+  const result = await pool.query(
+    `update plugin_releases
+     set review_status = $2,
+         reviewed_by = $3,
+         reviewer_note = $4,
+         approved_at = case when $2 = 'approved' then now() else approved_at end,
+         updated_at = now()
+     where id = $1
+     returning *`,
+    [id, status, reviewerId ?? null, optionalString(reviewerNote) ?? null]
+  );
+  return result.rows[0] ? { release: pluginReleaseFromRow(result.rows[0]) } : undefined;
+}
+
+type PluginReleaseFields = {
+  pluginId: string;
+  version: string;
+  slug: string;
+  name: string;
+  description: string;
+  publisher: string;
+  developerName: string;
+  developerUrl?: string;
+  source: "community" | "private";
+  shortDescription: string;
+  longDescription: string;
+  heroTagline: string;
+  packageUrl?: string;
+  repositoryUrl: string;
+  documentationUrl?: string;
+  runtime: OpenLeashPluginManifest["runtime"];
+  entrypoint: string;
+  events: OpenLeashPluginManifest["events"];
+  permissions: OpenLeashPluginManifest["permissions"];
+  effects: OpenLeashPluginManifest["effects"];
+  ordering?: OpenLeashPluginManifest["ordering"];
+  configSchema?: OpenLeashPluginManifest["configSchema"];
+  defaultConfig?: Record<string, unknown>;
+  tags?: string[];
+  iconText: string;
+  visualPng?: string;
+  gitRef: string;
+  commitSha?: string;
+  manifestPath: string;
+};
+
+function pluginReleaseFieldsFromManifest(manifest: Record<string, unknown>, source: {
+  repositoryUrl: string;
+  gitRef: string;
+  manifestPath: string;
+  commitSha?: string;
+  source: "community" | "private";
+  developerName?: string;
+}): PluginReleaseFields {
+  const pluginId = optionalString(manifest.id) ?? "";
+  const version = optionalString(manifest.version) ?? "";
+  const name = optionalString(manifest.name) ?? pluginId.split(".").pop() ?? "";
+  const slug = slugify(optionalString(manifest.slug) ?? name);
+  const publisher = optionalString(manifest.publisher) ?? pluginId.split(".")[0] ?? "community";
+  const description = optionalString(manifest.description) ?? "";
+  if (!pluginId || !version || !slug || !description) {
+    throw new HttpError(400, "Plugin manifest requires id, version, name or slug, and description.");
+  }
+  const runtime = manifest.runtime === "node" ? "node" : "openleash-core";
+  const entrypoint = optionalString(manifest.entrypoint) ?? "";
+  if (!entrypoint) throw new HttpError(400, "Plugin manifest requires entrypoint.");
+  const events = pluginStringArray(manifest.events);
+  const permissions = pluginStringArray(manifest.permissions);
+  const effects = pluginStringArray(manifest.effects);
+  if (events.length === 0 || permissions.length === 0 || effects.length === 0) {
+    throw new HttpError(400, "Plugin manifest requires events, permissions, and effects.");
+  }
+  const shortDescription = optionalString(manifest.shortDescription) ?? sentence(description);
+  return {
+    pluginId,
+    version,
+    slug,
+    name,
+    description,
+    publisher,
+    developerName: source.developerName ?? titleize(publisher),
+    developerUrl: optionalString(manifest.developerUrl),
+    source: source.source,
+    shortDescription,
+    longDescription: optionalString(manifest.longDescription) ?? description,
+    heroTagline: optionalString(manifest.heroTagline) ?? shortDescription,
+    packageUrl: optionalString(manifest.packageUrl),
+    repositoryUrl: source.repositoryUrl,
+    documentationUrl: optionalString(manifest.documentationUrl),
+    runtime,
+    entrypoint,
+    events: events as OpenLeashPluginManifest["events"],
+    permissions: permissions as OpenLeashPluginManifest["permissions"],
+    effects: effects as OpenLeashPluginManifest["effects"],
+    ordering: objectValue(manifest.ordering) as OpenLeashPluginManifest["ordering"],
+    configSchema: objectValue(manifest.configSchema) as OpenLeashPluginManifest["configSchema"],
+    defaultConfig: objectValue(manifest.defaultConfig) ?? {},
+    tags: pluginStringArray(manifest.tags),
+    iconText: optionalString(manifest.iconText) ?? iconText(slug),
+    visualPng: optionalString(manifest.visualPng),
+    gitRef: source.gitRef,
+    commitSha: source.commitSha,
+    manifestPath: source.manifestPath
+  };
+}
+
+async function fetchGithubPluginManifest(repositoryUrl: string, gitRef: string, manifestPath: string): Promise<Record<string, unknown>> {
+  const rawUrl = githubRawUrl(repositoryUrl, gitRef, manifestPath);
+  if (!rawUrl) throw new HttpError(400, "repositoryUrl must point to a GitHub repository.");
+  const response = await fetch(rawUrl, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(Number(process.env.OPENLEASH_PLUGIN_MANIFEST_FETCH_TIMEOUT_MS ?? 10000))
+  });
+  if (!response.ok) throw new HttpError(400, `Could not fetch plugin manifest from GitHub (${response.status}).`);
+  const text = await response.text();
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("manifest must be an object");
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new HttpError(400, "Plugin manifest must be JSON.");
+  }
+}
+
+function githubRawUrl(repositoryUrl: string, gitRef: string, manifestPath: string) {
+  try {
+    const url = new URL(repositoryUrl);
+    if (url.hostname.toLowerCase() !== "github.com") return undefined;
+    const [owner, repo] = url.pathname.replace(/^\/+|\/+$/g, "").split("/");
+    if (!owner || !repo) return undefined;
+    const pathParts = manifestPath.replace(/^\/+/, "").split("/").filter(Boolean).map(encodeURIComponent).join("/");
+    return `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(gitRef)}/${pathParts}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function pluginReleaseFromRow(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    pluginId: String(row.plugin_id),
+    version: String(row.version),
+    slug: String(row.slug),
+    name: String(row.name),
+    description: String(row.description),
+    publisher: String(row.publisher),
+    developerName: String(row.developer_name),
+    developerUrl: optionalString(row.developer_url),
+    source: String(row.source),
+    reviewStatus: String(row.review_status),
+    shortDescription: String(row.short_description),
+    longDescription: String(row.long_description),
+    heroTagline: String(row.hero_tagline),
+    packageUrl: optionalString(row.package_url),
+    repositoryUrl: String(row.repository_url),
+    documentationUrl: optionalString(row.documentation_url),
+    runtime: String(row.runtime),
+    entrypoint: String(row.entrypoint),
+    events: arrayValue(row.events),
+    permissions: arrayValue(row.permissions),
+    effects: arrayValue(row.effects),
+    ordering: objectValue(row.ordering),
+    configSchema: objectValue(row.config_schema),
+    defaultConfig: objectValue(row.default_config) ?? {},
+    tags: arrayValue(row.tags),
+    iconText: String(row.icon_text ?? "OL"),
+    visualPng: optionalString(row.visual_png),
+    gitRef: String(row.git_ref),
+    commitSha: optionalString(row.commit_sha),
+    manifestPath: String(row.manifest_path),
+    manifest: objectValue(row.manifest) ?? {},
+    reviewerNote: optionalString(row.reviewer_note),
+    approvedAt: optionalString(row.approved_at),
+    createdAt: optionalString(row.created_at),
+    updatedAt: optionalString(row.updated_at)
+  };
+}
+
+function pluginStringArray(value: unknown) {
+  return Array.isArray(value) ? value.map(String).map((item) => item.trim()).filter(Boolean) : [];
+}
+
+function sentence(value: string) {
+  return value.replace(/\s+/g, " ").trim().replace(/[.!?]+$/, "").slice(0, 180) + ".";
+}
+
+function titleize(value: string) {
+  return value
+    .replace(/^@/, "")
+    .replace(/[-_.]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .trim() || "Community";
+}
+
+function iconText(value: string) {
+  const letters = value.split(/[-_\s.]+/).map((part) => part[0]).join("").toUpperCase();
+  return (letters || value.slice(0, 2).toUpperCase() || "OL").slice(0, 2);
+}
+
 async function readPluginSettings(organizationId: string) {
   const rows = await pool.query<{
     plugin_id: string;
     enabled: boolean;
     config: Record<string, unknown>;
     ordering_priority: number | null;
+    installed_version: string | null;
+    update_policy: "manual" | "patch" | "minor" | "locked";
     updated_at: string;
   }>(
-    `select plugin_id, enabled, config, ordering_priority, updated_at
+    `select plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at
      from plugin_settings
      where organization_id = $1`,
     [organizationId]
@@ -4175,6 +4724,8 @@ async function readPluginSettings(organizationId: string) {
       enabled: row.enabled,
       config: row.config ?? {},
       orderingPriority: row.ordering_priority,
+      installedVersion: row.installed_version ?? undefined,
+      updatePolicy: row.update_policy ?? "manual",
       updatedAt: row.updated_at
     }
   ])));
@@ -4186,9 +4737,11 @@ async function readUserPluginSettings(organizationId: string, userId: string) {
     enabled: boolean;
     config: Record<string, unknown>;
     ordering_priority: number | null;
+    installed_version: string | null;
+    update_policy: "manual" | "patch" | "minor" | "locked";
     updated_at: string;
   }>(
-    `select plugin_id, enabled, config, ordering_priority, updated_at
+    `select plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at
      from user_plugin_settings
      where organization_id = $1 and user_id = $2`,
     [organizationId, userId]
@@ -4200,6 +4753,8 @@ async function readUserPluginSettings(organizationId: string, userId: string) {
       enabled: row.enabled,
       config: row.config ?? {},
       orderingPriority: row.ordering_priority,
+      installedVersion: row.installed_version ?? undefined,
+      updatePolicy: row.update_policy ?? "manual",
       updatedAt: row.updated_at
     }
   ])));
@@ -4254,6 +4809,13 @@ async function organizationIdForAdminRequest(req: express.Request) {
     throw new HttpError(403, "cannot access another organization");
   }
   return session.organization.id;
+}
+
+async function adminUserForRequest(req: express.Request) {
+  const session = await getDashboardSession(req.header("authorization") ?? "");
+  if (!session) throw new HttpError(401, "dashboard session required");
+  if (!isDashboardAccessRole(session.user.role)) throw new HttpError(403, "dashboard admin role required");
+  return session.user;
 }
 
 async function recordPromptTransformResult(conversationEventId: string, _userId: string, originalPrompt: string, result: PromptPipelineResult) {
@@ -5474,6 +6036,12 @@ function slugify(value: string) {
 function optionalString(value: unknown) {
   const text = typeof value === "string" ? value.trim() : "";
   return text || undefined;
+}
+
+function pluginUpdatePolicy(value: unknown): PluginSettingRecord["updatePolicy"] | undefined {
+  return value === "manual" || value === "patch" || value === "minor" || value === "locked"
+    ? value
+    : undefined;
 }
 
 function normalizeGithubRepositoryUrl(value: unknown) {
@@ -6794,6 +7362,7 @@ function requiresDashboardWriteSession(req: express.Request) {
   if (req.path === "/admin/users") return true;
   if (req.path.startsWith("/admin/deployment-tokens")) return true;
   if (req.path.startsWith("/admin/policies")) return true;
+  if (req.path.startsWith("/admin/plugin-releases")) return true;
   if (req.path === "/admin/prompt-transforms") return true;
   return false;
 }
@@ -7164,6 +7733,8 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath.startsWith("/admin/plugins/") ||
     requestPath === "/admin/plugin-marketplace" ||
     requestPath === "/admin/plugin-marketplace/policy" ||
+    requestPath === "/admin/plugin-releases" ||
+    requestPath.startsWith("/admin/plugin-releases/") ||
     requestPath === "/admin/debug" ||
     requestPath === "/admin/logs" ||
     /^\/admin\/logs\/[^/]+$/.test(requestPath) ||
@@ -7216,8 +7787,12 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     requestPath === "/v1/plugin-marketplace" ||
     requestPath === "/v1/outcomes" ||
     requestPath === "/v1/plugin-submissions" ||
+    requestPath === "/v1/plugin-releases" ||
+    requestPath === "/v1/client/notifications" ||
+    /^\/v1\/client\/decisions\/[^/]+\/resolve$/.test(requestPath) ||
     /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath) ||
     /^\/v1\/plugins\/[^/]+\/install$/.test(requestPath) ||
+    /^\/v1\/plugins\/[^/]+\/update$/.test(requestPath) ||
     /^\/v1\/plugins\/[^/]+\/uninstall$/.test(requestPath) ||
     requestPath === "/v1/skills/observations" ||
     /^\/v1\/decisions\/[^/]+$/.test(requestPath) ||
@@ -7248,8 +7823,10 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && /^\/public\/plugins\/[^/]+$/.test(requestPath)) return "tenantPluginsRead";
   if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath)) return "adminPluginsWrite";
   if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/install$/.test(requestPath)) return "adminPluginsWrite";
+  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/update$/.test(requestPath)) return "adminPluginsWrite";
   if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/uninstall$/.test(requestPath)) return "adminPluginsWrite";
   if (verb === "POST" && requestPath === "/v1/plugin-submissions") return "adminPluginsWrite";
+  if (verb === "POST" && requestPath === "/v1/plugin-releases") return "adminPluginsWrite";
   if (verb === "POST" && requestPath === "/v1/evaluate") return "tenantEvaluate";
   if (verb === "POST" && /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath)) return "tenantHookEvaluate";
   if (verb === "POST" && requestPath === "/v1/skills/observations") return "tenantSkillObservation";
@@ -7264,7 +7841,10 @@ function apiFunctionForRequest(method: string, requestPath: string): OpenLeashAp
   if (verb === "GET" && requestPath === "/admin/skills") return "adminSkills";
   if (verb === "GET" && requestPath === "/admin/plugins") return "adminPluginsRead";
   if (verb === "GET" && requestPath === "/admin/plugin-marketplace") return "adminPluginsRead";
+  if (verb === "GET" && requestPath === "/admin/plugin-releases") return "adminPluginsRead";
+  if (verb === "POST" && requestPath.startsWith("/admin/plugin-releases/")) return "adminPluginsWrite";
   if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/settings$/.test(requestPath)) return "adminPluginsWrite";
+  if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/update$/.test(requestPath)) return "adminPluginsWrite";
   if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/policy$/.test(requestPath)) return "adminPluginsWrite";
   if (verb === "POST" && requestPath === "/admin/plugin-marketplace/policy") return "adminPluginsWrite";
   if (verb === "GET" && requestPath === "/admin/logs") return "adminLogs";

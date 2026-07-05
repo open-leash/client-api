@@ -238,8 +238,11 @@ create table if not exists plugin_settings (
   enabled boolean not null default true,
   config jsonb not null default '{}'::jsonb,
   ordering_priority integer,
+  installed_version text,
+  update_policy text not null default 'manual',
   updated_at timestamptz not null default now(),
-  primary key (organization_id, plugin_id)
+  primary key (organization_id, plugin_id),
+  constraint plugin_settings_update_policy_check check (update_policy in ('manual', 'patch', 'minor', 'locked'))
 );
 
 create index if not exists plugin_settings_org_idx on plugin_settings(organization_id, plugin_id);
@@ -251,8 +254,11 @@ create table if not exists user_plugin_settings (
   enabled boolean not null default true,
   config jsonb not null default '{}'::jsonb,
   ordering_priority integer,
+  installed_version text,
+  update_policy text not null default 'manual',
   updated_at timestamptz not null default now(),
-  primary key (user_id, plugin_id)
+  primary key (user_id, plugin_id),
+  constraint user_plugin_settings_update_policy_check check (update_policy in ('manual', 'patch', 'minor', 'locked'))
 );
 
 create index if not exists user_plugin_settings_org_idx on user_plugin_settings(organization_id, plugin_id);
@@ -509,6 +515,53 @@ create table if not exists plugin_submissions (
 );
 
 create index if not exists plugin_submissions_status_idx on plugin_submissions(status, created_at desc);
+
+create table if not exists plugin_releases (
+  id uuid primary key default gen_random_uuid(),
+  plugin_id text not null,
+  version text not null,
+  slug text not null,
+  name text not null,
+  description text not null,
+  publisher text not null,
+  developer_name text not null,
+  developer_url text,
+  source text not null default 'community',
+  review_status text not null default 'pending_review',
+  short_description text not null,
+  long_description text not null,
+  hero_tagline text not null,
+  package_url text,
+  repository_url text not null,
+  documentation_url text,
+  runtime text not null,
+  entrypoint text not null,
+  events jsonb not null default '[]'::jsonb,
+  permissions jsonb not null default '[]'::jsonb,
+  effects jsonb not null default '[]'::jsonb,
+  ordering jsonb,
+  config_schema jsonb,
+  default_config jsonb not null default '{}'::jsonb,
+  tags jsonb not null default '[]'::jsonb,
+  icon_text text not null default 'OL',
+  visual_png text,
+  git_ref text not null,
+  commit_sha text,
+  manifest_path text not null default 'openleash.plugin.json',
+  manifest jsonb not null default '{}'::jsonb,
+  submitted_by uuid references users(id) on delete set null,
+  reviewed_by uuid references users(id) on delete set null,
+  reviewer_note text,
+  approved_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint plugin_releases_source_check check (source in ('first_party', 'community', 'private')),
+  constraint plugin_releases_review_check check (review_status in ('pending_review', 'approved', 'rejected', 'yanked')),
+  unique(plugin_id, version)
+);
+
+create index if not exists plugin_releases_plugin_version_idx on plugin_releases(plugin_id, version);
+create index if not exists plugin_releases_review_idx on plugin_releases(review_status, created_at desc);
 
 create table if not exists mcp_servers (
   id uuid primary key default gen_random_uuid(),
