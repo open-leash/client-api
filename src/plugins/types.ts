@@ -84,7 +84,7 @@ export type SkillObservationInput = {
   contentPreview?: string | null;
   status?: string;
   riskScore?: number;
-  reasons: Array<{ reason: string; quote?: string }>;
+  reasons?: Array<{ reason: string; quote?: string }>;
 };
 
 export type SkillObservationResult = {

@@ -2988,9 +2988,44 @@ app.post("/v1/skills/observations", async (req, res, next) => {
 	    const reasons = normalizeSkillReasons(body.reasons);
     const content = typeof body.content === "string" ? body.content.slice(0, 80000) : null;
     const contentPreview = typeof body.contentPreview === "string" ? body.contentPreview.slice(0, 12000) : content?.slice(0, 12000) ?? null;
+    const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
+    const agentKind = String(body.agentKind ?? "unknown") as AgentKind;
+    const agentName = body.agentName ?? "Local agent";
+    const skillScanRequest: EvaluationRequest = {
+      computer: {
+        hostname: req.hostname || "unknown",
+        platform: "unknown"
+      },
+      agent: {
+        kind: agentKind,
+        displayName: agentName
+      },
+      event: {
+        eventName: "SubagentStart",
+        agentKind,
+        sessionId: `skill:${skillPath}`,
+        projectPath: body.projectPath ?? undefined,
+        prompt: `Skill ${skillName} changed at ${skillPath}`,
+        occurredAt: new Date().toISOString(),
+        raw: {
+          openleashEventType: "skill-risk",
+          skillName,
+          skillPath,
+          contentPreview: contentPreview ?? "",
+          contentHash: body.contentHash
+        }
+      }
+    };
+    const skillScannerCapabilities = createPluginCapabilities({
+      organizationId,
+      pluginId: "openleash.skill-scanner",
+      userId: user.id,
+      tenantModelKey,
+      request: skillScanRequest
+    });
     const skillScan = await runSkillScanner({
-      agentKind: body.agentKind ?? "unknown",
-      agentName: body.agentName ?? "Local agent",
+      agentKind,
+      agentName,
       skillName,
       skillPath,
       content,
@@ -2998,7 +3033,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       status: body.status,
       riskScore: body.riskScore,
       reasons
-    });
+    }, skillScannerCapabilities);
     const suspicious = skillScan.status === "suspicious";
     const status = skillScan.status;
     const contentHash = body.contentHash ?? crypto.createHash("sha256").update(content ?? skillPath).digest("hex");
@@ -3149,25 +3184,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           userId: user.id,
           computerId: signalContext.computerId,
           runtimeId: signalContext.runtimeId,
-          request: {
-            computer: {
-              hostname: req.hostname || "unknown",
-              platform: "unknown"
-            },
-            agent: {
-              kind: body.agentKind ?? "unknown",
-              displayName: body.agentName ?? "Local agent"
-            },
-            event: {
-              eventName: "SubagentStart",
-              agentKind: body.agentKind ?? "unknown",
-              sessionId: `skill:${skillPath}`,
-              projectPath: body.projectPath ?? undefined,
-              prompt: `Skill ${skillName} changed at ${skillPath}`,
-              occurredAt: new Date().toISOString(),
-              raw: { openleashEventType: "skill-risk", skillName, skillPath }
-            }
-          } as EvaluationRequest
+          request: skillScanRequest
         }).signals.emit({
           kind: "security.finding",
           severity: "high",
@@ -7395,47 +7412,10 @@ function normalizeSkillReasons(value: unknown): Array<{ reason: string; quote?: 
   }).slice(0, 12);
 }
 
-async function skillPurposeSummary({ provided, content, skillName, skillPath }: { provided?: string; content: string; skillName: string; skillPath: string }) {
+async function skillPurposeSummary({ provided, content, skillName }: { provided?: string; content: string; skillName: string; skillPath: string }) {
   const normalized = normalizeSkillPurpose(provided ?? "", skillName);
   if (normalized) return normalized;
-  const apiKey = process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY;
-  if (apiKey && content.trim()) {
-    const llm = await summarizeSkillPurposeWithOpenAI({ apiKey, content, skillName, skillPath });
-    if (llm) return llm;
-  }
   return heuristicSkillPurpose(content, skillName);
-}
-
-async function summarizeSkillPurposeWithOpenAI({ apiKey, content, skillName, skillPath }: { apiKey: string; content: string; skillName: string; skillPath: string }) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3500);
-  try {
-    const response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: process.env.OPENLEASH_SKILL_SUMMARY_MODEL ?? process.env.OPENAI_EVAL_MODEL ?? "gpt-4.1-mini",
-        input: [
-          { role: "system", content: "Summarize this AI agent skill purpose in 4 to 8 words. No punctuation unless needed. No quotes. Return only the phrase." },
-          { role: "user", content: JSON.stringify({ skillName, skillPath, content: truncate(content, 10000) }) }
-        ],
-        temperature: 0,
-        max_output_tokens: 40
-      })
-    });
-    if (!response.ok) return undefined;
-    const payload = await response.json() as { output_text?: string; output?: Array<{ content?: Array<{ text?: string }> }> };
-    const output = payload.output_text ?? payload.output?.flatMap((item) => item.content ?? []).map((item) => item.text ?? "").join("") ?? "";
-    return normalizeSkillPurpose(output, skillName);
-  } catch {
-    return undefined;
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 function heuristicSkillPurpose(content: string, skillName: string) {

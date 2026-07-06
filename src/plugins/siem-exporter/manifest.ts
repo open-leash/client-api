@@ -44,5 +44,5 @@ export const siemExporterManifest: OpenLeashPluginManifest = {
     includePrompt: false,
     includeToolArguments: false
   },
-  tags: ["siem", "soc", "ecs", "splunk", "syslog", "incident-response"]
+  tags: ["utility", "siem", "soc", "ecs", "splunk", "syslog", "incident-response"]
 };

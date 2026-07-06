@@ -20,5 +20,5 @@ export const mcpScannerManifest: OpenLeashPluginManifest = {
     enabled: true,
     redactSecrets: true
   },
-  tags: ["mcp", "inventory", "audit"]
+  tags: ["security", "mcp", "inventory", "audit"]
 };
