@@ -123,7 +123,7 @@ export async function runSkillScanner(input: SkillObservationInput, capabilities
     findings,
     run: pluginRun({
       pluginId: manifest.id,
-      event: "skill.changed",
+      event: input.event ?? "skill.changed",
       status: suspicious ? "needs_question" : "passed",
       summary: suspicious
         ? "Skill scanner found behavior that needs review."

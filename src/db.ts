@@ -43,12 +43,34 @@ export async function ensureDevToken() {
   if (process.env.NODE_ENV === "production" && process.env.OPENLEASH_ALLOW_PROD_DEV_TOKEN_SEED !== "1") {
     throw new Error("OPENLEASH_DEV_TOKEN is set in production. Remove it or set OPENLEASH_ALLOW_PROD_DEV_TOKEN_SEED=1 explicitly.");
   }
+  const organizationSlug = String(process.env.OPENLEASH_DEV_ORG_SLUG ?? "").trim();
+  const organizationName = String(process.env.OPENLEASH_DEV_ORG_NAME ?? "Individual Open Source").trim();
+  const deploymentMode = String(process.env.OPENLEASH_DEPLOYMENT_MODE ?? "private").trim();
+  const organization = organizationSlug
+    ? await pool.query<{ id: string }>(
+        `insert into organizations (name, slug, setup_completed, current_step, deployment_mode)
+         values ($1, $2, true, 6, $3)
+         on conflict (slug) do update set
+           name = excluded.name,
+           setup_completed = true,
+           current_step = greatest(organizations.current_step, excluded.current_step),
+           deployment_mode = excluded.deployment_mode,
+           updated_at = now()
+         returning id`,
+        [organizationName, organizationSlug, deploymentMode === "cloud" ? "cloud" : "private"]
+      )
+    : undefined;
+  const organizationId = organization?.rows[0]?.id ?? null;
   const user = await pool.query<{ id: string }>(
-    `insert into users (email, display_name, role, token_hash)
-     values ('max.brin@openleash.local', 'Max Brin', 'owner', $1)
-     on conflict (email) do update set display_name = excluded.display_name, role = excluded.role, token_hash = excluded.token_hash
+    `insert into users (email, display_name, role, token_hash, organization_id)
+     values ('max.brin@openleash.local', 'Max Brin', 'owner', $1, $2)
+     on conflict (email) do update set
+       display_name = excluded.display_name,
+       role = excluded.role,
+       token_hash = excluded.token_hash,
+       organization_id = coalesce(excluded.organization_id, users.organization_id)
      returning id`,
-    [hashToken(token)]
+    [hashToken(token), organizationId]
   );
   const maxUserId = user.rows[0].id;
   const legacy = await pool.query<{ id: string }>("select id from users where email = 'dev@openleash.local' limit 1");

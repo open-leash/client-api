@@ -369,7 +369,9 @@ Use the narrowest event possible:
 
 - `openleash.startup`
 - `agent.detected`
+- `skill.detected`
 - `skill.changed`
+- `skill.removed`
 - `log.emitted`
 - `prompt.beforeSubmit`
 - `agent.response`

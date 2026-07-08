@@ -31,6 +31,7 @@ import {
   type PluginCatalogItem,
   type PluginLogRecord,
   type PluginMarketplaceListing,
+  type PipelineEvent,
   type PluginRunRecord,
   type PluginSettingState,
   type Policy,
@@ -75,6 +76,12 @@ import {
   readTenantModelKey,
   upsertTenantModelKey
 } from "./model-keys.js";
+import {
+  hasCapability,
+  openLeashProductModeFromEnv,
+  publicProductMode,
+  type OpenLeashCapability
+} from "./product-mode.js";
 import { assertReleaseAdmin, checkForClientUpdate, updateRequestSchema, upsertRelease } from "./releases.js";
 
 class HttpError extends Error {
@@ -99,6 +106,7 @@ export type PrepareOpenLeashApiOptions = Pick<StartOpenLeashApiOptions, "app" | 
 
 export const app = express();
 export const apiSurface = apiSurfaceFromEnv();
+export const productMode = openLeashProductModeFromEnv();
 const LOCAL_HOOK_AGENT_METADATA: Record<string, { kind: AgentKind | string; displayName: string }> = {
   ...HOOK_AGENT_METADATA,
   gemini: { kind: "gemini", displayName: "Google Gemini CLI" },
@@ -122,6 +130,16 @@ app.use((req, res, next) => {
     return res.status(404).json({
       error: "not found",
       service: apiSurface === "dashboard" ? "openleash-dashboard-api" : "openleash-api"
+    });
+  }
+  return next();
+});
+app.use((req, res, next) => {
+  const capability = capabilityForRequest(req.method, req.path);
+  if (capability && !hasCapability(productMode, capability)) {
+    return res.status(404).json({
+      error: "not found",
+      service: apiSurface === "dashboard" ? "openleash-dashboard-api" : "openleash-client-api"
     });
   }
   return next();
@@ -189,6 +207,7 @@ app.get("/health", (_req, res) => res.json({
   ok: true,
   service: apiSurface === "dashboard" ? "openleash-dashboard-api" : "openleash-client-api",
   surface: apiSurface,
+  productMode: publicProductMode(productMode),
   apiContracts: OPENLEASH_API_CONTRACTS
 }));
 
@@ -2974,6 +2993,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       content?: string;
       contentPreview?: string;
       purposeSummary?: string;
+      eventType?: string;
       status?: string;
       riskScore?: number;
       reasons?: Array<{ reason?: string; quote?: string }>;
@@ -2982,15 +3002,25 @@ app.post("/v1/skills/observations", async (req, res, next) => {
 	    const skillPath = String(body.skillPath ?? "").trim();
 	    if (!skillName || !skillPath) return res.status(400).json({ error: "skillName and skillPath are required" });
 	    const runtimePlugins = await pluginSettingsForRuntime(organizationId, user.id);
-	    if (runtimePlugins.get("openleash.skill-scanner")?.enabled === false) {
-	      return res.json({ ok: true, skipped: true, pluginId: "openleash.skill-scanner" });
-	    }
 	    const reasons = normalizeSkillReasons(body.reasons);
     const content = typeof body.content === "string" ? body.content.slice(0, 80000) : null;
     const contentPreview = typeof body.contentPreview === "string" ? body.contentPreview.slice(0, 12000) : content?.slice(0, 12000) ?? null;
-    const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
     const agentKind = String(body.agentKind ?? "unknown") as AgentKind;
     const agentName = body.agentName ?? "Local agent";
+    const requestedEventType = normalizeSkillObservationEventType(body.eventType);
+    const existingSkill = await pool.query(
+      `select id, status, risk_score, reasons, content_hash, purpose_summary
+       from skills
+       where organization_id = $1 and user_id = $2 and skill_path = $3
+       limit 1`,
+      [organizationId, user.id, skillPath]
+    );
+    const existing = existingSkill.rows[0] as { id: string; status: string; risk_score: number | string; reasons: unknown; content_hash: string; purpose_summary?: string | null } | undefined;
+    const contentHash = body.contentHash ?? existing?.content_hash ?? crypto.createHash("sha256").update(content ?? skillPath).digest("hex");
+    const skillEventType = inferSkillObservationEventType(requestedEventType, existing, contentHash);
+    const pipelineSkillEvent = pipelineEventForSkillObservation(skillEventType);
+    const shouldScanSkill = runtimePlugins.get("openleash.skill-scanner")?.enabled !== false && (skillEventType === "detected" || skillEventType === "changed");
+    const tenantModelKey = shouldScanSkill ? await tenantModelKeyForEvaluation(organizationId) : undefined;
     const skillScanRequest: EvaluationRequest = {
       computer: {
         hostname: req.hostname || "unknown",
@@ -3005,40 +3035,48 @@ app.post("/v1/skills/observations", async (req, res, next) => {
         agentKind,
         sessionId: `skill:${skillPath}`,
         projectPath: body.projectPath ?? undefined,
-        prompt: `Skill ${skillName} changed at ${skillPath}`,
+        prompt: `Skill ${skillName} ${skillEventType} at ${skillPath}`,
         occurredAt: new Date().toISOString(),
         raw: {
-          openleashEventType: "skill-risk",
+          openleashEventType: `skill-${skillEventType}`,
           skillName,
           skillPath,
+          skillEventType,
           contentPreview: contentPreview ?? "",
-          contentHash: body.contentHash
+          contentHash
         }
       }
     };
-    const skillScannerCapabilities = createPluginCapabilities({
-      organizationId,
-      pluginId: "openleash.skill-scanner",
-      userId: user.id,
-      tenantModelKey,
-      request: skillScanRequest
-    });
-    const skillScan = await runSkillScanner({
-      agentKind,
-      agentName,
-      skillName,
-      skillPath,
-      content,
-      contentPreview,
-      status: body.status,
-      riskScore: body.riskScore,
-      reasons
-    }, skillScannerCapabilities);
-    const suspicious = skillScan.status === "suspicious";
-    const status = skillScan.status;
-    const contentHash = body.contentHash ?? crypto.createHash("sha256").update(content ?? skillPath).digest("hex");
+    const skillScan = shouldScanSkill
+      ? await runSkillScanner({
+          event: pipelineSkillEvent,
+          agentKind,
+          agentName,
+          skillName,
+          skillPath,
+          content,
+          contentPreview,
+          status: body.status,
+          riskScore: body.riskScore,
+          reasons
+        }, createPluginCapabilities({
+          organizationId,
+          pluginId: "openleash.skill-scanner",
+          userId: user.id,
+          tenantModelKey,
+          request: skillScanRequest
+        }))
+      : {
+          status: skillEventType === "removed" ? "deleted" : normalizeSkillStatus(body.status, existing?.status),
+          riskScore: Number(existing?.risk_score ?? body.riskScore ?? 0),
+          reasons: normalizeExistingSkillReasons(existing?.reasons, reasons),
+          findings: [],
+          run: undefined
+        };
+    const suspicious = shouldScanSkill && skillScan.status === "suspicious";
+    const status = skillEventType === "removed" ? "deleted" : skillScan.status;
     const purposeSummary = await skillPurposeSummary({
-      provided: body.purposeSummary,
+      provided: body.purposeSummary ?? existing?.purpose_summary ?? undefined,
       content: content ?? contentPreview ?? "",
       skillName,
       skillPath
@@ -3061,9 +3099,9 @@ app.post("/v1/skills/observations", async (req, res, next) => {
            risk_score = excluded.risk_score,
            reasons = excluded.reasons,
            content_hash = excluded.content_hash,
-           content = excluded.content,
-           content_preview = excluded.content_preview,
-           purpose_summary = excluded.purpose_summary,
+           content = coalesce(excluded.content, skills.content),
+           content_preview = coalesce(excluded.content_preview, skills.content_preview),
+           purpose_summary = coalesce(excluded.purpose_summary, skills.purpose_summary),
            content_updated_at = case when skills.content_hash is distinct from excluded.content_hash then excluded.content_updated_at else coalesce(skills.content_updated_at, excluded.content_updated_at) end,
            last_seen_at = now(),
            updated_at = now()
@@ -3088,6 +3126,8 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       );
       let evaluationId: string | null = null;
       if (suspicious) {
+        const conversationEventName = skillEventType === "detected" ? "SkillDetected" : "SkillChanged";
+        const skillPluginRuns = skillScan.run ? [skillScan.run] : [];
         const computer = await client.query(
           `insert into computers (user_id, hostname, platform, last_seen_at)
            values ($1, $2, $3, now())
@@ -3105,23 +3145,25 @@ app.post("/v1/skills/observations", async (req, res, next) => {
         const event = await client.query(
           `insert into conversation_events
            (user_id, computer_id, agent_runtime_id, session_id, event_name, project_path, prompt, tool_name, payload, occurred_at)
-           values ($1, $2, $3, $4, 'SkillChanged', $5, $6, 'agent-skill', $7::jsonb, now())
+           values ($1, $2, $3, $4, $5, $6, $7, 'agent-skill', $8::jsonb, now())
            returning id`,
           [
             user.id,
             computer.rows[0].id,
             runtime.rows[0].id,
             `skill:${skillPath}`,
+            conversationEventName,
             body.projectPath ?? null,
-            `Skill ${skillName} changed at ${skillPath}`,
+            `Skill ${skillName} ${skillEventType} at ${skillPath}`,
             JSON.stringify({
               openleashEventType: "skill-risk",
+              skillEventType,
               skillName,
               skillPath,
               reasons: skillScan.reasons,
               contentPreview: contentPreview ?? "",
               purposeSummary,
-              openleashPluginRuns: [skillScan.run]
+              openleashPluginRuns: skillPluginRuns
             })
           ]
         );
@@ -3155,7 +3197,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       const event = await client.query(
         `insert into skill_events
          (organization_id, skill_id, evaluation_id, user_id, agent_kind, agent_name, scope, project_path, skill_name, skill_path, event_type, status, risk_score, reasons, content_preview, purpose_summary)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'changed', $11, $12, $13::jsonb, $14, $15)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16)
          returning *`,
         [
           organizationId,
@@ -3168,6 +3210,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           body.projectPath ?? null,
           skillName,
           skillPath,
+          skillEventType,
           status,
           skillScan.riskScore,
           JSON.stringify(skillScan.reasons),
@@ -3934,7 +3977,7 @@ function pluginCatalogItem(
 }
 
 async function savePluginSettingsForOrganization(organizationId: string, pluginId: string, body: Record<string, unknown>) {
-  const manifest = await manifestForPluginId(pluginId);
+  const manifest = await manifestForPluginId(pluginId, body.marketplace);
   if (!manifest) return undefined;
   const policy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
   const enabled = policy?.mandatory ? true : typeof body.enabled === "boolean" ? body.enabled : true;
@@ -3965,7 +4008,7 @@ async function savePluginSettingsForOrganization(organizationId: string, pluginI
 }
 
 async function savePluginSettingsForUser(organizationId: string, userId: string, pluginId: string, body: Record<string, unknown>) {
-  const manifest = await manifestForPluginId(pluginId);
+  const manifest = await manifestForPluginId(pluginId, body.marketplace);
   if (!manifest) return undefined;
   const [policy, marketplacePolicy, organizationSettings] = await Promise.all([
     readOrganizationPluginPolicy(organizationId),
@@ -4141,12 +4184,16 @@ function normalizedPluginRepositoryUrl(pluginId: string, slug: string, repositor
   return repositoryUrl;
 }
 
-async function manifestForPluginId(pluginId: string): Promise<OpenLeashPluginManifest | undefined> {
+async function manifestForPluginId(pluginId: string, marketplaceInput?: unknown): Promise<OpenLeashPluginManifest | undefined> {
   const firstParty = firstPartyPluginManifests.find((plugin) => plugin.id === pluginId);
   if (firstParty) return firstParty;
   const rows = await pool.query("select * from plugin_marketplace where plugin_id = $1 and review_status = 'approved'", [pluginId]);
   const listing = rows.rows[0] ? marketplaceListingFromRow(rows.rows[0]) : undefined;
-  return listing;
+  if (listing) return listing;
+  const imported = marketplaceListingFromInput(pluginId, marketplaceInput);
+  if (!imported) return undefined;
+  await upsertLocalMarketplaceListing(imported);
+  return imported;
 }
 
 async function installMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
@@ -4162,6 +4209,136 @@ async function installMarketplacePluginForUser(organizationId: string, userId: s
     config: manifest.defaultConfig ?? {},
     installedVersion: manifest.version
   });
+}
+
+function marketplaceListingFromInput(pluginId: string, input: unknown): PluginMarketplaceListing | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const value = input as Record<string, unknown>;
+  const id = optionalString(value.id);
+  if (!id || id !== pluginId) return undefined;
+  const name = optionalString(value.name) || optionalString(value.slug) || id;
+  const description = optionalString(value.description) || optionalString(value.shortDescription) || "OpenLeash plugin.";
+  const version = optionalString(value.version) || "0.0.0";
+  const publisher = optionalString(value.publisher) || "openleash";
+  const runtime = optionalString(value.runtime) as OpenLeashPluginManifest["runtime"] | undefined;
+  const entrypoint = optionalString(value.entrypoint);
+  if (!runtime || !entrypoint) return undefined;
+  const slug = slugify(optionalString(value.slug) || name || id);
+  const shortDescription = sentence(optionalString(value.shortDescription) || description);
+  const developerName = optionalString(value.developerName) || (publisher === "openleash" ? "OpenLeash" : titleize(publisher));
+  return {
+    id,
+    slug,
+    name,
+    description,
+    repositoryUrl: optionalString(value.repositoryUrl),
+    version,
+    publisher,
+    developerName,
+    developerUrl: optionalString(value.developerUrl),
+    source: (["first_party", "community", "private"].includes(String(value.source)) ? String(value.source) : publisher === "openleash" ? "first_party" : "community") as PluginMarketplaceListing["source"],
+    reviewStatus: "approved",
+    shortDescription,
+    longDescription: optionalString(value.longDescription) || description,
+    heroTagline: optionalString(value.heroTagline) || shortDescription,
+    packageUrl: optionalString(value.packageUrl),
+    documentationUrl: optionalString(value.documentationUrl),
+    runtime,
+    entrypoint,
+    events: arrayValue(value.events) as PluginMarketplaceListing["events"],
+    permissions: arrayValue(value.permissions) as PluginMarketplaceListing["permissions"],
+    effects: arrayValue(value.effects) as PluginMarketplaceListing["effects"],
+    ordering: objectValue(value.ordering) as PluginMarketplaceListing["ordering"],
+    configSchema: objectValue(value.configSchema) as PluginMarketplaceListing["configSchema"],
+    defaultConfig: objectValue(value.defaultConfig) ?? {},
+    tags: arrayValue(value.tags),
+    iconText: optionalString(value.iconText) || slug.slice(0, 2).toUpperCase() || "OL",
+    visualPng: optionalString(value.visualPng),
+    featuredRank: typeof value.featuredRank === "number" ? value.featuredRank : null,
+    seoTitle: optionalString(value.seoTitle) || `${slug} Plugin for OpenLeash`,
+    seoDescription: optionalString(value.seoDescription) || `Install ${slug} for OpenLeash. ${shortDescription}`
+  };
+}
+
+async function upsertLocalMarketplaceListing(plugin: PluginMarketplaceListing) {
+  await pool.query(
+    `insert into plugin_marketplace (
+       plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
+       source, review_status, short_description, long_description, hero_tagline, package_url,
+       repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
+       ordering, config_schema, default_config, tags, icon_text, visual_png,
+       featured_rank, seo_title, seo_description, updated_at
+     )
+     values (
+       $1, $2, $3, $4, $5, $6, $7, $8,
+       $9, 'approved', $10, $11, $12, $13,
+       $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20::jsonb,
+       $21::jsonb, $22::jsonb, $23::jsonb, $24::jsonb, $25, $26,
+       $27, $28, $29, now()
+     )
+     on conflict (plugin_id) do update set
+       slug = excluded.slug,
+       name = excluded.name,
+       description = excluded.description,
+       version = excluded.version,
+       publisher = excluded.publisher,
+       developer_name = excluded.developer_name,
+       developer_url = excluded.developer_url,
+       source = excluded.source,
+       review_status = 'approved',
+       short_description = excluded.short_description,
+       long_description = excluded.long_description,
+       hero_tagline = excluded.hero_tagline,
+       package_url = excluded.package_url,
+       repository_url = excluded.repository_url,
+       documentation_url = excluded.documentation_url,
+       runtime = excluded.runtime,
+       entrypoint = excluded.entrypoint,
+       events = excluded.events,
+       permissions = excluded.permissions,
+       effects = excluded.effects,
+       ordering = excluded.ordering,
+       config_schema = excluded.config_schema,
+       default_config = excluded.default_config,
+       tags = excluded.tags,
+       icon_text = excluded.icon_text,
+       visual_png = excluded.visual_png,
+       featured_rank = excluded.featured_rank,
+       seo_title = excluded.seo_title,
+       seo_description = excluded.seo_description,
+       updated_at = now()`,
+    [
+      plugin.id,
+      plugin.slug,
+      plugin.slug,
+      plugin.description,
+      plugin.version,
+      plugin.publisher,
+      plugin.developerName,
+      plugin.developerUrl ?? null,
+      plugin.source,
+      plugin.shortDescription,
+      plugin.longDescription,
+      plugin.heroTagline,
+      plugin.packageUrl ?? null,
+      plugin.repositoryUrl ?? null,
+      plugin.documentationUrl ?? null,
+      plugin.runtime,
+      plugin.entrypoint,
+      JSON.stringify(plugin.events),
+      JSON.stringify(plugin.permissions),
+      JSON.stringify(plugin.effects),
+      JSON.stringify(plugin.ordering ?? null),
+      JSON.stringify(plugin.configSchema ?? null),
+      JSON.stringify(plugin.defaultConfig ?? {}),
+      JSON.stringify(plugin.tags ?? []),
+      plugin.iconText,
+      plugin.visualPng ?? null,
+      plugin.featuredRank ?? null,
+      plugin.seoTitle,
+      plugin.seoDescription
+    ]
+  );
 }
 
 async function updateMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
@@ -7412,6 +7589,40 @@ function normalizeSkillReasons(value: unknown): Array<{ reason: string; quote?: 
   }).slice(0, 12);
 }
 
+type SkillObservationEventType = "detected" | "changed" | "seen" | "removed";
+
+function normalizeSkillObservationEventType(value: unknown): SkillObservationEventType | undefined {
+  return value === "detected" || value === "changed" || value === "seen" || value === "removed" ? value : undefined;
+}
+
+function inferSkillObservationEventType(
+  requested: SkillObservationEventType | undefined,
+  existing: { status?: string; content_hash?: string } | undefined,
+  contentHash: string
+): SkillObservationEventType {
+  if (requested === "removed") return "removed";
+  if (!existing || existing.status === "deleted") return "detected";
+  if (existing.content_hash && existing.content_hash !== contentHash) return "changed";
+  return "seen";
+}
+
+function pipelineEventForSkillObservation(eventType: SkillObservationEventType): Extract<PipelineEvent, "skill.detected" | "skill.changed" | "skill.removed"> {
+  if (eventType === "detected") return "skill.detected";
+  if (eventType === "removed") return "skill.removed";
+  return "skill.changed";
+}
+
+function normalizeSkillStatus(provided: unknown, existing?: string): "observed" | "approved" | "suspicious" {
+  if (provided === "suspicious" || provided === "approved" || provided === "observed") return provided;
+  if (existing === "suspicious" || existing === "approved" || existing === "observed") return existing;
+  return "observed";
+}
+
+function normalizeExistingSkillReasons(existing: unknown, fallback: Array<{ reason: string; quote?: string }>) {
+  const normalized = normalizeSkillReasons(existing);
+  return normalized.length ? normalized : fallback;
+}
+
 async function skillPurposeSummary({ provided, content, skillName }: { provided?: string; content: string; skillName: string; skillPath: string }) {
   const normalized = normalizeSkillPurpose(provided ?? "", skillName);
   if (normalized) return normalized;
@@ -7790,6 +8001,15 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
     return "client";
   }
 
+  return undefined;
+}
+
+function capabilityForRequest(method: string, requestPath: string): OpenLeashCapability | undefined {
+  const surface = surfaceForRequest(method, requestPath);
+  if (surface === "dashboard") return "dashboard";
+  if (requestPath === "/v1/enroll") return "deploymentTokens";
+  if (requestPath === "/public/plugins" || /^\/public\/plugins\/[^/]+$/.test(requestPath)) return "publicPluginCatalog";
+  if (requestPath === "/api/updates/check" || requestPath === "/api/updates/latest" || requestPath === "/api/admin/releases") return "desktopUpdates";
   return undefined;
 }
 

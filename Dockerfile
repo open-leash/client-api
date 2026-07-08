@@ -28,5 +28,6 @@ COPY --from=build /app/packages/shared/dist packages/shared/dist
 COPY --from=build /app/apps/client-api/dist apps/client-api/dist
 COPY --from=build /app/apps/client-api/infra apps/client-api/infra
 COPY infra infra
+COPY scripts/db-create-organization.mjs scripts/db-create-organization.mjs
 EXPOSE 9318 9319
 CMD ["node", "apps/client-api/dist/server.js"]
