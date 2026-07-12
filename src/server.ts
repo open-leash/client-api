@@ -16,6 +16,8 @@ import {
   type ConversationTurn,
   type EvaluationRequest,
   type EvaluationResponse,
+  type AgentEventSource,
+  type NormalizedAgentEvent,
   type HookAgentSlug,
   type HookEventName,
   type MobileAuthExchangeRequest,
@@ -35,7 +37,7 @@ import {
   type PluginRunRecord,
   type PluginSettingState,
   type Policy,
-  type PolicyDecision
+  type PolicyDecision,
 } from "@openleash/shared";
 import { z } from "zod";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
@@ -44,7 +46,7 @@ import {
   defaultPromptTransformConfig,
   normalizePromptTransformConfig,
   promptTransformsEnabled,
-  type PromptTransformConfig
+  type PromptTransformConfig,
 } from "./prompt-transforms.js";
 import { firstPartyPluginManifests } from "./plugins/registry.js";
 import { eventForHookEvent } from "./plugins/events.js";
@@ -60,7 +62,7 @@ import {
   externalProviderLabel,
   fetchConfiguredExternalConversations,
   listExternalConnectors,
-  type ExternalProvider
+  type ExternalProvider,
 } from "./external-agents.js";
 import {
   listProviderUsageConnections,
@@ -69,29 +71,43 @@ import {
   syncProviderUsage,
   upsertProviderUsageConnection,
   upsertProviderUsageBudget,
-  validateProviderConnection
+  validateProviderConnection,
 } from "./provider-usage.js";
 import {
   normalizeTenantModelProvider,
   readTenantModelKey,
-  upsertTenantModelKey
+  upsertTenantModelKey,
 } from "./model-keys.js";
 import {
   hasCapability,
   openLeashProductModeFromEnv,
   publicProductMode,
-  type OpenLeashCapability
+  type OpenLeashCapability,
 } from "./product-mode.js";
-import { assertReleaseAdmin, checkForClientUpdate, updateRequestSchema, upsertRelease } from "./releases.js";
+import {
+  assertReleaseAdmin,
+  checkForClientUpdate,
+  updateRequestSchema,
+  upsertRelease,
+} from "./releases.js";
+import {
+  normalizeAgentEvent,
+  OBSERVATION_ONLY_CAPABILITIES,
+} from "./agent-events.js";
 
 class HttpError extends Error {
-  constructor(public statusCode: number, message: string) {
+  constructor(
+    public statusCode: number,
+    message: string,
+  ) {
     super(message);
   }
 }
 
 export type ApiSurface = "client" | "dashboard" | "all";
-export type OpenLeashApiExtension = (context: OpenLeashApiContext) => void | Promise<void>;
+export type OpenLeashApiExtension = (
+  context: OpenLeashApiContext,
+) => void | Promise<void>;
 export type OpenLeashApiContext = {
   app: Express;
   surface: ApiSurface;
@@ -102,34 +118,71 @@ export type StartOpenLeashApiOptions = {
   port?: number;
   extensions?: OpenLeashApiExtension[];
 };
-export type PrepareOpenLeashApiOptions = Pick<StartOpenLeashApiOptions, "app" | "surface" | "extensions">;
+export type PrepareOpenLeashApiOptions = Pick<
+  StartOpenLeashApiOptions,
+  "app" | "surface" | "extensions"
+>;
 
 export const app = express();
+type NormalizedEventDecision =
+  EvaluationResponse | Awaited<ReturnType<typeof handlePromptOnlyHook>>;
+const inflightNormalizedEvents = new Map<
+  string,
+  Promise<NormalizedEventDecision>
+>();
+const pipelineTraceEnabled = process.env.OPENLEASH_PIPELINE_TRACE === "1";
+const pipelineTraceFile = process.env.OPENLEASH_PIPELINE_TRACE_FILE?.trim();
 export const apiSurface = apiSurfaceFromEnv();
 export const productMode = openLeashProductModeFromEnv();
-const LOCAL_HOOK_AGENT_METADATA: Record<string, { kind: AgentKind | string; displayName: string }> = {
+const LOCAL_HOOK_AGENT_METADATA: Record<
+  string,
+  { kind: AgentKind | string; displayName: string }
+> = {
   ...HOOK_AGENT_METADATA,
   gemini: { kind: "gemini", displayName: "Google Gemini CLI" },
-  opencode: { kind: "opencode", displayName: "OpenCode" }
+  opencode: { kind: "opencode", displayName: "OpenCode" },
 };
+const LOCAL_PROXY_PROMPT_AGENTS = new Set([
+  "claude-code",
+  "codex",
+  "opencode",
+  "nanoclaw",
+]);
 
 app.disable("x-powered-by");
-app.use(cors({
-  origin(origin, callback) {
-    if (isAllowedCorsOrigin(origin)) return callback(null, true);
-    return callback(new Error("origin is not allowed by OpenLeash CORS policy"));
-  },
-  credentials: false,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["authorization", "content-type", OPENLEASH_API_FUNCTION_HEADER, OPENLEASH_API_VERSION_HEADER]
-}));
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (isAllowedCorsOrigin(origin)) return callback(null, true);
+      return callback(
+        new Error("origin is not allowed by OpenLeash CORS policy"),
+      );
+    },
+    credentials: false,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "authorization",
+      "content-type",
+      OPENLEASH_API_FUNCTION_HEADER,
+      OPENLEASH_API_VERSION_HEADER,
+    ],
+  }),
+);
 app.use(express.json({ limit: "2mb" }));
 app.use((req, res, next) => {
   const routeSurface = surfaceForRequest(req.method, req.path);
-  if (apiSurface !== "all" && routeSurface && routeSurface !== "all" && routeSurface !== apiSurface) {
+  if (
+    apiSurface !== "all" &&
+    routeSurface &&
+    routeSurface !== "all" &&
+    routeSurface !== apiSurface
+  ) {
     return res.status(404).json({
       error: "not found",
-      service: apiSurface === "dashboard" ? "openleash-dashboard-api" : "openleash-api"
+      service:
+        apiSurface === "dashboard"
+          ? "openleash-dashboard-api"
+          : "openleash-api",
     });
   }
   return next();
@@ -139,7 +192,10 @@ app.use((req, res, next) => {
   if (capability && !hasCapability(productMode, capability)) {
     return res.status(404).json({
       error: "not found",
-      service: apiSurface === "dashboard" ? "openleash-dashboard-api" : "openleash-client-api"
+      service:
+        apiSurface === "dashboard"
+          ? "openleash-dashboard-api"
+          : "openleash-client-api",
     });
   }
   return next();
@@ -148,17 +204,25 @@ app.use((req, res, next) => {
   const functionName = apiFunctionForRequest(req.method, req.path);
   if (!functionName) return next();
   res.setHeader(OPENLEASH_API_FUNCTION_HEADER, functionName);
-  res.setHeader(OPENLEASH_API_VERSION_HEADER, OPENLEASH_API_CONTRACTS[functionName]);
+  res.setHeader(
+    OPENLEASH_API_VERSION_HEADER,
+    OPENLEASH_API_CONTRACTS[functionName],
+  );
   const requestedVersion = req.header(OPENLEASH_API_VERSION_HEADER);
-  const acceptsLegacyLocalHookVersion = functionName === "tenantHookEvaluate" &&
+  const acceptsLegacyLocalHookVersion =
+    functionName === "tenantHookEvaluate" &&
     /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(req.path) &&
     requestedVersion === OPENLEASH_API_CONTRACTS.localHookEvaluate;
-  if (requestedVersion && requestedVersion !== OPENLEASH_API_CONTRACTS[functionName] && !acceptsLegacyLocalHookVersion) {
+  if (
+    requestedVersion &&
+    requestedVersion !== OPENLEASH_API_CONTRACTS[functionName] &&
+    !acceptsLegacyLocalHookVersion
+  ) {
     return res.status(426).json({
       error: "unsupported OpenLeash API contract version",
       function: functionName,
       expectedVersion: OPENLEASH_API_CONTRACTS[functionName],
-      receivedVersion: requestedVersion
+      receivedVersion: requestedVersion,
     });
   }
   return next();
@@ -167,9 +231,13 @@ app.use(async (req, res, next) => {
   try {
     if (!requiresDashboardWriteSession(req)) return next();
     if (allowsLocalDashboardWriteBypass(req)) return next();
-    const session = await getDashboardSession(req.header("authorization") ?? "");
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
     if (!session || !["owner", "admin"].includes(session.user.role)) {
-      return res.status(401).json({ error: "dashboard admin session required" });
+      return res
+        .status(401)
+        .json({ error: "dashboard admin session required" });
     }
     return next();
   } catch (error) {
@@ -181,13 +249,13 @@ const eventSchema = z.object({
   computer: z.object({
     hostname: z.string(),
     platform: z.string(),
-    osRelease: z.string().optional()
+    osRelease: z.string().optional(),
   }),
   agent: z.object({
     kind: z.string(),
     displayName: z.string(),
     version: z.string().optional(),
-    executablePath: z.string().optional()
+    executablePath: z.string().optional(),
   }),
   event: z.object({
     eventName: z.string(),
@@ -199,17 +267,22 @@ const eventSchema = z.object({
     tool: z.any().optional(),
     prompt: z.string().optional(),
     raw: z.any().optional(),
-    occurredAt: z.string()
-  })
+    occurredAt: z.string(),
+  }),
 });
 
-app.get("/health", (_req, res) => res.json({
-  ok: true,
-  service: apiSurface === "dashboard" ? "openleash-dashboard-api" : "openleash-client-api",
-  surface: apiSurface,
-  productMode: publicProductMode(productMode),
-  apiContracts: OPENLEASH_API_CONTRACTS
-}));
+app.get("/health", (_req, res) =>
+  res.json({
+    ok: true,
+    service:
+      apiSurface === "dashboard"
+        ? "openleash-dashboard-api"
+        : "openleash-client-api",
+    surface: apiSurface,
+    productMode: publicProductMode(productMode),
+    apiContracts: OPENLEASH_API_CONTRACTS,
+  }),
+);
 
 app.get("/admin/prompt-transforms", async (req, res, next) => {
   try {
@@ -228,8 +301,60 @@ app.post("/admin/prompt-transforms", async (req, res, next) => {
       `insert into prompt_transform_settings (organization_id, config, updated_at)
        values ($1, $2, now())
        on conflict (organization_id) do update set config = excluded.config, updated_at = now()`,
-      [organizationId, JSON.stringify(config)]
+      [organizationId, JSON.stringify(config)],
     );
+    res.json({ ok: true, config });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/v1/client/prompt-transforms", async (req, res, next) => {
+  try {
+    const token = tokenFromRequest(req);
+    const user = token ? await getUserByToken(token) : undefined;
+    if (!user)
+      return res.status(401).json({ error: "invalid OpenLeash token" });
+    const organizationId =
+      user.organization_id ?? (await ensureDefaultOrganization()).id;
+    res.json({
+      config: await readPromptTransformConfig(organizationId, user.id),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/client/prompt-transforms", async (req, res, next) => {
+  try {
+    const token = tokenFromRequest(req);
+    const user = token ? await getUserByToken(token) : undefined;
+    if (!user)
+      return res.status(401).json({ error: "invalid OpenLeash token" });
+    const organizationId =
+      user.organization_id ?? (await ensureDefaultOrganization()).id;
+    const config = normalizePromptTransformConfig(req.body?.config ?? req.body);
+    await pool.query(
+      `insert into prompt_transform_settings (organization_id, config, updated_at)
+       values ($1, $2, now())
+       on conflict (organization_id) do update set config = excluded.config, updated_at = now()`,
+      [organizationId, JSON.stringify(config)],
+    );
+    await Promise.all([
+      savePluginSettingsForUser(
+        organizationId,
+        user.id,
+        "openleash.prompt-compression",
+        {
+          enabled: config.compression.enabled,
+          config: config.compression,
+        },
+      ),
+      savePluginSettingsForUser(organizationId, user.id, "openleash.dlp", {
+        enabled: config.dlp.enabled,
+        config: config.dlp,
+      }),
+    ]);
     res.json({ ok: true, config });
   } catch (error) {
     next(error);
@@ -241,7 +366,9 @@ app.post("/api/updates/check", async (req, res) => {
     const updateRequest = updateRequestSchema.parse(req.body);
     res.json(await checkForClientUpdate(updateRequest));
   } catch (error) {
-    res.status(400).json({ error: error instanceof Error ? error.message : "Invalid update request." });
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Invalid update request.",
+    });
   }
 });
 
@@ -253,7 +380,7 @@ app.get("/api/updates/latest", async (req, res) => {
     arch: firstQuery(req.query.arch) || "arm64",
     channel: firstQuery(req.query.channel) || "stable",
     installMode: firstQuery(req.query.installMode) || "personal",
-    updateSource: "latest-get"
+    updateSource: "latest-get",
   });
   res.json({
     version: response.latestVersion,
@@ -264,24 +391,31 @@ app.get("/api/updates/latest", async (req, res) => {
     notesUrl: response.notesUrl,
     releaseNotes: response.releaseNotes,
     publishedAt: response.publishedAt,
-    updateAvailable: response.updateAvailable
+    updateAvailable: response.updateAvailable,
   });
 });
 
 app.post("/api/admin/releases", async (req, res) => {
   try {
-    if (!assertReleaseAdmin(req)) return res.status(401).json({ error: "Unauthorized." });
+    if (!assertReleaseAdmin(req))
+      return res.status(401).json({ error: "Unauthorized." });
     const release = await upsertRelease(req.body);
     res.json({ ok: true, release });
   } catch (error) {
-    res.status(400).json({ error: error instanceof Error ? error.message : "Could not publish release." });
+    res.status(400).json({
+      error:
+        error instanceof Error ? error.message : "Could not publish release.",
+    });
   }
 });
 
 app.post("/v1/enroll", async (req, res, next) => {
   try {
-    const deploymentToken = String(req.body.deploymentToken ?? req.body.token ?? "").trim();
-    if (!deploymentToken) return res.status(401).json({ error: "missing deployment token" });
+    const deploymentToken = String(
+      req.body.deploymentToken ?? req.body.token ?? "",
+    ).trim();
+    if (!deploymentToken)
+      return res.status(401).json({ error: "missing deployment token" });
     const token = await pool.query<{
       id: string;
       label: string;
@@ -295,24 +429,37 @@ app.post("/v1/enroll", async (req, res, next) => {
          and revoked_at is null
          and (expires_at is null or expires_at > now())
        returning id, label, mode, tenant_url, mdm`,
-      [hashToken(deploymentToken)]
+      [hashToken(deploymentToken)],
     );
     const deployment = token.rows[0];
-    if (!deployment) return res.status(401).json({ error: "invalid or expired deployment token" });
+    if (!deployment)
+      return res
+        .status(401)
+        .json({ error: "invalid or expired deployment token" });
 
-    const hostname = String(req.body.hostname ?? os.hostname()).trim() || os.hostname();
+    const hostname =
+      String(req.body.hostname ?? os.hostname()).trim() || os.hostname();
     const platform = String(req.body.platform ?? "unknown");
-    const osRelease = typeof req.body.osRelease === "string" ? req.body.osRelease : null;
-    const displayName = String(req.body.displayName ?? req.body.userName ?? hostname).trim() || hostname;
-    const email = String(req.body.email ?? `${slug(displayName)}@managed.openleash.com`).toLowerCase();
+    const osRelease =
+      typeof req.body.osRelease === "string" ? req.body.osRelease : null;
+    const displayName =
+      String(req.body.displayName ?? req.body.userName ?? hostname).trim() ||
+      hostname;
+    const email = String(
+      req.body.email ?? `${slug(displayName)}@managed.openleash.com`,
+    ).toLowerCase();
     const agentToken = `ol_${crypto.randomBytes(24).toString("base64url")}`;
 
-    const user = await pool.query<{ id: string; email: string; display_name: string }>(
+    const user = await pool.query<{
+      id: string;
+      email: string;
+      display_name: string;
+    }>(
       `insert into users (email, display_name, role, token_hash)
        values ($1, $2, 'engineer', $3)
        on conflict (email) do update set display_name = excluded.display_name, token_hash = excluded.token_hash
        returning id, email, display_name`,
-      [email, displayName, hashToken(agentToken)]
+      [email, displayName, hashToken(agentToken)],
     );
     const computer = await pool.query<{ id: string }>(
       `insert into computers (user_id, hostname, platform, os_release, enrollment_token_id, enrolled_at, last_seen_at)
@@ -324,7 +471,7 @@ app.post("/v1/enroll", async (req, res, next) => {
          enrolled_at = coalesce(computers.enrolled_at, now()),
          last_seen_at = now()
        returning id`,
-      [user.rows[0].id, hostname, platform, osRelease, deployment.id]
+      [user.rows[0].id, hostname, platform, osRelease, deployment.id],
     );
 
     res.status(201).json({
@@ -334,7 +481,7 @@ app.post("/v1/enroll", async (req, res, next) => {
       token: agentToken,
       user: user.rows[0],
       computer: { id: computer.rows[0].id, hostname },
-      rulesManagedBy: "admin-dashboard"
+      rulesManagedBy: "admin-dashboard",
     });
   } catch (error) {
     next(error);
@@ -345,10 +492,143 @@ app.post("/v1/evaluate", async (req, res, next) => {
   try {
     const token = tokenFromRequest(req);
     const user = token ? await getUserByToken(token) : undefined;
-    if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
+    if (!user)
+      return res.status(401).json({ error: "invalid OpenLeash token" });
 
     const request = eventSchema.parse(req.body) as EvaluationRequest;
     res.json(await evaluateAndRecord(request, user));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/agent-events", async (req, res, next) => {
+  try {
+    const token = tokenFromRequest(req);
+    const user = token ? await getUserByToken(token) : undefined;
+    if (!user)
+      return res.status(401).json({ error: "invalid OpenLeash token" });
+    const source = String(req.body?.source ?? "") as AgentEventSource;
+    if (!["api_hook", "local_proxy", "provider_puller"].includes(source)) {
+      return res.status(400).json({
+        error: "source must be api_hook, local_proxy, or provider_puller",
+      });
+    }
+    const request = eventSchema.parse(req.body?.request) as EvaluationRequest;
+    await writePipelineTrace("ingress.raw", {
+      source,
+      provider: req.body?.provider,
+      agent: request.agent.kind,
+      event: request.event.eventName,
+      sessionId: request.event.sessionId,
+      payload: req.body,
+    });
+    const responseObservation =
+      source === "local_proxy" &&
+      Boolean(
+        (request.event.raw as { response?: unknown } | undefined)?.response,
+      ) &&
+      !Boolean((request.event.raw as { gated?: unknown } | undefined)?.gated);
+    const envelope = normalizeAgentEvent({
+      source,
+      provider: String(req.body?.provider || request.agent.kind),
+      request,
+      idempotencyKey:
+        typeof req.body?.idempotencyKey === "string"
+          ? req.body.idempotencyKey
+          : undefined,
+      correlationId:
+        typeof req.body?.correlationId === "string"
+          ? req.body.correlationId
+          : undefined,
+      capabilities: responseObservation
+        ? OBSERVATION_ONLY_CAPABILITIES
+        : undefined,
+    });
+    await writePipelineTrace("pipeline.normalized", {
+      traceId: envelope.idempotencyKey,
+      source,
+      provider: envelope.provider,
+      agent: envelope.request.agent.kind,
+      event: envelope.request.event.eventName,
+      sessionId: envelope.request.event.sessionId,
+      envelope,
+    });
+    const duplicate = await existingNormalizedEvent(
+      user.id,
+      envelope.idempotencyKey,
+    );
+    if (duplicate) {
+      await writePipelineTrace("pipeline.deduplicated", {
+        traceId: envelope.idempotencyKey,
+        source,
+        agent: envelope.request.agent.kind,
+        event: envelope.request.event.eventName,
+        decision: duplicate.decision,
+      });
+      return res.json({ ...duplicate, source, deduplicated: true });
+    }
+    const inflightKey = `${user.id}:${envelope.idempotencyKey}`;
+    const inflight = inflightNormalizedEvents.get(inflightKey);
+    if (inflight) {
+      const result = await inflight;
+      await writePipelineTrace("pipeline.deduplicated_inflight", {
+        traceId: envelope.idempotencyKey,
+        source,
+        agent: envelope.request.agent.kind,
+        event: envelope.request.event.eventName,
+        decision: "decision" in result ? result.decision : undefined,
+      });
+      return res.json({ ...result, source, deduplicated: true });
+    }
+    envelope.request.event.raw = attachEventEnvelope(
+      envelope.request.event.raw,
+      envelope,
+    );
+    const evaluation = (async (): Promise<NormalizedEventDecision> => {
+      if (source === "local_proxy" && isPromptOnlyHook(envelope.request)) {
+        return handlePromptOnlyHook(
+          request.agent.kind as HookAgentSlug,
+          request.event.eventName,
+          request,
+          user,
+          "proxy",
+        );
+      }
+      const decision = await evaluateAndRecord(envelope.request, user);
+      const gatedResponse =
+        source === "local_proxy" &&
+        Boolean((request.event.raw as { gated?: unknown } | undefined)?.gated);
+      return gatedResponse ? waitForHookDecision(user, decision) : decision;
+    })();
+    inflightNormalizedEvents.set(inflightKey, evaluation);
+    try {
+      const result = await evaluation;
+      const resultDecision = "decision" in result ? result.decision : undefined;
+      const gatedResponse = Boolean(
+        (request.event.raw as { gated?: unknown } | undefined)?.gated,
+      );
+      await writePipelineTrace("pipeline.final", {
+        traceId: envelope.idempotencyKey,
+        source,
+        provider: envelope.provider,
+        agent: envelope.request.agent.kind,
+        event: envelope.request.event.eventName,
+        sessionId: envelope.request.event.sessionId,
+        decision: resultDecision,
+        transportOutcome:
+          resultDecision === "allow"
+            ? gatedResponse
+              ? "provider_tool_bytes_released_to_agent"
+              : "request_released_to_provider"
+            : "intercepted_bytes_not_released",
+        result,
+      });
+      res.json({ ...result, source, deduplicated: false });
+    } finally {
+      if (inflightNormalizedEvents.get(inflightKey) === evaluation)
+        inflightNormalizedEvents.delete(inflightKey);
+    }
   } catch (error) {
     next(error);
   }
@@ -358,19 +638,105 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
   try {
     const token = tokenFromRequest(req);
     const user = token ? await getUserByToken(token) : undefined;
-    if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
+    if (!user)
+      return res.status(401).json({ error: "invalid OpenLeash token" });
     const agent = req.params.agent as HookAgentSlug;
     const eventName = req.params.event as HookEventName;
     if (!LOCAL_HOOK_AGENT_METADATA[agent] || !isHookEventName(eventName)) {
-      return res.status(400).json({ error: "unsupported OpenLeash hook target" });
+      return res
+        .status(400)
+        .json({ error: "unsupported OpenLeash hook target" });
     }
     const request = normalizeHookRequest(agent, eventName, req.body, req.query);
+    await writePipelineTrace("ingress.raw_hook", {
+      source: "api_hook",
+      provider: agent,
+      agent: request.agent.kind,
+      event: eventName,
+      sessionId: request.event.sessionId,
+      payload: req.body,
+      query: req.query,
+    });
+    const hookEnvelope = normalizeAgentEvent({
+      source: "api_hook",
+      provider: agent,
+      request,
+    });
+    await writePipelineTrace("pipeline.normalized_hook", {
+      traceId: hookEnvelope.idempotencyKey,
+      source: "api_hook",
+      provider: agent,
+      agent: request.agent.kind,
+      event: eventName,
+      sessionId: request.event.sessionId,
+      envelope: hookEnvelope,
+    });
+    if (
+      process.env.OPENLEASH_LOCAL_PROXY_AUTHORITATIVE === "1" &&
+      isPromptOnlyHook(request) &&
+      LOCAL_PROXY_PROMPT_AGENTS.has(String(request.agent.kind).toLowerCase())
+    ) {
+      const handoff: EvaluationResponse = {
+        decision: "allow",
+        decisionId: `local-proxy-handoff:${hookEnvelope.idempotencyKey}`,
+        summary:
+          "Prompt hook handed off to the authoritative local-proxy evaluation path.",
+        results: [],
+      };
+      await writePipelineTrace("pipeline.deferred_to_local_proxy", {
+        traceId: hookEnvelope.idempotencyKey,
+        source: "api_hook",
+        agent: request.agent.kind,
+        event: eventName,
+        sessionId: request.event.sessionId,
+        decision: "allow",
+        authoritativeSource: "local_proxy",
+      });
+      return res.json(nativeHookDecision(agent, eventName, handoff));
+    }
+    const duplicate = await existingNormalizedEvent(
+      user.id,
+      hookEnvelope.idempotencyKey,
+    );
+    if (duplicate) {
+      await writePipelineTrace("pipeline.deduplicated_hook", {
+        traceId: hookEnvelope.idempotencyKey,
+        source: "api_hook",
+        agent: request.agent.kind,
+        event: eventName,
+        decision: duplicate.decision,
+      });
+      return res.json(nativeHookDecision(agent, eventName, duplicate));
+    }
+    request.event.raw = attachEventEnvelope(request.event.raw, hookEnvelope);
     if (isPromptOnlyHook(request)) {
-      const transformed = await handlePromptOnlyHook(agent, eventName, request, user);
+      const transformed = await handlePromptOnlyHook(
+        agent,
+        eventName,
+        request,
+        user,
+      );
+      await writePipelineTrace("pipeline.final_hook", {
+        traceId: hookEnvelope.idempotencyKey,
+        source: "api_hook",
+        agent: request.agent.kind,
+        event: eventName,
+        sessionId: request.event.sessionId,
+        result: transformed,
+      });
       return res.json(transformed);
     }
     const decision = await evaluateAndRecord(request, user);
     const resolvedDecision = await waitForHookDecision(user, decision);
+    await writePipelineTrace("pipeline.final_hook", {
+      traceId: hookEnvelope.idempotencyKey,
+      source: "api_hook",
+      agent: request.agent.kind,
+      event: eventName,
+      sessionId: request.event.sessionId,
+      decision: resolvedDecision.decision,
+      result: resolvedDecision,
+    });
     res.json(nativeHookDecision(agent, eventName, resolvedDecision));
   } catch (error) {
     next(error);
@@ -398,7 +764,7 @@ app.get("/admin/external-agents", async (_req, res, next) => {
        left join evaluations ev on ev.conversation_event_id = latest.id
        where ar.kind = any($1)
        order by greatest(ar.last_seen_at, coalesce(latest.created_at, ar.last_seen_at)) desc`,
-      [EXTERNAL_PROVIDER_IDS]
+      [EXTERNAL_PROVIDER_IDS],
     );
     res.json({ connectors, known: known.rows });
   } catch (error) {
@@ -408,7 +774,10 @@ app.get("/admin/external-agents", async (_req, res, next) => {
 
 app.post("/admin/external-agents/sync", async (req, res, next) => {
   try {
-    const provider = typeof req.body?.provider === "string" ? req.body.provider as ExternalProvider : undefined;
+    const provider =
+      typeof req.body?.provider === "string"
+        ? (req.body.provider as ExternalProvider)
+        : undefined;
     const conversations = await fetchConfiguredExternalConversations(provider);
     const user = await ensureExternalUser(provider ?? "external-agents");
     const synced = [];
@@ -416,11 +785,28 @@ app.post("/admin/external-agents/sync", async (req, res, next) => {
     for (const conversation of conversations) {
       const key = externalEvaluationKey(conversation);
       if (await externalEventExists(key)) {
-        skipped.push({ provider: conversation.provider, sessionId: conversation.sessionId, reason: "already synced" });
+        skipped.push({
+          provider: conversation.provider,
+          sessionId: conversation.sessionId,
+          reason: "already synced",
+        });
         continue;
       }
-      const response = await evaluateAndRecord(externalConversationToEvaluation(conversation), user);
-      synced.push({ provider: conversation.provider, sessionId: conversation.sessionId, decisionId: response.decisionId, decision: response.decision });
+      const request = externalConversationToEvaluation(conversation);
+      const envelope = normalizeAgentEvent({
+        source: "provider_puller",
+        provider: conversation.provider,
+        request,
+        idempotencyKey: key,
+      });
+      request.event.raw = attachEventEnvelope(request.event.raw, envelope);
+      const response = await evaluateAndRecord(request, user);
+      synced.push({
+        provider: conversation.provider,
+        sessionId: conversation.sessionId,
+        decisionId: response.decisionId,
+        decision: response.decision,
+      });
     }
     res.json({ ok: true, synced, skipped, total: conversations.length });
   } catch (error) {
@@ -442,7 +828,9 @@ app.get("/admin/provider-usage", async (req, res, next) => {
 app.get("/admin/provider-usage/connections", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
-    res.json({ connections: await listProviderUsageConnections(organizationId) });
+    res.json({
+      connections: await listProviderUsageConnections(organizationId),
+    });
   } catch (error) {
     next(error);
   }
@@ -453,14 +841,22 @@ app.post("/admin/provider-usage/connections", async (req, res, next) => {
     const organizationId = await organizationIdForAdminRequest(req);
     const provider = normalizeUsageProvider(req.body?.provider);
     const apiKey = String(req.body?.apiKey ?? "").trim();
-    if (!provider) return res.status(400).json({ ok: false, message: "provider must be cursor, openai, or anthropic" });
-    if (!apiKey) return res.status(400).json({ ok: false, message: "apiKey is required" });
+    if (!provider)
+      return res.status(400).json({
+        ok: false,
+        message: "provider must be cursor, openai, or anthropic",
+      });
+    if (!apiKey)
+      return res.status(400).json({ ok: false, message: "apiKey is required" });
     const result = await upsertProviderUsageConnection({
       organizationId,
       provider,
       apiKey,
       label: typeof req.body?.label === "string" ? req.body.label : undefined,
-      externalOrgId: typeof req.body?.externalOrgId === "string" ? req.body.externalOrgId : undefined
+      externalOrgId:
+        typeof req.body?.externalOrgId === "string"
+          ? req.body.externalOrgId
+          : undefined,
     });
     if (!result.ok) return res.status(400).json(result);
     res.status(201).json(result);
@@ -473,7 +869,11 @@ app.post("/admin/provider-usage/validate", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
     const provider = normalizeUsageProvider(req.body?.provider);
-    if (!provider) return res.status(400).json({ ok: false, message: "provider must be cursor, openai, or anthropic" });
+    if (!provider)
+      return res.status(400).json({
+        ok: false,
+        message: "provider must be cursor, openai, or anthropic",
+      });
     const result = await validateProviderConnection(organizationId, provider);
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
@@ -489,7 +889,7 @@ app.post("/admin/provider-usage/budgets", async (req, res, next) => {
     const budget = await upsertProviderUsageBudget({
       organizationId,
       provider,
-      monthlyBudgetCents: Number(req.body?.monthlyBudgetCents ?? 0)
+      monthlyBudgetCents: Number(req.body?.monthlyBudgetCents ?? 0),
     });
     res.json({ ok: true, budget });
   } catch (error) {
@@ -506,7 +906,13 @@ app.post("/admin/provider-usage/sync", async (req, res, next) => {
       `insert into provider_usage_sync_jobs (organization_id, provider, status, triggered_by)
        values ($1, $2, 'running', $3)
        returning id`,
-      [organizationId, provider ?? null, typeof req.body?.triggeredBy === "string" ? req.body.triggeredBy : "manual"]
+      [
+        organizationId,
+        provider ?? null,
+        typeof req.body?.triggeredBy === "string"
+          ? req.body.triggeredBy
+          : "manual",
+      ],
     );
     const result = await syncProviderUsage(organizationId, provider);
     const records = result.synced.reduce((sum, item) => sum + item.events, 0);
@@ -514,17 +920,25 @@ app.post("/admin/provider-usage/sync", async (req, res, next) => {
       `update provider_usage_sync_jobs
        set status = $2, records = $3, error = $4, finished_at = now()
        where id = $1`,
-      [started.rows[0].id, result.ok ? "completed" : "partial", records, result.failed.map(item => `${item.provider}: ${item.error}`).join("; ") || null]
+      [
+        started.rows[0].id,
+        result.ok ? "completed" : "partial",
+        records,
+        result.failed
+          .map((item) => `${item.provider}: ${item.error}`)
+          .join("; ") || null,
+      ],
     );
     res.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown sync error";
+    const message =
+      error instanceof Error ? error.message : "Unknown sync error";
     if (started?.rows[0]?.id) {
       await pool.query(
         `update provider_usage_sync_jobs
          set status = 'failed', error = $2, finished_at = now()
          where id = $1`,
-        [started.rows[0].id, message]
+        [started.rows[0].id, message],
       );
     }
     next(error);
@@ -534,11 +948,22 @@ app.post("/admin/provider-usage/sync", async (req, res, next) => {
 app.post("/admin/evaluation-key", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
-    const provider = normalizeTenantModelProvider(req.body?.provider ?? req.body?.apiProvider);
+    const provider = normalizeTenantModelProvider(
+      req.body?.provider ?? req.body?.apiProvider,
+    );
     const apiKey = String(req.body?.apiKey ?? "").trim();
-    if (!provider) return res.status(400).json({ ok: false, error: "provider must be openai, anthropic, or deepseek" });
-    if (!apiKey) return res.status(400).json({ ok: false, error: "apiKey is required" });
-    const result = await upsertTenantModelKey({ organizationId, provider, apiKey });
+    if (!provider)
+      return res.status(400).json({
+        ok: false,
+        error: "provider must be openai, anthropic, or deepseek",
+      });
+    if (!apiKey)
+      return res.status(400).json({ ok: false, error: "apiKey is required" });
+    const result = await upsertTenantModelKey({
+      organizationId,
+      provider,
+      apiKey,
+    });
     res.json({ ok: true, ...result });
   } catch (error) {
     next(error);
@@ -547,11 +972,18 @@ app.post("/admin/evaluation-key", async (req, res, next) => {
 
 app.get("/admin/overview", async (req, res, next) => {
   try {
-      const session = await getDashboardSession(req.header("authorization") ?? "");
-      if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-      const dashboardRole = isDashboardAccessRole(session.user.role);
-      const scopeParams = [session.organization.id, session.user.id, dashboardRole];
-      const eventScope = `exists (
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const dashboardRole = isDashboardAccessRole(session.user.role);
+    const scopeParams = [
+      session.organization.id,
+      session.user.id,
+      dashboardRole,
+    ];
+    const eventScope = `exists (
           select 1
           from computers scope_c
           where scope_c.id = ce.computer_id
@@ -564,8 +996,18 @@ app.get("/admin/overview", async (req, res, next) => {
             )
             and ($3::boolean or scope_c.user_id = $2)
         )`;
-      const [metrics, sessionMetrics, agentSessions, usageSessions, agents, recent, policies, users] = await Promise.all([
-      pool.query(`select
+    const [
+      metrics,
+      sessionMetrics,
+      agentSessions,
+      usageSessions,
+      agents,
+      recent,
+      policies,
+      users,
+    ] = await Promise.all([
+      pool.query(
+        `select
         (select count(*)
          from computers c
          join users u on u.id = c.user_id
@@ -592,12 +1034,13 @@ app.get("/admin/overview", async (req, res, next) => {
          join computers c on c.id = ce.computer_id
          join users u on u.id = c.user_id
          where u.organization_id = $1 and ($3::boolean or c.user_id = $2) and e.decision = 'ask' and e.created_at > now() - interval '30 days') as questions`,
-        scopeParams
+        scopeParams,
       ),
       dashboardSessionMetrics(eventScope, scopeParams),
       dashboardAgentSessions(eventScope, scopeParams),
       dashboardUsageSessions(eventScope, scopeParams),
-      pool.query(`select ar.*, c.hostname, u.display_name as user_name
+      pool.query(
+        `select ar.*, c.hostname, u.display_name as user_name
         from agent_runtimes ar
         join computers c on c.id = ar.computer_id
         left join users u on u.id = c.user_id
@@ -605,9 +1048,10 @@ app.get("/admin/overview", async (req, res, next) => {
           and u.organization_id = $1
           and ($3::boolean or c.user_id = $2)
         order by ar.last_seen_at desc limit 20`,
-        scopeParams
+        scopeParams,
       ),
-      pool.query(`select e.id, e.decision, e.resolution, e.summary, e.question, e.created_at, ce.event_name, ce.tool_name, ce.project_path, ce.prompt,
+      pool.query(
+        `select e.id, e.decision, e.resolution, e.summary, e.question, e.created_at, ce.event_name, ce.tool_name, ce.project_path, ce.prompt,
           ar.kind as agent_kind, ar.display_name as agent_name, c.hostname, u.display_name as user_name,
           coalesce(triggered.items, '[]'::jsonb) as triggered_policies
         from evaluations e
@@ -645,10 +1089,16 @@ app.get("/admin/overview", async (req, res, next) => {
           )
           and ($3::boolean or c.user_id = $2)
         order by e.created_at desc limit 30`,
-        scopeParams
+        scopeParams,
       ),
-      pool.query(policyInventorySql("u.organization_id = $1 and ($3::boolean or e.user_id = $2)"), scopeParams),
-      pool.query(`select u.id, u.email, u.display_name, u.role, u.created_at,
+      pool.query(
+        policyInventorySql(
+          "u.organization_id = $1 and ($3::boolean or e.user_id = $2)",
+        ),
+        scopeParams,
+      ),
+      pool.query(
+        `select u.id, u.email, u.display_name, u.role, u.created_at,
           u.department, u.title as hr_title, u.idp_provider, u.status,
           count(distinct c.id) as endpoint_count,
           count(distinct ar.id) filter (where ar.kind not in ('openclaw', 'nanoclaw')) as agent_count,
@@ -662,19 +1112,21 @@ app.get("/admin/overview", async (req, res, next) => {
           and ($3::boolean or u.id = $2)
         group by u.id
         order by u.display_name asc`,
-        scopeParams
-      )
+        scopeParams,
+      ),
     ]);
     res.json({
       metrics: { ...metrics.rows[0], session_time: sessionMetrics.rows[0] },
       agents: agents.rows.map((agent) => ({
         ...agent,
-        sessions: agentSessions.rows.filter((session) => session.agent_runtime_id === agent.id).slice(0, 8)
+        sessions: agentSessions.rows
+          .filter((session) => session.agent_runtime_id === agent.id)
+          .slice(0, 8),
       })),
       recent: recent.rows,
       policies: policies.rows,
       users: users.rows,
-      usage: { sessions: usageSessions.rows }
+      usage: { sessions: usageSessions.rows },
     });
   } catch (error) {
     next(error);
@@ -686,7 +1138,15 @@ app.get("/admin/security", async (req, res, next) => {
     const organizationId = await organizationIdForAdminRequest(req);
     const days = Math.max(1, Math.min(180, Number(req.query.days ?? 30) || 30));
     const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const [summary, signals, byPlugin, byUser, usageByPlugin, usageByUser, correlations] = await Promise.all([
+    const [
+      summary,
+      signals,
+      byPlugin,
+      byUser,
+      usageByPlugin,
+      usageByUser,
+      correlations,
+    ] = await Promise.all([
       pool.query(
         `select
            count(*)::int as total_signals,
@@ -696,7 +1156,7 @@ app.get("/admin/security", async (req, res, next) => {
            count(distinct user_id)::int as affected_users
          from plugin_signals
          where organization_id = $1 and created_at >= $2`,
-        [organizationId, start]
+        [organizationId, start],
       ),
       pool.query(
         `select ps.id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary, ps.decision, ps.status,
@@ -713,7 +1173,7 @@ app.get("/admin/security", async (req, res, next) => {
          where ps.organization_id = $1 and ps.created_at >= $2
          order by ps.created_at desc
          limit 100`,
-        [organizationId, start]
+        [organizationId, start],
       ),
       pool.query(
         `select plugin_id, kind, severity, count(*)::int as count
@@ -721,7 +1181,7 @@ app.get("/admin/security", async (req, res, next) => {
          where organization_id = $1 and created_at >= $2
          group by plugin_id, kind, severity
          order by count desc, plugin_id asc`,
-        [organizationId, start]
+        [organizationId, start],
       ),
       pool.query(
         `select u.id as user_id, u.email, u.display_name as name,
@@ -734,7 +1194,7 @@ app.get("/admin/security", async (req, res, next) => {
          group by u.id, u.email, u.display_name
          order by high_count desc, signal_count desc
          limit 25`,
-        [organizationId, start]
+        [organizationId, start],
       ),
       pool.query(
         `select plugin_id, kind, coalesce(provider, 'plugin') as provider, coalesce(model, '') as model,
@@ -748,7 +1208,7 @@ app.get("/admin/security", async (req, res, next) => {
          group by plugin_id, kind, provider, model
          order by estimated_cost_cents desc, records desc
          limit 50`,
-        [organizationId, start]
+        [organizationId, start],
       ),
       pool.query(
         `select u.id as user_id, u.email, u.display_name as name,
@@ -764,7 +1224,7 @@ app.get("/admin/security", async (req, res, next) => {
          group by u.id, u.email, u.display_name
          order by estimated_cost_cents desc, records desc
          limit 25`,
-        [organizationId, start]
+        [organizationId, start],
       ),
       pool.query(
         `select key as correlation_key,
@@ -779,8 +1239,8 @@ app.get("/admin/security", async (req, res, next) => {
          having count(*) > 1 or count(distinct plugin_id) > 1
          order by plugin_count desc, signal_count desc, last_signal_at desc
          limit 30`,
-        [organizationId, start]
-      )
+        [organizationId, start],
+      ),
     ]);
     res.json({
       range: { days, since: start.toISOString() },
@@ -790,9 +1250,9 @@ app.get("/admin/security", async (req, res, next) => {
       byUser: byUser.rows,
       usage: {
         byPlugin: usageByPlugin.rows,
-        byUser: usageByUser.rows
+        byUser: usageByUser.rows,
       },
-      correlations: correlations.rows
+      correlations: correlations.rows,
     });
   } catch (error) {
     next(error);
@@ -803,7 +1263,10 @@ app.get("/admin/outcomes", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
     const days = Math.max(1, Math.min(365, Number(req.query.days ?? 30) || 30));
-    const limit = Math.max(1, Math.min(200, Number(req.query.limit ?? 80) || 80));
+    const limit = Math.max(
+      1,
+      Math.min(200, Number(req.query.limit ?? 80) || 80),
+    );
     const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const domain = normalizeOutcomeDomain(req.query.domain);
     const severity = normalizeOutcomeSeverity(req.query.severity);
@@ -850,7 +1313,7 @@ app.get("/admin/outcomes", async (req, res, next) => {
        where ${where.join(" and ")}
        order by ps.created_at desc
        limit $${limitIndex}`,
-      params
+      params,
     );
     const outcomes = rows.rows.map(signalRowToOutcome);
     const summary = outcomeSummary(outcomes);
@@ -863,8 +1326,16 @@ app.get("/admin/outcomes", async (req, res, next) => {
         plugins,
         outcomes,
         summary,
-        shellSections: ["overview", "agents", "activity", "approvals", "policies", "settings", "identity"]
-      })
+        shellSections: [
+          "overview",
+          "agents",
+          "activity",
+          "approvals",
+          "policies",
+          "settings",
+          "identity",
+        ],
+      }),
     });
   } catch (error) {
     next(error);
@@ -873,10 +1344,16 @@ app.get("/admin/outcomes", async (req, res, next) => {
 
 app.get("/v1/outcomes", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
     const days = Math.max(1, Math.min(365, Number(req.query.days ?? 30) || 30));
-    const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 40) || 40));
+    const limit = Math.max(
+      1,
+      Math.min(100, Number(req.query.limit ?? 40) || 40),
+    );
     const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const rows = await pool.query(
       `select ps.id, ps.organization_id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary,
@@ -899,16 +1376,19 @@ app.get("/v1/outcomes", async (req, res, next) => {
          and ps.created_at >= $3
        order by ps.created_at desc
        limit $4`,
-      [session.organization.id, session.user.id, start, limit]
+      [session.organization.id, session.user.id, start, limit],
     );
     const outcomes = rows.rows.map(signalRowToOutcome);
     const summary = outcomeSummary(outcomes);
-    const { plugins } = await pluginCatalogForOrganization(session.organization.id, session.user.id);
+    const { plugins } = await pluginCatalogForOrganization(
+      session.organization.id,
+      session.user.id,
+    );
     res.json({
       range: { days, since: start.toISOString() },
       summary,
       outcomes,
-      viewModel: buildOpenLeashClientViewModel({ plugins, outcomes, summary })
+      viewModel: buildOpenLeashClientViewModel({ plugins, outcomes, summary }),
     });
   } catch (error) {
     next(error);
@@ -925,23 +1405,25 @@ function signalRowToOutcome(row: any): OpenLeashOutcomeRecord {
     severity: normalizeSignalSeverity(row.severity),
     status: outcomeStatusForSignal(row.status, row.decision, row.kind),
     decision: row.decision ?? null,
-    occurredAt: new Date(row.occurred_at ?? row.created_at ?? Date.now()).toISOString(),
+    occurredAt: new Date(
+      row.occurred_at ?? row.created_at ?? Date.now(),
+    ).toISOString(),
     createdAt: new Date(row.created_at ?? Date.now()).toISOString(),
     source: {
       pluginId: String(row.plugin_id ?? "openleash"),
       label: outcomeSourceLabel(row.plugin_id),
-      kind: row.kind
+      kind: row.kind,
     },
     subject: normalizeOutcomeSubject(row.target),
     actor: {
       userId: row.user_id ?? null,
       name: row.user_name ?? null,
-      email: row.user_email ?? null
+      email: row.user_email ?? null,
     },
     agent: {
       kind: row.agent_kind ?? null,
       name: row.agent_name ?? null,
-      hostname: row.hostname ?? null
+      hostname: row.hostname ?? null,
     },
     context: {
       organizationId: row.organization_id,
@@ -951,27 +1433,42 @@ function signalRowToOutcome(row: any): OpenLeashOutcomeRecord {
       eventName: row.event_name ?? null,
       toolName: row.tool_name ?? null,
       projectPath: row.project_path ?? null,
-      correlationKeys: Array.isArray(row.correlation_keys) ? row.correlation_keys : []
+      correlationKeys: Array.isArray(row.correlation_keys)
+        ? row.correlation_keys
+        : [],
     },
     evidence: normalizeOutcomeEvidence(row.evidence),
-    details: row.details && typeof row.details === "object" ? row.details : {}
+    details: row.details && typeof row.details === "object" ? row.details : {},
   };
 }
 
 function outcomeSummary(outcomes: OpenLeashOutcomeRecord[]) {
   return {
     total: outcomes.length,
-    highSeverity: outcomes.filter((item) => item.severity === "high" || item.severity === "critical").length,
-    blocked: outcomes.filter((item) => item.status === "blocked" || item.decision === "blocked" || item.decision === "deny").length,
-    needsReview: outcomes.filter((item) => item.status === "needs_review" || item.decision === "ask").length,
+    highSeverity: outcomes.filter(
+      (item) => item.severity === "high" || item.severity === "critical",
+    ).length,
+    blocked: outcomes.filter(
+      (item) =>
+        item.status === "blocked" ||
+        item.decision === "blocked" ||
+        item.decision === "deny",
+    ).length,
+    needsReview: outcomes.filter(
+      (item) => item.status === "needs_review" || item.decision === "ask",
+    ).length,
     byDomain: outcomes.reduce<Record<string, number>>((acc, item) => {
       acc[item.domain] = (acc[item.domain] ?? 0) + 1;
       return acc;
-    }, {})
+    }, {}),
   };
 }
 
-async function userPluginOutcomes(organizationId: string, userId: string, options: { days?: number; limit?: number } = {}) {
+async function userPluginOutcomes(
+  organizationId: string,
+  userId: string,
+  options: { days?: number; limit?: number } = {},
+) {
   const days = Math.max(1, Math.min(365, Number(options.days ?? 30) || 30));
   const limit = Math.max(1, Math.min(100, Number(options.limit ?? 40) || 40));
   const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
@@ -996,20 +1493,35 @@ async function userPluginOutcomes(organizationId: string, userId: string, option
        and ps.created_at >= $3
      order by ps.created_at desc
      limit $4`,
-    [organizationId, userId, start, limit]
+    [organizationId, userId, start, limit],
   );
   return {
     range: { days, since: start.toISOString() },
-    outcomes: rows.rows.map(signalRowToOutcome)
+    outcomes: rows.rows.map(signalRowToOutcome),
   };
 }
 
-function outcomeDomainForSignal(kind: string, pluginId?: string): OpenLeashOutcomeDomain {
-  if (kind === "secret.detected" || pluginId === "openleash.dlp") return "data_protection";
-  if (kind === "tool.risk" || kind === "mcp.discovery" || pluginId === "openleash.mcp-scanner") return "tool_risk";
+function outcomeDomainForSignal(
+  kind: string,
+  pluginId?: string,
+): OpenLeashOutcomeDomain {
+  if (kind === "secret.detected" || pluginId === "openleash.dlp")
+    return "data_protection";
+  if (
+    kind === "tool.risk" ||
+    kind === "mcp.discovery" ||
+    pluginId === "openleash.mcp-scanner"
+  )
+    return "tool_risk";
   if (kind === "identity.risk") return "identity";
   if (kind === "export.status" || kind === "plugin.health") return "operations";
-  if (kind === "policy.decision" || kind === "security.finding" || pluginId === "openleash.rules-enforcer" || pluginId === "openleash.skill-scanner") return "security";
+  if (
+    kind === "policy.decision" ||
+    kind === "security.finding" ||
+    pluginId === "openleash.rules-enforcer" ||
+    pluginId === "openleash.skill-scanner"
+  )
+    return "security";
   return "compliance";
 }
 
@@ -1017,35 +1529,66 @@ function kindsForOutcomeDomain(domain: OpenLeashOutcomeDomain) {
   if (domain === "data_protection") return ["secret.detected"];
   if (domain === "tool_risk") return ["tool.risk", "mcp.discovery"];
   if (domain === "identity") return ["identity.risk"];
-  if (domain === "operations") return ["plugin.health", "export.status", "audit.event"];
+  if (domain === "operations")
+    return ["plugin.health", "export.status", "audit.event"];
   if (domain === "security") return ["security.finding", "policy.decision"];
-  return ["security.finding", "policy.decision", "approval.event", "audit.event"];
+  return [
+    "security.finding",
+    "policy.decision",
+    "approval.event",
+    "audit.event",
+  ];
 }
 
-function normalizeOutcomeDomain(value: unknown): OpenLeashOutcomeDomain | undefined {
+function normalizeOutcomeDomain(
+  value: unknown,
+): OpenLeashOutcomeDomain | undefined {
   const normalized = String(value ?? "").trim();
-  return ["security", "data_protection", "tool_risk", "identity", "cost", "productivity", "compliance", "operations"].includes(normalized)
-    ? normalized as OpenLeashOutcomeDomain
+  return [
+    "security",
+    "data_protection",
+    "tool_risk",
+    "identity",
+    "cost",
+    "productivity",
+    "compliance",
+    "operations",
+  ].includes(normalized)
+    ? (normalized as OpenLeashOutcomeDomain)
     : undefined;
 }
 
 function normalizeOutcomeSeverity(value: unknown) {
   const normalized = String(value ?? "").trim();
-  return ["info", "low", "medium", "high", "critical"].includes(normalized) ? normalized : undefined;
+  return ["info", "low", "medium", "high", "critical"].includes(normalized)
+    ? normalized
+    : undefined;
 }
 
 function normalizeSignalSeverity(value: unknown) {
   const normalized = String(value ?? "").trim();
-  return ["info", "low", "medium", "high", "critical"].includes(normalized) ? normalized as OpenLeashOutcomeRecord["severity"] : "info";
+  return ["info", "low", "medium", "high", "critical"].includes(normalized)
+    ? (normalized as OpenLeashOutcomeRecord["severity"])
+    : "info";
 }
 
-function outcomeStatusForSignal(status: unknown, decision: unknown, kind: string): OpenLeashOutcomeStatus {
+function outcomeStatusForSignal(
+  status: unknown,
+  decision: unknown,
+  kind: string,
+): OpenLeashOutcomeStatus {
   const statusText = String(status ?? "").toLowerCase();
   const decisionText = String(decision ?? "").toLowerCase();
   if (statusText === "masked") return "masked";
-  if (statusText === "blocked" || decisionText === "blocked" || decisionText === "deny") return "blocked";
+  if (
+    statusText === "blocked" ||
+    decisionText === "blocked" ||
+    decisionText === "deny"
+  )
+    return "blocked";
   if (statusText === "failed") return "failed";
-  if (statusText === "needs_question" || decisionText === "ask") return "needs_review";
+  if (statusText === "needs_question" || decisionText === "ask")
+    return "needs_review";
   if (statusText === "modified") return "modified";
   if (kind === "policy.decision" && !statusText) return "passed";
   return "observed";
@@ -1057,26 +1600,48 @@ function normalizeOutcomeSubject(value: unknown) {
   return {
     type: typeof target.type === "string" ? target.type : undefined,
     name: typeof target.name === "string" ? target.name : undefined,
-    id: typeof target.id === "string" ? target.id : undefined
+    id: typeof target.id === "string" ? target.id : undefined,
   };
 }
 
-function normalizeOutcomeEvidence(value: unknown): OpenLeashOutcomeRecord["evidence"] {
+function normalizeOutcomeEvidence(
+  value: unknown,
+): OpenLeashOutcomeRecord["evidence"] {
   const evidence = Array.isArray(value) ? value : [];
   return evidence.slice(0, 12).map((item, index) => {
-    if (typeof item === "string") return { label: `Evidence ${index + 1}`, value: item, kind: "text" as const };
+    if (typeof item === "string")
+      return {
+        label: `Evidence ${index + 1}`,
+        value: item,
+        kind: "text" as const,
+      };
     if (item && typeof item === "object") {
       const record = item as Record<string, unknown>;
-      const label = String(record.category ?? record.label ?? record.reason ?? `Evidence ${index + 1}`);
-      const value = record.quote ?? record.value ?? record.text ?? record.path ?? record.name ?? record.reason;
+      const label = String(
+        record.category ??
+          record.label ??
+          record.reason ??
+          `Evidence ${index + 1}`,
+      );
+      const value =
+        record.quote ??
+        record.value ??
+        record.text ??
+        record.path ??
+        record.name ??
+        record.reason;
       return {
         label,
         value: value === undefined ? undefined : String(value),
-        kind: record.path ? "path" as const : "text" as const,
-        sensitive: Boolean(record.sensitive)
+        kind: record.path ? ("path" as const) : ("text" as const),
+        sensitive: Boolean(record.sensitive),
       };
     }
-    return { label: `Evidence ${index + 1}`, value: String(item), kind: "text" as const };
+    return {
+      label: `Evidence ${index + 1}`,
+      value: String(item),
+      kind: "text" as const,
+    };
   });
 }
 
@@ -1086,9 +1651,11 @@ function outcomeSourceLabel(pluginId?: string | null) {
   if (value === "openleash.dlp") return "Data Protection";
   if (value === "openleash.mcp-scanner") return "MCP and Tool Risk";
   if (value === "openleash.skill-scanner") return "Skill Review";
-  if (value === "openleash.prompt-compression") return "Token Savings";
+  if (value === "openleash.prompt-compression") return "token-saver";
   if (value === "openleash.siem-exporter") return "SIEM Export";
-  return value.replace(/^openleash\./, "").replace(/[-_.]+/g, " ") || "OpenLeash";
+  return (
+    value.replace(/^openleash\./, "").replace(/[-_.]+/g, " ") || "OpenLeash"
+  );
 }
 
 function outcomeDomainLabel(domain: OpenLeashOutcomeDomain) {
@@ -1120,7 +1687,7 @@ function dashboardSessionMetrics(whereClause = "true", params: unknown[] = []) {
        coalesce(sum(duration_seconds) filter (where last_activity_at >= now() - interval '30 days'), 0)::int as month_seconds,
        count(*) filter (where last_activity_at >= now() - interval '30 days')::int as month_sessions
      from sessions`,
-    params
+    params,
   );
 }
 
@@ -1171,17 +1738,19 @@ function dashboardAgentSessions(whereClause = "true", params: unknown[] = []) {
        limit 1
      ) title_item on true
      order by sg.last_activity_at desc`,
-    params
+    params,
   );
 }
 
 function dashboardUsageSessions(whereClause = "true", params: unknown[] = []) {
-  return pool.query(
-    usageSessionsSql(whereClause, params, "limit 500")
-  );
+  return pool.query(usageSessionsSql(whereClause, params, "limit 500"));
 }
 
-function usageSessionsSql(whereClause: string, params: unknown[], limitClause: string) {
+function usageSessionsSql(
+  whereClause: string,
+  params: unknown[],
+  limitClause: string,
+) {
   return {
     text: `with session_groups as (
        select ce.agent_runtime_id,
@@ -1283,7 +1852,7 @@ function usageSessionsSql(whereClause: string, params: unknown[], limitClause: s
      ) title_item on true
      order by sg.last_activity_at desc
      ${limitClause}`,
-    values: params
+    values: params,
   };
 }
 
@@ -1324,7 +1893,7 @@ app.get("/admin/mcp-servers", async (_req, res, next) => {
        ) recent on true
        group by s.id, recent.items
        order by s.last_seen_at desc
-       limit 250`
+       limit 250`,
     );
     res.json({ servers: servers.rows });
   } catch (error) {
@@ -1342,7 +1911,7 @@ app.get("/admin/mcp-servers/:id", async (req, res, next) => {
          left join mcp_tool_calls c on c.mcp_server_id = s.id
          where s.id = $1
          group by s.id`,
-        [req.params.id]
+        [req.params.id],
       ),
       pool.query(
         `select c.id, c.server_name, c.tool_name, c.full_tool_name, c.arguments, c.argument_summary,
@@ -1359,10 +1928,11 @@ app.get("/admin/mcp-servers/:id", async (req, res, next) => {
          where c.mcp_server_id = $1
          order by c.occurred_at desc
          limit 100`,
-        [req.params.id]
-      )
+        [req.params.id],
+      ),
     ]);
-    if (!server.rows[0]) return res.status(404).json({ error: "MCP server not found" });
+    if (!server.rows[0])
+      return res.status(404).json({ error: "MCP server not found" });
     res.json({ server: server.rows[0], calls: calls.rows });
   } catch (error) {
     next(error);
@@ -1377,14 +1947,14 @@ app.get("/admin/skills", async (_req, res, next) => {
        left join users u on u.id = s.user_id
        where s.status <> 'deleted'
        order by s.updated_at desc
-       limit 500`
+       limit 500`,
     );
     const events = await pool.query(
       `select se.*, u.display_name as user_name
        from skill_events se
        left join users u on u.id = se.user_id
        order by se.created_at desc
-       limit 100`
+       limit 100`,
     );
     res.json({ skills: skills.rows, events: events.rows });
   } catch (error) {
@@ -1395,57 +1965,73 @@ app.get("/admin/skills", async (_req, res, next) => {
 app.get("/admin/onboarding", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
-    const [idp, groups, users, roles, tokens, providerUsage] = await Promise.all([
-      pool.query(
-        `select id, provider, enabled, last_sync_at, user_count, group_count, last_error, created_at, updated_at,
+    const [idp, groups, users, roles, tokens, providerUsage] =
+      await Promise.all([
+        pool.query(
+          `select id, provider, enabled, last_sync_at, user_count, group_count, last_error, created_at, updated_at,
                 config - array['ClientSecret','clientSecret','PrivateKey','privateKey','ApiToken','apiToken','AccessToken','accessToken','ServiceAccountJson','serviceAccountJson'] as config
          from idp_connections
          where organization_id = $1
          limit 1`,
-        [organization.id]
-      ),
-      pool.query(
-        `select g.id, g.name, g.description, g.idp_group_id, g.idp_provider,
+          [organization.id],
+        ),
+        pool.query(
+          `select g.id, g.name, g.description, g.idp_group_id, g.idp_provider,
                 count(gm.user_id) as member_count
          from identity_groups g
          left join identity_group_members gm on gm.group_id = g.id
          where g.organization_id = $1
          group by g.id
          order by g.name asc`,
-        [organization.id]
-      ),
-      pool.query(
-        `select id, email, display_name, role, first_name, last_name, department, title, idp_provider, status, last_login_at, created_at
+          [organization.id],
+        ),
+        pool.query(
+          `select id, email, display_name, role, first_name, last_name, department, title, idp_provider, status, last_login_at, created_at
          from users
          where organization_id = $1
          order by display_name asc
          limit 500`,
-        [organization.id]
-      ),
-      pool.query(
-        `select ra.id, ra.role, ra.user_id, ra.group_id, u.display_name as user_name, g.name as group_name
+          [organization.id],
+        ),
+        pool.query(
+          `select ra.id, ra.role, ra.user_id, ra.group_id, u.display_name as user_name, g.name as group_name
          from role_assignments ra
          left join users u on u.id = ra.user_id
          left join identity_groups g on g.id = ra.group_id
          where ra.organization_id = $1
          order by ra.role asc, coalesce(g.name, u.display_name) asc`,
-        [organization.id]
-      ),
-      pool.query(
-        `select id, label, mode, tenant_url, mdm, expires_at, revoked_at, created_at, last_used_at
+          [organization.id],
+        ),
+        pool.query(
+          `select id, label, mode, tenant_url, mdm, expires_at, revoked_at, created_at, last_used_at
          from deployment_tokens
          order by created_at desc
-         limit 10`
-      ),
-      pool.query(
-        `select
+         limit 10`,
+        ),
+        pool.query(
+          `select
            (select count(*)::int from provider_usage_connections where organization_id = $1 and enabled = true) as connection_count,
            (select count(*)::int from provider_usage_budgets where organization_id = $1 and enabled = true) as budget_count`,
-        [organization.id]
-      )
-    ]);
-    const deploymentMode = process.env.OPENLEASH_DEPLOYMENT_MODE ?? process.env.OPENLEASH_EDITION ?? organization.deployment_mode ?? "cloud";
-    res.json({ organization: { ...organization, deployment_mode: deploymentMode }, idp: idp.rows[0] ?? null, groups: groups.rows, users: users.rows, roles: roles.rows, deploymentTokens: tokens.rows, providerUsage: providerUsage.rows[0] ?? { connection_count: 0, budget_count: 0 } });
+          [organization.id],
+        ),
+      ]);
+    const deploymentMode =
+      process.env.OPENLEASH_DEPLOYMENT_MODE ??
+      process.env.OPENLEASH_EDITION ??
+      organization.deployment_mode ??
+      "cloud";
+    res.json({
+      organization: { ...organization, deployment_mode: deploymentMode },
+      idp: idp.rows[0] ?? null,
+      groups: groups.rows,
+      users: users.rows,
+      roles: roles.rows,
+      deploymentTokens: tokens.rows,
+      providerUsage: providerUsage.rows[0] ?? {
+        connection_count: 0,
+        budget_count: 0,
+      },
+    });
   } catch (error) {
     next(error);
   }
@@ -1454,13 +2040,14 @@ app.get("/admin/onboarding", async (req, res, next) => {
 app.get("/organizations/:slug", async (req, res, next) => {
   try {
     const organization = await getOrganizationBySlug(req.params.slug);
-    if (!organization) return res.status(404).json({ error: "Organization not found" });
+    if (!organization)
+      return res.status(404).json({ error: "Organization not found" });
     res.json({
       id: organization.id,
       name: organization.name,
       slug: organization.slug,
       setupCompleted: organization.setup_completed,
-      deploymentMode: organization.deployment_mode
+      deploymentMode: organization.deployment_mode,
     });
   } catch (error) {
     next(error);
@@ -1470,10 +2057,12 @@ app.get("/organizations/:slug", async (req, res, next) => {
 app.post("/organizations", async (req, res, next) => {
   try {
     const name = String(req.body.name ?? "").trim();
-    if (!name) return res.status(400).json({ error: "Organization name is required" });
+    if (!name)
+      return res.status(400).json({ error: "Organization name is required" });
     const requestedSlug = String(req.body.slug ?? "").trim();
     const slug = slugifyTenant(requestedSlug || name);
-    if (!slug) return res.status(400).json({ error: "Organization slug is required" });
+    if (!slug)
+      return res.status(400).json({ error: "Organization slug is required" });
     const result = await pool.query(
       `insert into organizations (name, slug, region, setup_completed, current_step, deployment_mode)
        values ($1, $2, $3, false, 1, $4)
@@ -1485,7 +2074,14 @@ app.post("/organizations", async (req, res, next) => {
          deployment_mode = excluded.deployment_mode,
          updated_at = now()
        returning id, name, slug, region, setup_completed, current_step, deployment_mode`,
-      [name, slug, req.body.region ?? null, normalizeDeploymentMode(req.body.deploymentMode ?? process.env.OPENLEASH_DEPLOYMENT_MODE)]
+      [
+        name,
+        slug,
+        req.body.region ?? null,
+        normalizeDeploymentMode(
+          req.body.deploymentMode ?? process.env.OPENLEASH_DEPLOYMENT_MODE,
+        ),
+      ],
     );
     res.status(201).json({ organization: result.rows[0] });
   } catch (error) {
@@ -1496,15 +2092,18 @@ app.post("/organizations", async (req, res, next) => {
 app.get("/organizations/:slug/sso-providers", async (req, res, next) => {
   try {
     const organization = await getOrganizationBySlug(req.params.slug);
-    if (!organization) return res.status(404).json({ error: "Organization not found" });
+    if (!organization)
+      return res.status(404).json({ error: "Organization not found" });
     const result = await pool.query(
       `select id, provider, enabled, config
        from idp_connections
        where organization_id = $1 and enabled = true
        order by updated_at desc`,
-      [organization.id]
+      [organization.id],
     );
-    const providers = result.rows.map((row) => ssoProviderFromIdp(row, organization.id)).filter(Boolean);
+    const providers = result.rows
+      .map((row) => ssoProviderFromIdp(row, organization.id))
+      .filter(Boolean);
     res.json({ providers });
   } catch (error) {
     next(error);
@@ -1515,17 +2114,36 @@ app.post("/auth/sso/authorize", async (req, res, next) => {
   try {
     const organizationId = String(req.body.organizationId ?? "").trim();
     const providerType = String(req.body.providerType ?? "").trim();
-    if (!organizationId || !providerType) return res.status(400).json({ error: "organizationId and providerType are required" });
+    if (!organizationId || !providerType)
+      return res
+        .status(400)
+        .json({ error: "organizationId and providerType are required" });
     const result = await pool.query(
       `select provider, config from idp_connections where organization_id = $1 and enabled = true limit 1`,
-      [organizationId]
+      [organizationId],
     );
-    const row = result.rows.find((item) => ssoProviderType(item.provider) === providerType) ?? result.rows[0];
-    if (!row) return res.status(404).json({ error: "SSO provider not found or disabled" });
-    const redirectUri = process.env.OPENLEASH_SSO_REDIRECT_URI ?? `${process.env.OPENLEASH_TENANT_URL ?? "http://localhost:9300"}/auth/sso/callback`;
+    const row =
+      result.rows.find(
+        (item) => ssoProviderType(item.provider) === providerType,
+      ) ?? result.rows[0];
+    if (!row)
+      return res
+        .status(404)
+        .json({ error: "SSO provider not found or disabled" });
+    const redirectUri =
+      process.env.OPENLEASH_SSO_REDIRECT_URI ??
+      `${process.env.OPENLEASH_TENANT_URL ?? "http://localhost:9300"}/auth/sso/callback`;
     const state = crypto.randomBytes(18).toString("base64url");
-    const authorizationUrl = await buildAuthorizationUrl(providerType, row.config ?? {}, redirectUri, state);
-    if (!authorizationUrl) return res.status(400).json({ error: `Unsupported provider type: ${providerType}` });
+    const authorizationUrl = await buildAuthorizationUrl(
+      providerType,
+      row.config ?? {},
+      redirectUri,
+      state,
+    );
+    if (!authorizationUrl)
+      return res
+        .status(400)
+        .json({ error: `Unsupported provider type: ${providerType}` });
     res.json({ authorizationUrl, state, providerType, organizationId });
   } catch (error) {
     next(error);
@@ -1536,33 +2154,70 @@ app.post("/auth/sso/callback", async (req, res, next) => {
   try {
     const organizationId = String(req.body.organizationId ?? "").trim();
     const providerType = String(req.body.providerType ?? "").trim();
-    const authorizationCode = String(req.body.authorizationCode ?? req.body.code ?? "").trim();
+    const authorizationCode = String(
+      req.body.authorizationCode ?? req.body.code ?? "",
+    ).trim();
     const redirectUri = String(req.body.redirectUri ?? "").trim();
-    if (!organizationId || !providerType || !authorizationCode || !redirectUri) {
-      return res.status(400).json({ success: false, message: "organizationId, providerType, authorizationCode, and redirectUri are required" });
+    if (
+      !organizationId ||
+      !providerType ||
+      !authorizationCode ||
+      !redirectUri
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "organizationId, providerType, authorizationCode, and redirectUri are required",
+      });
     }
 
     const providerResult = await pool.query(
       `select provider, config from idp_connections where organization_id = $1 and enabled = true`,
-      [organizationId]
+      [organizationId],
     );
-    const row = providerResult.rows.find((item) => ssoProviderType(item.provider) === providerType) ?? providerResult.rows[0];
-    if (!row) return res.status(404).json({ success: false, message: "SSO provider not found or disabled" });
+    const row =
+      providerResult.rows.find(
+        (item) => ssoProviderType(item.provider) === providerType,
+      ) ?? providerResult.rows[0];
+    if (!row)
+      return res.status(404).json({
+        success: false,
+        message: "SSO provider not found or disabled",
+      });
 
-    const organizationResult = await pool.query(`select id, name, slug, region from organizations where id = $1 limit 1`, [organizationId]);
+    const organizationResult = await pool.query(
+      `select id, name, slug, region from organizations where id = $1 limit 1`,
+      [organizationId],
+    );
     const organization = organizationResult.rows[0];
-    if (!organization) return res.status(404).json({ success: false, message: "Organization not found" });
+    if (!organization)
+      return res
+        .status(404)
+        .json({ success: false, message: "Organization not found" });
 
-    const tokenSet = await exchangeAuthorizationCode(providerType, row.config ?? {}, authorizationCode, redirectUri);
-    const profile = await fetchSsoProfile(providerType, row.config ?? {}, tokenSet);
-    if (!profile.email) return res.status(400).json({ success: false, message: "Identity provider did not return an email address" });
+    const tokenSet = await exchangeAuthorizationCode(
+      providerType,
+      row.config ?? {},
+      authorizationCode,
+      redirectUri,
+    );
+    const profile = await fetchSsoProfile(
+      providerType,
+      row.config ?? {},
+      tokenSet,
+    );
+    if (!profile.email)
+      return res.status(400).json({
+        success: false,
+        message: "Identity provider did not return an email address",
+      });
 
     const response = await createDashboardSessionFromProfile({
       organizationId,
       providerType,
       profile,
       provisionUser: false,
-      accountAudience: "organization"
+      accountAudience: "organization",
     });
     res.json(response);
   } catch (error) {
@@ -1573,7 +2228,10 @@ app.post("/auth/sso/callback", async (req, res, next) => {
 app.get("/auth/google/start", async (req, res) => {
   const finalRedirectUri = String(req.query.redirectUri ?? "").trim();
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
-    return res.status(400).json({ error: "redirectUri is required and must be an allowed OpenLeash dashboard URL" });
+    return res.status(400).json({
+      error:
+        "redirectUri is required and must be an allowed OpenLeash dashboard URL",
+    });
   }
   const exchangeRedirectUri = webGoogleRedirectUri(req);
   if (process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
@@ -1586,13 +2244,19 @@ app.get("/auth/google/start", async (req, res) => {
   const state = encodeMobileAuthState({
     nonce: crypto.randomBytes(18).toString("base64url"),
     finalRedirectUri,
-    exchangeRedirectUri
+    exchangeRedirectUri,
   });
-  const authorizationUrl = await buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
+  const authorizationUrl = await buildMobileGoogleAuthorizationUrl(
+    exchangeRedirectUri,
+    state,
+  );
   if (!authorizationUrl) {
     return res.status(501).json({
       error: "Managed Google login is not configured",
-      required: ["OPENLEASH_GOOGLE_CLIENT_ID", "OPENLEASH_GOOGLE_CLIENT_SECRET"]
+      required: [
+        "OPENLEASH_GOOGLE_CLIENT_ID",
+        "OPENLEASH_GOOGLE_CLIENT_SECRET",
+      ],
     });
   }
   res.redirect(302, authorizationUrl);
@@ -1601,7 +2265,10 @@ app.get("/auth/google/start", async (req, res) => {
 app.get("/auth/microsoft/start", async (req, res) => {
   const finalRedirectUri = String(req.query.redirectUri ?? "").trim();
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
-    return res.status(400).json({ error: "redirectUri is required and must be an allowed OpenLeash dashboard URL" });
+    return res.status(400).json({
+      error:
+        "redirectUri is required and must be an allowed OpenLeash dashboard URL",
+    });
   }
   const exchangeRedirectUri = webMicrosoftRedirectUri(req);
   if (process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
@@ -1614,13 +2281,21 @@ app.get("/auth/microsoft/start", async (req, res) => {
   const state = encodeMobileAuthState({
     nonce: crypto.randomBytes(18).toString("base64url"),
     finalRedirectUri,
-    exchangeRedirectUri
+    exchangeRedirectUri,
   });
-  const authorizationUrl = await buildAuthorizationUrl("azure_ad", cloudMicrosoftConfig(), exchangeRedirectUri, state);
+  const authorizationUrl = await buildAuthorizationUrl(
+    "azure_ad",
+    cloudMicrosoftConfig(),
+    exchangeRedirectUri,
+    state,
+  );
   if (!authorizationUrl) {
     return res.status(501).json({
       error: "Managed Microsoft 365 login is not configured",
-      required: ["OPENLEASH_MICROSOFT_CLIENT_ID", "OPENLEASH_MICROSOFT_CLIENT_SECRET"]
+      required: [
+        "OPENLEASH_MICROSOFT_CLIENT_ID",
+        "OPENLEASH_MICROSOFT_CLIENT_SECRET",
+      ],
     });
   }
   res.redirect(302, authorizationUrl);
@@ -1631,14 +2306,20 @@ app.get("/auth/google/callback", (req, res) => {
   const callbackState = decodeMobileAuthState(state);
   const finalRedirectUri = callbackState?.finalRedirectUri;
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
-    return res.status(400).send("OpenLeash sign-in could not continue because the return URL is invalid.");
+    return res
+      .status(400)
+      .send(
+        "OpenLeash sign-in could not continue because the return URL is invalid.",
+      );
   }
 
   const redirect = new URL(finalRedirectUri);
-  const exchangeRedirectUri = callbackState.exchangeRedirectUri ?? webGoogleRedirectUri(req);
+  const exchangeRedirectUri =
+    callbackState.exchangeRedirectUri ?? webGoogleRedirectUri(req);
   for (const key of ["code", "state", "error", "error_description"]) {
     const value = req.query[key];
-    if (typeof value === "string" && value) redirect.searchParams.set(key, value);
+    if (typeof value === "string" && value)
+      redirect.searchParams.set(key, value);
   }
   redirect.searchParams.set("exchangeRedirectUri", exchangeRedirectUri);
   res.redirect(302, redirect.toString());
@@ -1649,14 +2330,20 @@ app.get("/auth/microsoft/callback", (req, res) => {
   const callbackState = decodeMobileAuthState(state);
   const finalRedirectUri = callbackState?.finalRedirectUri;
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
-    return res.status(400).send("OpenLeash sign-in could not continue because the return URL is invalid.");
+    return res
+      .status(400)
+      .send(
+        "OpenLeash sign-in could not continue because the return URL is invalid.",
+      );
   }
 
   const redirect = new URL(finalRedirectUri);
-  const exchangeRedirectUri = callbackState.exchangeRedirectUri ?? webMicrosoftRedirectUri(req);
+  const exchangeRedirectUri =
+    callbackState.exchangeRedirectUri ?? webMicrosoftRedirectUri(req);
   for (const key of ["code", "state", "error", "error_description"]) {
     const value = req.query[key];
-    if (typeof value === "string" && value) redirect.searchParams.set(key, value);
+    if (typeof value === "string" && value)
+      redirect.searchParams.set(key, value);
   }
   redirect.searchParams.set("exchangeRedirectUri", exchangeRedirectUri);
   res.redirect(302, redirect.toString());
@@ -1664,7 +2351,9 @@ app.get("/auth/microsoft/callback", (req, res) => {
 
 app.get("/auth/session", async (req, res, next) => {
   try {
-    const session = await getDashboardSession(req.header("authorization") ?? "");
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
     if (!session) return res.status(401).json({ authenticated: false });
     const desktop = await pool.query(
       `select id, hostname, platform, os_release, enrolled_at, last_seen_at
@@ -1674,7 +2363,7 @@ app.get("/auth/session", async (req, res, next) => {
          and last_seen_at > now() - interval '90 days'
        order by last_seen_at desc
        limit 1`,
-      [session.user.id]
+      [session.user.id],
     );
     res.json({
       authenticated: true,
@@ -1683,8 +2372,8 @@ app.get("/auth/session", async (req, res, next) => {
       account: session.account,
       desktop: {
         connected: Boolean(desktop.rows[0]),
-        computer: desktop.rows[0] ?? null
-      }
+        computer: desktop.rows[0] ?? null,
+      },
     });
   } catch (error) {
     next(error);
@@ -1693,10 +2382,16 @@ app.get("/auth/session", async (req, res, next) => {
 
 app.get("/auth/account/outcomes", async (req, res, next) => {
   try {
-    const session = await getDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
     const days = Math.max(1, Math.min(365, Number(req.query.days ?? 30) || 30));
-    const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 40) || 40));
+    const limit = Math.max(
+      1,
+      Math.min(100, Number(req.query.limit ?? 40) || 40),
+    );
     const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const rows = await pool.query(
       `select ps.id, ps.organization_id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary,
@@ -1719,16 +2414,19 @@ app.get("/auth/account/outcomes", async (req, res, next) => {
          and ps.created_at >= $3
        order by ps.created_at desc
        limit $4`,
-      [session.organization.id, session.user.id, start, limit]
+      [session.organization.id, session.user.id, start, limit],
     );
     const outcomes = rows.rows.map(signalRowToOutcome);
     const summary = outcomeSummary(outcomes);
-    const { plugins } = await pluginCatalogForOrganization(session.organization.id, session.user.id);
+    const { plugins } = await pluginCatalogForOrganization(
+      session.organization.id,
+      session.user.id,
+    );
     res.json({
       range: { days, since: start.toISOString() },
       summary,
       outcomes,
-      viewModel: buildOpenLeashClientViewModel({ plugins, outcomes, summary })
+      viewModel: buildOpenLeashClientViewModel({ plugins, outcomes, summary }),
     });
   } catch (error) {
     next(error);
@@ -1739,7 +2437,10 @@ app.post("/auth/logout", async (req, res, next) => {
   try {
     const token = bearerToken(req.header("authorization") ?? "");
     if (token) {
-      await pool.query(`update dashboard_sessions set revoked_at = now() where token_hash = $1`, [hashToken(token)]);
+      await pool.query(
+        `update dashboard_sessions set revoked_at = now() where token_hash = $1`,
+        [hashToken(token)],
+      );
     }
     res.json({ success: true });
   } catch (error) {
@@ -1749,11 +2450,19 @@ app.post("/auth/logout", async (req, res, next) => {
 
 app.get("/v1/mobile/bootstrap", async (req, res, next) => {
   try {
-    const slug = String(req.query.organizationSlug ?? req.query.slug ?? "").trim();
+    const slug = String(
+      req.query.organizationSlug ?? req.query.slug ?? "",
+    ).trim();
     let organization = slug ? await getOrganizationBySlug(slug) : undefined;
     if (!organization && clientModeFromEnvironment() === "enterprise") {
-      const defaultSlug = String(process.env.OPENLEASH_MANAGED_MOBILE_ORG_SLUG ?? process.env.OPENLEASH_DEV_ORG_SLUG ?? "").trim();
-      organization = defaultSlug ? await getOrganizationBySlug(defaultSlug) : await ensureDefaultOrganization();
+      const defaultSlug = String(
+        process.env.OPENLEASH_MANAGED_MOBILE_ORG_SLUG ??
+          process.env.OPENLEASH_DEV_ORG_SLUG ??
+          "",
+      ).trim();
+      organization = defaultSlug
+        ? await getOrganizationBySlug(defaultSlug)
+        : await ensureDefaultOrganization();
     }
     const providers = organization
       ? await mobileProvidersForOrganization(organization.id, organization.slug)
@@ -1768,9 +2477,9 @@ app.get("/v1/mobile/bootstrap", async (req, res, next) => {
             id: organization.id,
             name: organization.name,
             slug: organization.slug,
-            region: "region" in organization ? organization.region : null
+            region: "region" in organization ? organization.region : null,
           }
-        : undefined
+        : undefined,
     });
   } catch (error) {
     next(error);
@@ -1780,9 +2489,15 @@ app.get("/v1/mobile/bootstrap", async (req, res, next) => {
 app.post("/v1/mobile/auth/start", async (req, res, next) => {
   try {
     const body = req.body as MobileAuthStartRequest;
-    const audience = body.audience === "organization" || body.organizationId || body.organizationSlug ? "organization" : "individual";
+    const audience =
+      body.audience === "organization" ||
+      body.organizationId ||
+      body.organizationSlug
+        ? "organization"
+        : "individual";
     const redirectUri = String(body.redirectUri ?? "").trim();
-    if (!redirectUri) return res.status(400).json({ error: "redirectUri is required" });
+    if (!redirectUri)
+      return res.status(400).json({ error: "redirectUri is required" });
 
     const organization = body.organizationId
       ? await getOrganizationById(body.organizationId)
@@ -1792,58 +2507,115 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
 
     if (organization) {
       const providerType = String(body.providerType ?? "").trim();
-      const provider = await configuredSsoProvider(organization.id, providerType);
-      if (!provider) return res.status(404).json({ error: "Identity provider is not configured for this organization" });
+      const provider = await configuredSsoProvider(
+        organization.id,
+        providerType,
+      );
+      if (!provider)
+        return res.status(404).json({
+          error: "Identity provider is not configured for this organization",
+        });
       const state = crypto.randomBytes(18).toString("base64url");
-      const authorizationUrl = await buildAuthorizationUrl(provider.providerType, provider.config, redirectUri, state);
-      if (!authorizationUrl) return res.status(400).json({ error: `Identity provider ${provider.providerType} is missing OAuth configuration` });
-      return res.json({ authorizationUrl, state, providerType: provider.providerType, organizationId: organization.id });
+      const authorizationUrl = await buildAuthorizationUrl(
+        provider.providerType,
+        provider.config,
+        redirectUri,
+        state,
+      );
+      if (!authorizationUrl)
+        return res.status(400).json({
+          error: `Identity provider ${provider.providerType} is missing OAuth configuration`,
+        });
+      return res.json({
+        authorizationUrl,
+        state,
+        providerType: provider.providerType,
+        organizationId: organization.id,
+      });
     }
 
     const requestedProviderType = String(body.providerType ?? "google").trim();
-    const providerType = normalizePublicCloudAuthProvider(requestedProviderType);
+    const providerType = normalizePublicCloudAuthProvider(
+      requestedProviderType,
+    );
     if (providerType === "github" && audience !== "individual") {
-      return res.status(400).json({ error: "GitHub sign-in is available for individual accounts only." });
+      return res.status(400).json({
+        error: "GitHub sign-in is available for individual accounts only.",
+      });
     }
     if (process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
-      const authorizationUrl = new URL("/v1/mobile/dev-auth/callback", publicApiUrl(req));
+      const authorizationUrl = new URL(
+        "/v1/mobile/dev-auth/callback",
+        publicApiUrl(req),
+      );
       authorizationUrl.searchParams.set("redirectUri", redirectUri);
       authorizationUrl.searchParams.set("audience", audience);
-      if (body.organizationId) authorizationUrl.searchParams.set("organizationId", body.organizationId);
-      if (body.organizationSlug) authorizationUrl.searchParams.set("organizationSlug", body.organizationSlug);
+      if (body.organizationId)
+        authorizationUrl.searchParams.set(
+          "organizationId",
+          body.organizationId,
+        );
+      if (body.organizationSlug)
+        authorizationUrl.searchParams.set(
+          "organizationSlug",
+          body.organizationSlug,
+        );
       return res.json({
         authorizationUrl: authorizationUrl.toString(),
         state: "development",
         providerType,
         exchangeRedirectUri: redirectUri,
         organizationId: body.organizationId,
-        development: true
+        development: true,
       });
     }
 
-    const exchangeRedirectUri = publicCloudAuthRedirectUri(req, providerType, redirectUri);
+    const exchangeRedirectUri = publicCloudAuthRedirectUri(
+      req,
+      providerType,
+      redirectUri,
+    );
     const state = encodeMobileAuthState({
       nonce: crypto.randomBytes(18).toString("base64url"),
       finalRedirectUri: redirectUri,
-      exchangeRedirectUri
+      exchangeRedirectUri,
     });
-    const authorizationUrl = providerType === "azure_ad"
-      ? await buildAuthorizationUrl("azure_ad", cloudMicrosoftConfig(), exchangeRedirectUri, state)
-      : providerType === "github"
-        ? await buildAuthorizationUrl("github", cloudGithubConfig(exchangeRedirectUri), exchangeRedirectUri, state)
-        : await buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
+    const authorizationUrl =
+      providerType === "azure_ad"
+        ? await buildAuthorizationUrl(
+            "azure_ad",
+            cloudMicrosoftConfig(),
+            exchangeRedirectUri,
+            state,
+          )
+        : providerType === "github"
+          ? await buildAuthorizationUrl(
+              "github",
+              cloudGithubConfig(exchangeRedirectUri),
+              exchangeRedirectUri,
+              state,
+            )
+          : await buildMobileGoogleAuthorizationUrl(exchangeRedirectUri, state);
     if (!authorizationUrl) {
       return res.status(501).json({
-        error: providerType === "azure_ad"
-          ? "Managed Microsoft 365 login is not configured"
-          : providerType === "github"
-            ? "Managed GitHub login is not configured"
-            : "Managed Google login is not configured",
-        required: providerType === "azure_ad"
-          ? ["OPENLEASH_MICROSOFT_CLIENT_ID", "OPENLEASH_MICROSOFT_CLIENT_SECRET"]
-          : providerType === "github"
-            ? ["OPENLEASH_GITHUB_CLIENT_ID", "OPENLEASH_GITHUB_CLIENT_SECRET"]
-            : ["OPENLEASH_GOOGLE_CLIENT_ID", "OPENLEASH_GOOGLE_CLIENT_SECRET"]
+        error:
+          providerType === "azure_ad"
+            ? "Managed Microsoft 365 login is not configured"
+            : providerType === "github"
+              ? "Managed GitHub login is not configured"
+              : "Managed Google login is not configured",
+        required:
+          providerType === "azure_ad"
+            ? [
+                "OPENLEASH_MICROSOFT_CLIENT_ID",
+                "OPENLEASH_MICROSOFT_CLIENT_SECRET",
+              ]
+            : providerType === "github"
+              ? ["OPENLEASH_GITHUB_CLIENT_ID", "OPENLEASH_GITHUB_CLIENT_SECRET"]
+              : [
+                  "OPENLEASH_GOOGLE_CLIENT_ID",
+                  "OPENLEASH_GOOGLE_CLIENT_SECRET",
+                ],
       });
     }
     res.json({ authorizationUrl, state, providerType, exchangeRedirectUri });
@@ -1853,10 +2625,17 @@ app.post("/v1/mobile/auth/start", async (req, res, next) => {
 });
 
 app.get("/v1/mobile/dev-auth/callback", (req, res) => {
-  if (process.env.OPENLEASH_MOBILE_DEV_AUTH !== "1") return res.status(404).send("Not found");
-  const redirectUri = String(req.query.redirectUri ?? desktopRedirectUriFallback()).trim();
+  if (process.env.OPENLEASH_MOBILE_DEV_AUTH !== "1")
+    return res.status(404).send("Not found");
+  const redirectUri = String(
+    req.query.redirectUri ?? desktopRedirectUriFallback(),
+  ).trim();
   if (!isAllowedAuthRedirectUri(redirectUri)) {
-    return res.status(400).send("OpenLeash sign-in could not continue because the return URL is invalid.");
+    return res
+      .status(400)
+      .send(
+        "OpenLeash sign-in could not continue because the return URL is invalid.",
+      );
   }
   const redirect = new URL(redirectUri);
   redirect.searchParams.set("code", "development");
@@ -1871,17 +2650,23 @@ app.get("/v1/auth/google/callback", (req, res) => {
   const callbackState = decodeMobileAuthState(state);
   const finalRedirectUri = callbackState?.finalRedirectUri;
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
-    return res.status(400).send("OpenLeash sign-in could not continue because the return URL is invalid.");
+    return res
+      .status(400)
+      .send(
+        "OpenLeash sign-in could not continue because the return URL is invalid.",
+      );
   }
 
   const redirect = new URL(finalRedirectUri);
   for (const key of ["code", "state", "error", "error_description"]) {
     const value = req.query[key];
-    if (typeof value === "string" && value) redirect.searchParams.set(key, value);
+    if (typeof value === "string" && value)
+      redirect.searchParams.set(key, value);
   }
   redirect.searchParams.set(
     "exchangeRedirectUri",
-    callbackState.exchangeRedirectUri ?? `${publicApiUrl(req)}/v1/auth/google/callback`
+    callbackState.exchangeRedirectUri ??
+      `${publicApiUrl(req)}/v1/auth/google/callback`,
   );
   res.redirect(302, redirect.toString());
 });
@@ -1891,17 +2676,23 @@ app.get("/v1/auth/microsoft/callback", (req, res) => {
   const callbackState = decodeMobileAuthState(state);
   const finalRedirectUri = callbackState?.finalRedirectUri;
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
-    return res.status(400).send("OpenLeash sign-in could not continue because the return URL is invalid.");
+    return res
+      .status(400)
+      .send(
+        "OpenLeash sign-in could not continue because the return URL is invalid.",
+      );
   }
 
   const redirect = new URL(finalRedirectUri);
   for (const key of ["code", "state", "error", "error_description"]) {
     const value = req.query[key];
-    if (typeof value === "string" && value) redirect.searchParams.set(key, value);
+    if (typeof value === "string" && value)
+      redirect.searchParams.set(key, value);
   }
   redirect.searchParams.set(
     "exchangeRedirectUri",
-    callbackState.exchangeRedirectUri ?? `${publicApiUrl(req)}/v1/auth/microsoft/callback`
+    callbackState.exchangeRedirectUri ??
+      `${publicApiUrl(req)}/v1/auth/microsoft/callback`,
   );
   res.redirect(302, redirect.toString());
 });
@@ -1911,17 +2702,23 @@ app.get("/v1/auth/github/callback", (req, res) => {
   const callbackState = decodeMobileAuthState(state);
   const finalRedirectUri = callbackState?.finalRedirectUri;
   if (!finalRedirectUri || !isAllowedAuthRedirectUri(finalRedirectUri)) {
-    return res.status(400).send("OpenLeash sign-in could not continue because the return URL is invalid.");
+    return res
+      .status(400)
+      .send(
+        "OpenLeash sign-in could not continue because the return URL is invalid.",
+      );
   }
 
   const redirect = new URL(finalRedirectUri);
   for (const key of ["code", "state", "error", "error_description"]) {
     const value = req.query[key];
-    if (typeof value === "string" && value) redirect.searchParams.set(key, value);
+    if (typeof value === "string" && value)
+      redirect.searchParams.set(key, value);
   }
   redirect.searchParams.set(
     "exchangeRedirectUri",
-    callbackState.exchangeRedirectUri ?? `${publicApiUrl(req)}/v1/auth/github/callback`
+    callbackState.exchangeRedirectUri ??
+      `${publicApiUrl(req)}/v1/auth/github/callback`,
   );
   res.redirect(302, redirect.toString());
 });
@@ -1929,105 +2726,218 @@ app.get("/v1/auth/github/callback", (req, res) => {
 app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
   try {
     const body = req.body as MobileAuthExchangeRequest;
-    const audience = body.audience === "organization" || body.organizationId || body.organizationSlug ? "organization" : "individual";
+    const audience =
+      body.audience === "organization" ||
+      body.organizationId ||
+      body.organizationSlug
+        ? "organization"
+        : "individual";
     const requestedProviderType = String(body.providerType ?? "").trim();
     const redirectUri = String(body.redirectUri ?? "").trim();
     const authorizationCode = String(body.authorizationCode ?? "").trim();
     const idToken = String(body.idToken ?? "").trim();
-    if (!redirectUri) return res.status(400).json({ success: false, message: "redirectUri is required" });
+    if (!redirectUri)
+      return res
+        .status(400)
+        .json({ success: false, message: "redirectUri is required" });
 
     const requestedOrganization = body.organizationId
       ? await getOrganizationById(body.organizationId)
       : body.organizationSlug
         ? await getOrganizationBySlug(body.organizationSlug)
         : undefined;
-    if ((body.organizationId || body.organizationSlug) && !requestedOrganization) return res.status(404).json({ success: false, message: "Organization not found" });
+    if (
+      (body.organizationId || body.organizationSlug) &&
+      !requestedOrganization
+    )
+      return res
+        .status(404)
+        .json({ success: false, message: "Organization not found" });
 
-    const developmentProviderType = normalizePublicCloudAuthProvider(requestedProviderType || "google");
-    const isDevelopmentMobileAuthCode = authorizationCode === "development" || authorizationCode === "dev-auth";
-    if ((developmentProviderType === "google" || developmentProviderType === "azure_ad" || developmentProviderType === "github") && (!authorizationCode || isDevelopmentMobileAuthCode) && !idToken && process.env.OPENLEASH_MOBILE_DEV_AUTH === "1") {
+    const developmentProviderType = normalizePublicCloudAuthProvider(
+      requestedProviderType || "google",
+    );
+    const isDevelopmentMobileAuthCode =
+      authorizationCode === "development" || authorizationCode === "dev-auth";
+    if (
+      (developmentProviderType === "google" ||
+        developmentProviderType === "azure_ad" ||
+        developmentProviderType === "github") &&
+      (!authorizationCode || isDevelopmentMobileAuthCode) &&
+      !idToken &&
+      process.env.OPENLEASH_MOBILE_DEV_AUTH === "1"
+    ) {
       const profile = {
         subject: "mobile-dev-user",
-        email: process.env.OPENLEASH_MOBILE_DEV_EMAIL ?? (requestedOrganization ? "ava.chen@example.com" : "mobile.user@openleash.com"),
-        name: process.env.OPENLEASH_MOBILE_DEV_NAME ?? (requestedOrganization ? "Ava Chen" : "Mobile User"),
+        email:
+          process.env.OPENLEASH_MOBILE_DEV_EMAIL ??
+          (requestedOrganization
+            ? "ava.chen@example.com"
+            : "mobile.user@openleash.com"),
+        name:
+          process.env.OPENLEASH_MOBILE_DEV_NAME ??
+          (requestedOrganization ? "Ava Chen" : "Mobile User"),
         givenName: requestedOrganization ? "Ava" : "Mobile",
         familyName: requestedOrganization ? "Chen" : "User",
-        raw: { development: true }
+        raw: { development: true },
       };
       if (
         audience === "organization" &&
         isPersonalEmailDomain(profile.email) &&
-        !(requestedOrganization && await canUseCloudOwnerLogin(requestedOrganization.id, profile.email))
+        !(
+          requestedOrganization &&
+          (await canUseCloudOwnerLogin(requestedOrganization.id, profile.email))
+        )
       ) {
-        return res.status(400).json({ success: false, message: "Use your company Google Workspace or Microsoft 365 account, not a personal email address." });
+        return res.status(400).json({
+          success: false,
+          message:
+            "Use your company Google Workspace or Microsoft 365 account, not a personal email address.",
+        });
       }
-      const provisionUser = requestedOrganization ? false : body.provisionUser !== false;
+      const provisionUser = requestedOrganization
+        ? false
+        : body.provisionUser !== false;
       const organization: ManagedOrganization = requestedOrganization
         ? { ...requestedOrganization }
         : provisionUser
-        ? await resolveManagedMobileOrganization(profile, audience)
+          ? await resolveManagedMobileOrganization(profile, audience)
           : await resolveExistingMobileOrganizationForProfile(profile);
       const response = await createDashboardSessionFromProfile({
         organizationId: organization.id,
         providerType: developmentProviderType,
         profile,
-        role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer",
+        role: requestedOrganization
+          ? organization.defaultUserRole
+          : audience === "organization"
+            ? "admin"
+            : "engineer",
         provisionUser,
-        accountAudience: audience
+        accountAudience: audience,
       });
       return res.json({ ...response, authMode: "development" });
     }
 
     const organizationSsoProvider = requestedOrganization
-      ? await configuredSsoProvider(requestedOrganization.id, requestedProviderType ? ssoProviderType(requestedProviderType) : undefined)
+      ? await configuredSsoProvider(
+          requestedOrganization.id,
+          requestedProviderType
+            ? ssoProviderType(requestedProviderType)
+            : undefined,
+        )
       : undefined;
     if (requestedOrganization && !organizationSsoProvider) {
-      return res.status(404).json({ success: false, message: "Identity provider is not configured for this organization" });
+      return res.status(404).json({
+        success: false,
+        message: "Identity provider is not configured for this organization",
+      });
     }
 
-    const providerType = organizationSsoProvider?.providerType ?? normalizePublicCloudAuthProvider(requestedProviderType || "google");
-    const organizationForProvider = requestedOrganization ?? (providerType === "google" || providerType === "azure_ad" || providerType === "github" ? undefined : await ensureManagedMobileOrganization());
-    const publicProviderType = providerType === "google" ? "google_workspace" : providerType;
-    const publicProviderConfig = providerType === "google"
+    const providerType =
+      organizationSsoProvider?.providerType ??
+      normalizePublicCloudAuthProvider(requestedProviderType || "google");
+    const organizationForProvider =
+      requestedOrganization ??
+      (providerType === "google" ||
+      providerType === "azure_ad" ||
+      providerType === "github"
+        ? undefined
+        : await ensureManagedMobileOrganization());
+    const publicProviderType =
+      providerType === "google" ? "google_workspace" : providerType;
+    const publicProviderConfig =
+      providerType === "google"
         ? mobileGoogleConfig()
         : providerType === "azure_ad"
           ? cloudMicrosoftConfig()
-        : providerType === "github"
-          ? cloudGithubConfig(redirectUri)
-        : {};
+          : providerType === "github"
+            ? cloudGithubConfig(redirectUri)
+            : {};
     const tokenSet = organizationSsoProvider
-      ? await exchangeAuthorizationCode(organizationSsoProvider.providerType, organizationSsoProvider.config, authorizationCode, redirectUri)
-      : providerType === "google" || providerType === "github" || (providerType === "azure_ad" && !requestedOrganization)
-      ? await exchangeAuthorizationCode(publicProviderType, publicProviderConfig, authorizationCode, redirectUri)
-      : await exchangeAuthorizationCode(providerType, {}, authorizationCode, redirectUri);
+      ? await exchangeAuthorizationCode(
+          organizationSsoProvider.providerType,
+          organizationSsoProvider.config,
+          authorizationCode,
+          redirectUri,
+        )
+      : providerType === "google" ||
+          providerType === "github" ||
+          (providerType === "azure_ad" && !requestedOrganization)
+        ? await exchangeAuthorizationCode(
+            publicProviderType,
+            publicProviderConfig,
+            authorizationCode,
+            redirectUri,
+          )
+        : await exchangeAuthorizationCode(
+            providerType,
+            {},
+            authorizationCode,
+            redirectUri,
+          );
 
     const profile = organizationSsoProvider
-      ? await fetchSsoProfile(organizationSsoProvider.providerType, organizationSsoProvider.config, idToken ? { id_token: idToken } : tokenSet)
-      : providerType === "google" || providerType === "github" || (providerType === "azure_ad" && !requestedOrganization)
-      ? await fetchSsoProfile(publicProviderType, publicProviderConfig, idToken ? { id_token: idToken } : tokenSet)
-      : await fetchSsoProfile(providerType, {}, idToken ? { id_token: idToken } : tokenSet);
-    if (!profile.email) return res.status(400).json({ success: false, message: "Identity provider did not return an email address" });
+      ? await fetchSsoProfile(
+          organizationSsoProvider.providerType,
+          organizationSsoProvider.config,
+          idToken ? { id_token: idToken } : tokenSet,
+        )
+      : providerType === "google" ||
+          providerType === "github" ||
+          (providerType === "azure_ad" && !requestedOrganization)
+        ? await fetchSsoProfile(
+            publicProviderType,
+            publicProviderConfig,
+            idToken ? { id_token: idToken } : tokenSet,
+          )
+        : await fetchSsoProfile(
+            providerType,
+            {},
+            idToken ? { id_token: idToken } : tokenSet,
+          );
+    if (!profile.email)
+      return res.status(400).json({
+        success: false,
+        message: "Identity provider did not return an email address",
+      });
     if (
       audience === "organization" &&
       isPersonalEmailDomain(profile.email) &&
-      !(requestedOrganization && await canUseCloudOwnerLogin(requestedOrganization.id, profile.email))
+      !(
+        requestedOrganization &&
+        (await canUseCloudOwnerLogin(requestedOrganization.id, profile.email))
+      )
     ) {
-      return res.status(400).json({ success: false, message: "Use your company Google Workspace or Microsoft 365 account, not a personal email address." });
+      return res.status(400).json({
+        success: false,
+        message:
+          "Use your company Google Workspace or Microsoft 365 account, not a personal email address.",
+      });
     }
 
-    const provisionUser = requestedOrganization ? false : body.provisionUser !== false;
+    const provisionUser = requestedOrganization
+      ? false
+      : body.provisionUser !== false;
     const organization: ManagedOrganization = requestedOrganization
       ? { ...requestedOrganization }
       : provisionUser
-        ? (providerType === "google" || providerType === "azure_ad" || providerType === "github" ? await resolveManagedMobileOrganization(profile, audience) : organizationForProvider!)
+        ? providerType === "google" ||
+          providerType === "azure_ad" ||
+          providerType === "github"
+          ? await resolveManagedMobileOrganization(profile, audience)
+          : organizationForProvider!
         : await resolveExistingMobileOrganizationForProfile(profile);
     const response = await createDashboardSessionFromProfile({
       organizationId: organization.id,
       providerType,
       profile,
-      role: requestedOrganization ? organization.defaultUserRole : audience === "organization" ? "admin" : "engineer",
+      role: requestedOrganization
+        ? organization.defaultUserRole
+        : audience === "organization"
+          ? "admin"
+          : "engineer",
       provisionUser,
-      accountAudience: audience
+      accountAudience: audience,
     });
     res.json({ ...response, authMode: providerType });
   } catch (error) {
@@ -2037,13 +2947,25 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
 
 app.post("/v1/mobile/model-key", async (req, res, next) => {
   try {
-    const session = await getDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const provider = normalizeTenantModelProvider(req.body.provider ?? req.body.apiProvider);
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const provider = normalizeTenantModelProvider(
+      req.body.provider ?? req.body.apiProvider,
+    );
     const apiKey = String(req.body.apiKey ?? "").trim();
-    if (!provider) return res.status(400).json({ error: "provider must be openai, anthropic, or deepseek" });
+    if (!provider)
+      return res
+        .status(400)
+        .json({ error: "provider must be openai, anthropic, or deepseek" });
     if (!apiKey) return res.status(400).json({ error: "apiKey is required" });
-    const result = await upsertTenantModelKey({ organizationId: session.organization.id, provider, apiKey });
+    const result = await upsertTenantModelKey({
+      organizationId: session.organization.id,
+      provider,
+      apiKey,
+    });
     res.json({ ok: true, ...result });
   } catch (error) {
     next(error);
@@ -2052,8 +2974,11 @@ app.post("/v1/mobile/model-key", async (req, res, next) => {
 
 app.post("/v1/mobile/devices", async (req, res, next) => {
   try {
-    const session = await getDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
     const body = req.body as MobileDeviceRegisterRequest;
     const result = await pool.query(
       `insert into mobile_devices (organization_id, user_id, platform, push_token, device_name, app_version, last_seen_at)
@@ -2070,8 +2995,8 @@ app.post("/v1/mobile/devices", async (req, res, next) => {
         body.platform ?? "unknown",
         String(body.pushToken ?? `${session.user.id}:manual`).trim(),
         body.deviceName ?? null,
-        body.appVersion ?? null
-      ]
+        body.appVersion ?? null,
+      ],
     );
     res.status(201).json({ device: result.rows[0] });
   } catch (error) {
@@ -2081,12 +3006,20 @@ app.post("/v1/mobile/devices", async (req, res, next) => {
 
 app.post("/v1/desktop/enroll", async (req, res, next) => {
   try {
-    const session = await getDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const hostname = String(req.body?.hostname ?? os.hostname()).trim() || os.hostname();
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const hostname =
+      String(req.body?.hostname ?? os.hostname()).trim() || os.hostname();
     const platform = String(req.body?.platform ?? "unknown");
-    const osRelease = typeof req.body?.osRelease === "string" ? req.body.osRelease : null;
-    const clientVersion = typeof req.body?.clientVersion === "string" ? req.body.clientVersion : null;
+    const osRelease =
+      typeof req.body?.osRelease === "string" ? req.body.osRelease : null;
+    const clientVersion =
+      typeof req.body?.clientVersion === "string"
+        ? req.body.clientVersion
+        : null;
     const agents = normalizeEnrollmentAgents(req.body?.agents);
     const agentToken = `ol_${crypto.randomBytes(24).toString("base64url")}`;
     const user = await pool.query(
@@ -2094,9 +3027,10 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
        set token_hash = $2, status = 'active', last_login_at = now()
        where id = $1 and organization_id = $3
        returning id, email, display_name, organization_id`,
-      [session.user.id, hashToken(agentToken), session.organization.id]
+      [session.user.id, hashToken(agentToken), session.organization.id],
     );
-    if (!user.rows[0]) return res.status(404).json({ error: "session user not found" });
+    if (!user.rows[0])
+      return res.status(404).json({ error: "session user not found" });
     const computer = await pool.query(
       `insert into computers (user_id, hostname, platform, os_release, enrolled_at, last_seen_at)
        values ($1, $2, $3, $4, now(), now())
@@ -2106,9 +3040,13 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
          enrolled_at = coalesce(computers.enrolled_at, now()),
          last_seen_at = now()
        returning id, hostname, platform, os_release, enrolled_at, last_seen_at`,
-      [session.user.id, hostname, platform, osRelease]
+      [session.user.id, hostname, platform, osRelease],
     );
-    await upsertDesktopAgentInventory(computer.rows[0].id, agents, clientVersion);
+    await upsertDesktopAgentInventory(
+      computer.rows[0].id,
+      agents,
+      clientVersion,
+    );
     res.status(201).json({
       token: agentToken,
       user: user.rows[0],
@@ -2116,7 +3054,7 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
       agents,
       organization: session.organization,
       clientVersion,
-      rulesManagedBy: "openleash-cloud"
+      rulesManagedBy: "openleash-cloud",
     });
   } catch (error) {
     next(error);
@@ -2125,11 +3063,16 @@ app.post("/v1/desktop/enroll", async (req, res, next) => {
 
 app.post("/v1/desktop/agents", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const hostname = String(req.body?.hostname ?? os.hostname()).trim() || os.hostname();
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const hostname =
+      String(req.body?.hostname ?? os.hostname()).trim() || os.hostname();
     const platform = String(req.body?.platform ?? "unknown");
-    const osRelease = typeof req.body?.osRelease === "string" ? req.body.osRelease : null;
+    const osRelease =
+      typeof req.body?.osRelease === "string" ? req.body.osRelease : null;
     const agents = normalizeEnrollmentAgents(req.body?.agents);
     const computer = await pool.query(
       `insert into computers (user_id, hostname, platform, os_release, enrolled_at, last_seen_at)
@@ -2140,10 +3083,17 @@ app.post("/v1/desktop/agents", async (req, res, next) => {
          enrolled_at = coalesce(computers.enrolled_at, now()),
          last_seen_at = now()
        returning id, hostname, platform, os_release, enrolled_at, last_seen_at`,
-      [session.user.id, hostname, platform, osRelease]
+      [session.user.id, hostname, platform, osRelease],
     );
-    const clientVersion = typeof req.body?.clientVersion === "string" ? req.body.clientVersion : null;
-    await upsertDesktopAgentInventory(computer.rows[0].id, agents, clientVersion);
+    const clientVersion =
+      typeof req.body?.clientVersion === "string"
+        ? req.body.clientVersion
+        : null;
+    await upsertDesktopAgentInventory(
+      computer.rows[0].id,
+      agents,
+      clientVersion,
+    );
     res.json({ ok: true, computer: computer.rows[0], agents });
   } catch (error) {
     next(error);
@@ -2152,8 +3102,11 @@ app.post("/v1/desktop/agents", async (req, res, next) => {
 
 app.post("/v1/agents/:kind/monitoring", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
     const kind = normalizeAgentKindForSettings(req.params.kind);
     if (!kind) return res.status(400).json({ error: "agent kind is required" });
     const monitored = Boolean(req.body?.monitored);
@@ -2164,7 +3117,7 @@ app.post("/v1/agents/:kind/monitoring", async (req, res, next) => {
          organization_id = excluded.organization_id,
          monitored = excluded.monitored,
          updated_at = now()`,
-      [session.user.id, session.organization.id, kind, monitored]
+      [session.user.id, session.organization.id, kind, monitored],
     );
     res.json({ kind, monitored });
   } catch (error) {
@@ -2172,7 +3125,11 @@ app.post("/v1/agents/:kind/monitoring", async (req, res, next) => {
   }
 });
 
-async function upsertDesktopAgentInventory(computerId: string, agents: ReturnType<typeof normalizeEnrollmentAgents>, clientVersion?: string | null) {
+async function upsertDesktopAgentInventory(
+  computerId: string,
+  agents: ReturnType<typeof normalizeEnrollmentAgents>,
+  clientVersion?: string | null,
+) {
   for (const agent of agents) {
     await pool.query(
       `insert into agent_runtimes (computer_id, kind, display_name, executable_path, version, installed, protected, detail, last_seen_at)
@@ -2184,13 +3141,25 @@ async function upsertDesktopAgentInventory(computerId: string, agents: ReturnTyp
          protected = excluded.protected,
          detail = excluded.detail,
          last_seen_at = now()`,
-      [computerId, agent.kind, agent.displayName, agent.executablePath, clientVersion, agent.installed, agent.protected, agent.detail || null]
+      [
+        computerId,
+        agent.kind,
+        agent.displayName,
+        agent.executablePath,
+        clientVersion,
+        agent.installed,
+        agent.protected,
+        agent.detail || null,
+      ],
     );
   }
 }
 
 function normalizeAgentKindForSettings(value: unknown) {
-  const text = String(value ?? "").trim().toLowerCase().replace(/_/g, "-");
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, "-");
   if (!text) return "";
   if (text.includes("claude")) return "claude-code";
   if (text.includes("copilot")) return "github-copilot";
@@ -2207,26 +3176,53 @@ function normalizeEnrollmentAgents(value: unknown) {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
   return value.flatMap((item) => {
-    const kind = typeof item === "string" ? item : String((item as { kind?: unknown })?.kind ?? "");
+    const kind =
+      typeof item === "string"
+        ? item
+        : String((item as { kind?: unknown })?.kind ?? "");
     const cleanKind = kind.trim().toLowerCase();
     if (!cleanKind || seen.has(cleanKind)) return [];
     seen.add(cleanKind);
-    const displayName = typeof item === "object" && item && typeof (item as { displayName?: unknown }).displayName === "string"
-      ? (item as { displayName: string }).displayName.trim()
-      : "";
-    const executablePath = typeof item === "object" && item && typeof (item as { executablePath?: unknown }).executablePath === "string"
-      ? (item as { executablePath: string }).executablePath.trim()
-      : "";
-    const installed = typeof item === "object" && item && typeof (item as { installed?: unknown }).installed === "boolean"
-      ? Boolean((item as { installed: boolean }).installed)
-      : true;
-    const protectedByOpenLeash = typeof item === "object" && item && typeof (item as { protected?: unknown }).protected === "boolean"
-      ? Boolean((item as { protected: boolean }).protected)
-      : false;
-    const detail = typeof item === "object" && item && typeof (item as { detail?: unknown }).detail === "string"
-      ? (item as { detail: string }).detail.trim()
-      : "";
-    return [{ kind: cleanKind, displayName: displayName || enrollmentAgentDisplayName(cleanKind), executablePath, installed, protected: protectedByOpenLeash, detail }];
+    const displayName =
+      typeof item === "object" &&
+      item &&
+      typeof (item as { displayName?: unknown }).displayName === "string"
+        ? (item as { displayName: string }).displayName.trim()
+        : "";
+    const executablePath =
+      typeof item === "object" &&
+      item &&
+      typeof (item as { executablePath?: unknown }).executablePath === "string"
+        ? (item as { executablePath: string }).executablePath.trim()
+        : "";
+    const installed =
+      typeof item === "object" &&
+      item &&
+      typeof (item as { installed?: unknown }).installed === "boolean"
+        ? Boolean((item as { installed: boolean }).installed)
+        : true;
+    const protectedByOpenLeash =
+      typeof item === "object" &&
+      item &&
+      typeof (item as { protected?: unknown }).protected === "boolean"
+        ? Boolean((item as { protected: boolean }).protected)
+        : false;
+    const detail =
+      typeof item === "object" &&
+      item &&
+      typeof (item as { detail?: unknown }).detail === "string"
+        ? (item as { detail: string }).detail.trim()
+        : "";
+    return [
+      {
+        kind: cleanKind,
+        displayName: displayName || enrollmentAgentDisplayName(cleanKind),
+        executablePath,
+        installed,
+        protected: protectedByOpenLeash,
+        detail,
+      },
+    ];
   });
 }
 
@@ -2243,16 +3239,31 @@ function enrollmentAgentDisplayName(kind: string) {
 
 app.get("/v1/mobile/state", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const [pending, agents, history, sessionMetrics, policies, pluginCatalog, pluginOutcomes] = await Promise.all([
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const [
+      pending,
+      agents,
+      history,
+      sessionMetrics,
+      policies,
+      pluginCatalog,
+      pluginOutcomes,
+    ] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       mobileAgents(session.organization.id, session.user.id),
       mobileRecentActivity(session.organization.id, session.user.id),
       mobileSessionMetrics(session.organization.id, session.user.id),
-      pool.query(`select id, name, description, severity, natural_language_rule, enabled, locked from policies order by created_at asc`),
+      pool.query(
+        `select id, name, description, severity, natural_language_rule, enabled, locked from policies order by created_at asc`,
+      ),
       pluginCatalogForOrganization(session.organization.id, session.user.id),
-      userPluginOutcomes(session.organization.id, session.user.id, { limit: 40 })
+      userPluginOutcomes(session.organization.id, session.user.id, {
+        limit: 40,
+      }),
     ]);
     const summary = outcomeSummary(pluginOutcomes.outcomes);
     res.json({
@@ -2270,12 +3281,12 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       viewModel: buildOpenLeashClientViewModel({
         plugins: pluginCatalog.plugins,
         outcomes: pluginOutcomes.outcomes,
-        summary
+        summary,
       }),
       clientConfig: {
         approvalNotifications: true,
-        managedByOrganization: true
-      }
+        managedByOrganization: true,
+      },
     });
   } catch (error) {
     next(error);
@@ -2284,13 +3295,22 @@ app.get("/v1/mobile/state", async (req, res, next) => {
 
 app.post("/v1/mobile/decisions/:id/resolve", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
     const body = req.body as MobileDecisionResolveRequest;
     const resolution = body.resolution === "allow" ? "allow" : "deny";
-    const result = await resolveApprovalGroup(req.params.id, resolution, `mobile:${session.user.id}`, {
-      userId: session.user.id
-    }, body.resolutionGuidance);
+    const result = await resolveApprovalGroup(
+      req.params.id,
+      resolution,
+      `mobile:${session.user.id}`,
+      {
+        userId: session.user.id,
+      },
+      body.resolutionGuidance,
+    );
     if (!result) return res.status(404).json({ error: "approval not found" });
     res.json(result);
   } catch (error) {
@@ -2300,16 +3320,24 @@ app.post("/v1/mobile/decisions/:id/resolve", async (req, res, next) => {
 
 app.get("/v1/client/notifications", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const [pending, blocked] = await Promise.all([
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const [pending, blocked, activity] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
-      browserBlockedNotifications(session.organization.id, session.user.id)
+      browserBlockedNotifications(session.organization.id, session.user.id),
+      mobileRecentActivity(session.organization.id, session.user.id),
     ]);
     res.json({
       serverTime: new Date().toISOString(),
       pendingApprovals: pending.rows,
-      blockedEvents: blocked.rows
+      blockedEvents: blocked.rows.map((row) => ({
+        ...row,
+        ...notificationPluginAttribution(row.payload),
+      })),
+      recentActivity: activity.rows,
     });
   } catch (error) {
     next(error);
@@ -2318,13 +3346,22 @@ app.get("/v1/client/notifications", async (req, res, next) => {
 
 app.post("/v1/client/decisions/:id/resolve", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
     const body = req.body as MobileDecisionResolveRequest;
     const resolution = body.resolution === "allow" ? "allow" : "deny";
-    const result = await resolveApprovalGroup(req.params.id, resolution, `web:${session.user.id}`, {
-      userId: session.user.id
-    }, body.resolutionGuidance);
+    const result = await resolveApprovalGroup(
+      req.params.id,
+      resolution,
+      `web:${session.user.id}`,
+      {
+        userId: session.user.id,
+      },
+      body.resolutionGuidance,
+    );
     if (!result) return res.status(404).json({ error: "approval not found" });
     res.json(result);
   } catch (error) {
@@ -2337,7 +3374,7 @@ async function resolveApprovalGroup(
   resolution: "allow" | "deny",
   resolvedBy: string,
   scope: { organizationId?: string; userId?: string } = {},
-  resolutionGuidance?: string
+  resolutionGuidance?: string,
 ) {
   const client = await pool.connect();
   try {
@@ -2363,14 +3400,17 @@ async function resolveApprovalGroup(
            )
          )
        for update`,
-      [id, scope.userId ?? null, scope.organizationId ?? null]
+      [id, scope.userId ?? null, scope.organizationId ?? null],
     );
     const row = selected.rows[0];
     if (!row) {
       await client.query("rollback");
       return undefined;
     }
-    const guidance = resolution === "deny" ? cleanResolutionGuidance(resolutionGuidance) : undefined;
+    const guidance =
+      resolution === "deny"
+        ? cleanResolutionGuidance(resolutionGuidance)
+        : undefined;
     const result = await client.query(
       `update evaluations
        set resolution = $2, resolved_at = now(), resolved_by = $3, resolution_guidance = $4
@@ -2378,7 +3418,7 @@ async function resolveApprovalGroup(
          and decision = 'ask'
          and resolution is null
        returning id, decision, resolution, resolution_guidance, resolved_at`,
-      [id, resolution, resolvedBy, guidance ?? null]
+      [id, resolution, resolvedBy, guidance ?? null],
     );
     if (row.intent_key) {
       await client.query(
@@ -2398,9 +3438,20 @@ async function resolveApprovalGroup(
                where owner.id = e.user_id and owner.organization_id = $6
              )
            )`,
-        [id, resolution, resolvedBy, row.intent_key, scope.userId ?? null, scope.organizationId ?? null, guidance ?? null]
+        [
+          id,
+          resolution,
+          resolvedBy,
+          row.intent_key,
+          scope.userId ?? null,
+          scope.organizationId ?? null,
+          guidance ?? null,
+        ],
       );
-      const candidates = await client.query<{ id: string; intent_key: string | null }>(
+      const candidates = await client.query<{
+        id: string;
+        intent_key: string | null;
+      }>(
         `select e.id, ce.payload->'raw'->>'openleashIntentKey' as intent_key
          from evaluations e
          join conversation_events ce on ce.id = e.conversation_event_id
@@ -2415,18 +3466,21 @@ async function resolveApprovalGroup(
                where owner.id = e.user_id and owner.organization_id = $3
              )
            )`,
-        [id, scope.userId ?? null, scope.organizationId ?? null]
+        [id, scope.userId ?? null, scope.organizationId ?? null],
       );
       const canonicalKey = canonicalIntentKey(row.intent_key);
       const duplicateIds = candidates.rows
-        .filter((candidate) => canonicalIntentKey(candidate.intent_key) === canonicalKey)
+        .filter(
+          (candidate) =>
+            canonicalIntentKey(candidate.intent_key) === canonicalKey,
+        )
         .map((candidate) => candidate.id);
       if (duplicateIds.length > 0) {
         await client.query(
           `update evaluations
            set resolution = $2, resolved_at = now(), resolved_by = $3, resolution_guidance = $4
            where id = any($1::uuid[])`,
-          [duplicateIds, resolution, resolvedBy, guidance ?? null]
+          [duplicateIds, resolution, resolvedBy, guidance ?? null],
         );
       }
     }
@@ -2443,25 +3497,32 @@ async function resolveApprovalGroup(
 app.post("/admin/onboarding/infrastructure", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
-    const deploymentMode = normalizeDeploymentMode(req.body.deploymentMode ?? process.env.OPENLEASH_DEPLOYMENT_MODE);
+    const deploymentMode = normalizeDeploymentMode(
+      req.body.deploymentMode ?? process.env.OPENLEASH_DEPLOYMENT_MODE,
+    );
     if (deploymentMode !== "private") {
       return res.json({ success: true, organization });
     }
     const databaseUrl = String(req.body.databaseUrl ?? "").trim();
-    if (!databaseUrl) return res.status(400).json({ success: false, error: "Postgres connection string is required for private deployments." });
+    if (!databaseUrl)
+      return res.status(400).json({
+        success: false,
+        error:
+          "Postgres connection string is required for private deployments.",
+      });
     const config = {
       databaseUrl,
       apiUrl: String(req.body.apiUrl ?? "").trim(),
       dashboardUrl: String(req.body.dashboardUrl ?? "").trim(),
       identityLoaderUrl: String(req.body.identityLoaderUrl ?? "").trim(),
-      updateFeedUrl: String(req.body.updateFeedUrl ?? "").trim()
+      updateFeedUrl: String(req.body.updateFeedUrl ?? "").trim(),
     };
     const result = await pool.query(
       `update organizations
        set deployment_mode = 'private', infrastructure_config = $2, current_step = greatest(current_step, 2), updated_at = now()
        where id = $1
        returning *`,
-      [organization.id, JSON.stringify(config)]
+      [organization.id, JSON.stringify(config)],
     );
     res.json({ success: true, organization: result.rows[0] });
   } catch (error) {
@@ -2472,15 +3533,28 @@ app.post("/admin/onboarding/infrastructure", async (req, res, next) => {
 app.post("/admin/onboarding/company", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
-    const name = String(req.body.name ?? req.body.organizationName ?? "").trim();
-    if (!name) return res.status(400).json({ success: false, error: "Organization name is required" });
+    const name = String(
+      req.body.name ?? req.body.organizationName ?? "",
+    ).trim();
+    if (!name)
+      return res
+        .status(400)
+        .json({ success: false, error: "Organization name is required" });
     const requestedSlug = String(req.body.slug ?? "").trim();
     const slug = slugifyTenant(requestedSlug || name);
-    const existingSlug = await pool.query(`select id from organizations where slug = $1 and id <> $2 limit 1`, [slug, organization.id]);
+    const existingSlug = await pool.query(
+      `select id from organizations where slug = $1 and id <> $2 limit 1`,
+      [slug, organization.id],
+    );
     if ((existingSlug.rowCount ?? 0) > 0) {
-      return res.status(409).json({ success: false, error: "That dashboard URL is already taken." });
+      return res.status(409).json({
+        success: false,
+        error: "That dashboard URL is already taken.",
+      });
     }
-    const packageId = normalizeAccountPackage(req.body.packageId ?? req.body.plan) ?? "work-managed";
+    const packageId =
+      normalizeAccountPackage(req.body.packageId ?? req.body.plan) ??
+      "work-managed";
     const result = await pool.query(
       `update organizations
        set name = $2,
@@ -2495,7 +3569,14 @@ app.post("/admin/onboarding/company", async (req, res, next) => {
            updated_at = now()
        where id = $1
        returning *`,
-      [organization.id, name, slug, req.body.region ?? null, req.body.logoUrl ?? null, packageId]
+      [
+        organization.id,
+        name,
+        slug,
+        req.body.region ?? null,
+        req.body.logoUrl ?? null,
+        packageId,
+      ],
     );
     res.json({ organization: result.rows[0] });
   } catch (error) {
@@ -2509,9 +3590,13 @@ app.post("/admin/onboarding/generate-code", async (req, res, next) => {
     const code = generateOnboardingCode();
     const result = await pool.query(
       `update organizations set onboarding_code = $2, updated_at = now() where id = $1 returning *`,
-      [organization.id, code]
+      [organization.id, code],
     );
-    res.json({ organization: result.rows[0], code, url: `/setup?code=${encodeURIComponent(code)}` });
+    res.json({
+      organization: result.rows[0],
+      code,
+      url: `/setup?code=${encodeURIComponent(code)}`,
+    });
   } catch (error) {
     next(error);
   }
@@ -2521,21 +3606,35 @@ app.post("/admin/onboarding/test-idp", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
     const provider = normalizeIdpProvider(req.body.provider);
-    const credentials = providerCredentials(provider, req.body.credentials ?? req.body);
-    if (!provider) return res.status(400).json({ success: false, error: "Unsupported identity provider" });
+    const credentials = providerCredentials(
+      provider,
+      req.body.credentials ?? req.body,
+    );
+    if (!provider)
+      return res
+        .status(400)
+        .json({ success: false, error: "Unsupported identity provider" });
     const identityLoader = process.env.IDENTITY_LOADER_URL;
     if (identityLoader) {
-      const response = await fetch(`${identityLoader.replace(/\/+$/, "")}/api/sync/test`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ idpType: provider.idpType, credentials, additionalConfig: { OrganizationId: organization.id } })
-      });
+      const response = await fetch(
+        `${identityLoader.replace(/\/+$/, "")}/api/sync/test`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            idpType: provider.idpType,
+            credentials,
+            additionalConfig: { OrganizationId: organization.id },
+          }),
+        },
+      );
       const data = await response.json().catch(() => ({}));
       return res.status(response.ok ? 200 : 400).json(data);
     }
     res.status(400).json({
       success: false,
-      error: "Identity sync service is not configured. Set IDENTITY_LOADER_URL to test this provider."
+      error:
+        "Identity sync service is not configured. Set IDENTITY_LOADER_URL to test this provider.",
     });
   } catch (error) {
     next(error);
@@ -2545,52 +3644,86 @@ app.post("/admin/onboarding/test-idp", async (req, res, next) => {
 app.post("/admin/onboarding/sync-identity", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
-    const existing = await pool.query<{ provider: string; config: Record<string, unknown> }>(
+    const existing = await pool.query<{
+      provider: string;
+      config: Record<string, unknown>;
+    }>(
       `select provider, config from idp_connections where organization_id = $1 limit 1`,
-      [organization.id]
+      [organization.id],
     );
-    const provider = normalizeIdpProvider(req.body.provider ?? existing.rows[0]?.provider);
-    if (!provider) return res.status(400).json({ success: false, error: "Unsupported identity provider" });
-    const incomingCredentials = providerCredentials(provider, req.body.credentials ?? req.body);
-    const credentials = hasAnyCredential(incomingCredentials) ? incomingCredentials : (existing.rows[0]?.config ?? {});
+    const provider = normalizeIdpProvider(
+      req.body.provider ?? existing.rows[0]?.provider,
+    );
+    if (!provider)
+      return res
+        .status(400)
+        .json({ success: false, error: "Unsupported identity provider" });
+    const incomingCredentials = providerCredentials(
+      provider,
+      req.body.credentials ?? req.body,
+    );
+    const credentials = hasAnyCredential(incomingCredentials)
+      ? incomingCredentials
+      : (existing.rows[0]?.config ?? {});
 
     await pool.query(
       `insert into idp_connections (organization_id, provider, config, enabled, updated_at)
        values ($1, $2, $3, true, now())
        on conflict (organization_id) do update set provider = excluded.provider, config = excluded.config, enabled = true, updated_at = now()`,
-      [organization.id, provider.idpType, JSON.stringify(credentials)]
+      [organization.id, provider.idpType, JSON.stringify(credentials)],
     );
 
     const identityLoader = process.env.IDENTITY_LOADER_URL;
     if (!identityLoader) {
-      const error = "Identity sync service is not configured. Set IDENTITY_LOADER_URL to sync real users and groups.";
-      await pool.query(`update idp_connections set last_error = $2, updated_at = now() where organization_id = $1`, [organization.id, error]);
+      const error =
+        "Identity sync service is not configured. Set IDENTITY_LOADER_URL to sync real users and groups.";
+      await pool.query(
+        `update idp_connections set last_error = $2, updated_at = now() where organization_id = $1`,
+        [organization.id, error],
+      );
       return res.status(400).json({ success: false, error });
     }
-    const response = await fetch(`${identityLoader.replace(/\/+$/, "")}/api/sync`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ idpType: provider.idpType, credentials, additionalConfig: { OrganizationId: organization.id } })
-    });
+    const response = await fetch(
+      `${identityLoader.replace(/\/+$/, "")}/api/sync`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          idpType: provider.idpType,
+          credentials,
+          additionalConfig: { OrganizationId: organization.id },
+        }),
+      },
+    );
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.success === false) {
-      await pool.query(`update idp_connections set last_error = $2, updated_at = now() where organization_id = $1`, [organization.id, data.error ?? data.message ?? "Identity sync failed"]);
+      await pool.query(
+        `update idp_connections set last_error = $2, updated_at = now() where organization_id = $1`,
+        [organization.id, data.error ?? data.message ?? "Identity sync failed"],
+      );
       return res.status(400).json(data);
     }
     const stats = {
       usersProcessed: Number(data.statistics?.usersProcessed ?? 0),
       groupsProcessed: Number(data.statistics?.groupsProcessed ?? 0),
-      membershipsProcessed: Number(data.statistics?.membershipsProcessed ?? 0)
+      membershipsProcessed: Number(data.statistics?.membershipsProcessed ?? 0),
     };
 
     await pool.query(
       `update idp_connections
        set last_sync_at = now(), user_count = $2, group_count = $3, last_error = null, updated_at = now()
        where organization_id = $1`,
-      [organization.id, stats.usersProcessed, stats.groupsProcessed]
+      [organization.id, stats.usersProcessed, stats.groupsProcessed],
     );
-    await pool.query(`update organizations set current_step = greatest(current_step, 4), updated_at = now() where id = $1`, [organization.id]);
-    res.json({ success: true, message: "Identity sync completed", statistics: stats });
+    await pool.query(
+      `update organizations set current_step = greatest(current_step, 4), updated_at = now() where id = $1`,
+      [organization.id],
+    );
+    res.json({
+      success: true,
+      message: "Identity sync completed",
+      statistics: stats,
+    });
   } catch (error) {
     next(error);
   }
@@ -2599,25 +3732,43 @@ app.post("/admin/onboarding/sync-identity", async (req, res, next) => {
 app.post("/admin/onboarding/rbac", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
-    await pool.query(`delete from role_assignments where organization_id = $1`, [organization.id]);
+    await pool.query(
+      `delete from role_assignments where organization_id = $1`,
+      [organization.id],
+    );
     const roles = Array.isArray(req.body.roles) ? req.body.roles : [];
     const adminUserIds: string[] = [];
     for (const item of roles) {
-      const role = ["admin", "analyst", "responder", "viewer"].includes(item.role) ? item.role : "viewer";
-      const groupId = typeof item.groupId === "string" && item.groupId ? item.groupId : null;
-      const userId = typeof item.userId === "string" && item.userId ? item.userId : null;
+      const role = ["admin", "analyst", "responder", "viewer"].includes(
+        item.role,
+      )
+        ? item.role
+        : "viewer";
+      const groupId =
+        typeof item.groupId === "string" && item.groupId ? item.groupId : null;
+      const userId =
+        typeof item.userId === "string" && item.userId ? item.userId : null;
       if (!groupId && !userId) continue;
       if (role === "admin" && userId) adminUserIds.push(userId);
       await pool.query(
         `insert into role_assignments (organization_id, role, group_id, user_id) values ($1, $2, $3, $4)`,
-        [organization.id, role, groupId, userId]
+        [organization.id, role, groupId, userId],
       );
     }
-    await pool.query(`update users set role = 'engineer' where organization_id = $1 and role = 'admin'`, [organization.id]);
+    await pool.query(
+      `update users set role = 'engineer' where organization_id = $1 and role = 'admin'`,
+      [organization.id],
+    );
     if (adminUserIds.length > 0) {
-      await pool.query(`update users set role = 'admin' where organization_id = $1 and id = any($2::uuid[])`, [organization.id, adminUserIds]);
+      await pool.query(
+        `update users set role = 'admin' where organization_id = $1 and id = any($2::uuid[])`,
+        [organization.id, adminUserIds],
+      );
     }
-    await pool.query(`update organizations set current_step = greatest(current_step, 5), updated_at = now() where id = $1`, [organization.id]);
+    await pool.query(
+      `update organizations set current_step = greatest(current_step, 5), updated_at = now() where id = $1`,
+      [organization.id],
+    );
     res.json({ success: true, count: roles.length });
   } catch (error) {
     next(error);
@@ -2628,11 +3779,14 @@ app.post("/admin/onboarding/complete", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
     if (!organization.name?.trim()) {
-      return res.status(400).json({ success: false, error: "Save your company profile before activating OpenLeash." });
+      return res.status(400).json({
+        success: false,
+        error: "Save your company profile before activating OpenLeash.",
+      });
     }
     const result = await pool.query(
       `update organizations set setup_completed = true, current_step = 8, updated_at = now() where id = $1 returning *`,
-      [organization.id]
+      [organization.id],
     );
     res.json({ success: true, organization: result.rows[0] });
   } catch (error) {
@@ -2644,7 +3798,10 @@ app.get("/admin/identity", async (_req, res, next) => {
   try {
     const organization = await ensureDefaultOrganization();
     const [idp, groups, users, roles] = await Promise.all([
-      pool.query(`select provider, enabled, last_sync_at, user_count, group_count, last_error from idp_connections where organization_id = $1`, [organization.id]),
+      pool.query(
+        `select provider, enabled, last_sync_at, user_count, group_count, last_error from idp_connections where organization_id = $1`,
+        [organization.id],
+      ),
       pool.query(
         `select g.id, g.name, g.description, g.idp_provider, count(gm.user_id) as member_count
          from identity_groups g
@@ -2652,7 +3809,7 @@ app.get("/admin/identity", async (_req, res, next) => {
          where g.organization_id = $1
          group by g.id
          order by g.name asc`,
-        [organization.id]
+        [organization.id],
       ),
       pool.query(
         `select u.id, u.email, u.display_name, u.role, u.department, u.title, u.idp_provider, u.status,
@@ -2665,11 +3822,20 @@ app.get("/admin/identity", async (_req, res, next) => {
          where u.organization_id = $1
          group by u.id
          order by u.display_name asc`,
-        [organization.id]
+        [organization.id],
       ),
-      pool.query(`select role, count(*) as count from role_assignments where organization_id = $1 group by role`, [organization.id])
+      pool.query(
+        `select role, count(*) as count from role_assignments where organization_id = $1 group by role`,
+        [organization.id],
+      ),
     ]);
-    res.json({ organization, idp: idp.rows[0] ?? null, groups: groups.rows, users: users.rows, roles: roles.rows });
+    res.json({
+      organization,
+      idp: idp.rows[0] ?? null,
+      groups: groups.rows,
+      users: users.rows,
+      roles: roles.rows,
+    });
   } catch (error) {
     next(error);
   }
@@ -2677,7 +3843,9 @@ app.get("/admin/identity", async (_req, res, next) => {
 
 app.get("/admin/triggers", async (req, res, next) => {
   try {
-    const filters: string[] = ["exists (select 1 from policy_results pr where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question'))"];
+    const filters: string[] = [
+      "exists (select 1 from policy_results pr where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question'))",
+    ];
     const values: unknown[] = [];
     const add = (value: unknown) => {
       values.push(value);
@@ -2685,7 +3853,9 @@ app.get("/admin/triggers", async (req, res, next) => {
     };
     if (typeof req.query.q === "string" && req.query.q.trim()) {
       const param = add(`%${req.query.q.trim()}%`);
-      filters.push(`(e.summary ilike ${param} or ce.prompt ilike ${param} or ce.project_path ilike ${param} or ce.tool_name ilike ${param})`);
+      filters.push(
+        `(e.summary ilike ${param} or ce.prompt ilike ${param} or ce.project_path ilike ${param} or ce.tool_name ilike ${param})`,
+      );
     }
     if (typeof req.query.user === "string" && req.query.user.trim()) {
       const param = add(`%${req.query.user.trim()}%`);
@@ -2693,9 +3863,14 @@ app.get("/admin/triggers", async (req, res, next) => {
     }
     if (typeof req.query.policy === "string" && req.query.policy.trim()) {
       const param = add(`%${req.query.policy.trim()}%`);
-      filters.push(`exists (select 1 from policy_results pr where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question') and pr.policy_name ilike ${param})`);
+      filters.push(
+        `exists (select 1 from policy_results pr where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question') and pr.policy_name ilike ${param})`,
+      );
     }
-    if (typeof req.query.decision === "string" && ["ask", "deny", "allow"].includes(req.query.decision)) {
+    if (
+      typeof req.query.decision === "string" &&
+      ["ask", "deny", "allow"].includes(req.query.decision)
+    ) {
       filters.push(`e.decision = ${add(req.query.decision)}`);
     }
     if (typeof req.query.dateFrom === "string" && req.query.dateFrom.trim()) {
@@ -2733,7 +3908,7 @@ app.get("/admin/triggers", async (req, res, next) => {
        where ${filters.join(" and ")}
        order by e.created_at desc
        limit ${add(limit)}`,
-      values
+      values,
     );
     res.json({ triggers: result.rows });
   } catch (error) {
@@ -2755,19 +3930,25 @@ app.get("/admin/triggers/:id", async (req, res, next) => {
          join computers c on c.id = ce.computer_id
          left join users u on u.id = e.user_id
          where e.id = $1`,
-        [req.params.id]
+        [req.params.id],
       ),
       pool.query(
         `select policy_name, status, severity, explanation, evidence, question, created_at
          from policy_results
          where evaluation_id = $1
          order by created_at asc`,
-        [req.params.id]
-      )
+        [req.params.id],
+      ),
     ]);
-    if (!trigger.rows[0]) return res.status(404).json({ error: "trigger not found" });
-    const payload = await withTranscriptContext(trigger.rows[0].payload, trigger.rows[0].occurred_at);
-    res.json({ trigger: { ...trigger.rows[0], payload, policy_results: policies.rows } });
+    if (!trigger.rows[0])
+      return res.status(404).json({ error: "trigger not found" });
+    const payload = await withTranscriptContext(
+      trigger.rows[0].payload,
+      trigger.rows[0].occurred_at,
+    );
+    res.json({
+      trigger: { ...trigger.rows[0], payload, policy_results: policies.rows },
+    });
   } catch (error) {
     next(error);
   }
@@ -2807,16 +3988,23 @@ app.get("/admin/logs", async (req, res, next) => {
     }
     if (typeof req.query.agent === "string" && req.query.agent.trim()) {
       const param = add(`%${req.query.agent.trim()}%`);
-      filters.push(`(ar.display_name ilike ${param} or ar.kind ilike ${param})`);
+      filters.push(
+        `(ar.display_name ilike ${param} or ar.kind ilike ${param})`,
+      );
     }
     if (typeof req.query.event === "string" && req.query.event.trim()) {
       filters.push(`ce.event_name = ${add(req.query.event.trim())}`);
     }
-    if (typeof req.query.decision === "string" && ["ask", "deny", "allow", "passed", "logged"].includes(req.query.decision)) {
+    if (
+      typeof req.query.decision === "string" &&
+      ["ask", "deny", "allow", "passed", "logged"].includes(req.query.decision)
+    ) {
       if (req.query.decision === "logged") {
         filters.push(`e.id is null`);
       } else if (req.query.decision === "passed") {
-        filters.push(`e.decision = 'allow' and not exists (select 1 from policy_results pr where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question'))`);
+        filters.push(
+          `e.decision = 'allow' and not exists (select 1 from policy_results pr where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question'))`,
+        );
       } else {
         filters.push(`e.decision = ${add(req.query.decision)}`);
       }
@@ -2859,7 +4047,7 @@ app.get("/admin/logs", async (req, res, next) => {
        where ${filters.join(" and ")}
        order by ce.created_at desc
        limit ${add(limit)}`,
-      values
+      values,
     );
     res.json({ logs: result.rows });
   } catch (error) {
@@ -2900,14 +4088,19 @@ app.get("/admin/debug", async (req, res, next) => {
       const param = add(`%${req.query.plugin.trim()}%`);
       filters.push(`ple.plugin_id ilike ${param}`);
     }
-    if (typeof req.query.level === "string" && ["debug", "info", "warn", "error", "security"].includes(req.query.level)) {
+    if (
+      typeof req.query.level === "string" &&
+      ["debug", "info", "warn", "error", "security"].includes(req.query.level)
+    ) {
       filters.push(`ple.level = ${add(req.query.level)}`);
     }
     if (typeof req.query.category === "string" && req.query.category.trim()) {
       filters.push(`ple.category = ${add(req.query.category.trim())}`);
     }
     if (typeof req.query.session === "string" && req.query.session.trim()) {
-      filters.push(`coalesce(ce.session_id, ple.scope->>'sessionId') = ${add(req.query.session.trim())}`);
+      filters.push(
+        `coalesce(ce.session_id, ple.scope->>'sessionId') = ${add(req.query.session.trim())}`,
+      );
     }
     if (typeof req.query.dateFrom === "string" && req.query.dateFrom.trim()) {
       filters.push(`ple.created_at >= ${add(req.query.dateFrom)}`);
@@ -2930,7 +4123,7 @@ app.get("/admin/debug", async (req, res, next) => {
        where ${filters.join(" and ")}
        order by ple.created_at desc
        limit ${add(limit)}`,
-      values
+      values,
     );
     res.json({ debugLogs: result.rows });
   } catch (error) {
@@ -2955,7 +4148,7 @@ app.get("/admin/logs/:id", async (req, res, next) => {
          left join agent_runtimes ar on ar.id = ce.agent_runtime_id
          left join computers c on c.id = ce.computer_id
          where ce.id = $1 and u.organization_id = $2`,
-        [req.params.id, organization.id]
+        [req.params.id, organization.id],
       ),
       pool.query(
         `select pr.policy_name, pr.status, pr.severity, pr.explanation, pr.evidence, pr.question, pr.created_at
@@ -2965,12 +4158,17 @@ app.get("/admin/logs/:id", async (req, res, next) => {
          join users u on u.id = ce.user_id
          where ce.id = $1 and u.organization_id = $2
          order by pr.created_at asc`,
-        [req.params.id, organization.id]
-      )
+        [req.params.id, organization.id],
+      ),
     ]);
     if (!log.rows[0]) return res.status(404).json({ error: "log not found" });
-    const payload = await withTranscriptContext(log.rows[0].payload, log.rows[0].occurred_at);
-    res.json({ log: { ...log.rows[0], payload, policy_results: policies.rows } });
+    const payload = await withTranscriptContext(
+      log.rows[0].payload,
+      log.rows[0].occurred_at,
+    );
+    res.json({
+      log: { ...log.rows[0], payload, policy_results: policies.rows },
+    });
   } catch (error) {
     next(error);
   }
@@ -2980,8 +4178,12 @@ app.post("/v1/skills/observations", async (req, res, next) => {
   try {
     const token = bearerToken(req.header("authorization") ?? "");
     const user = token ? await getUserByToken(token) : undefined;
-    if (!user) return res.status(401).json({ error: "missing or invalid OpenLeash token" });
-    const organizationId = user.organization_id ?? (await ensureDefaultOrganization()).id;
+    if (!user)
+      return res
+        .status(401)
+        .json({ error: "missing or invalid OpenLeash token" });
+    const organizationId =
+      user.organization_id ?? (await ensureDefaultOrganization()).id;
     const body = req.body as {
       agentKind?: string;
       agentName?: string;
@@ -2998,37 +4200,72 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       riskScore?: number;
       reasons?: Array<{ reason?: string; quote?: string }>;
     };
-	    const skillName = String(body.skillName ?? "").trim();
-	    const skillPath = String(body.skillPath ?? "").trim();
-	    if (!skillName || !skillPath) return res.status(400).json({ error: "skillName and skillPath are required" });
-	    const runtimePlugins = await pluginSettingsForRuntime(organizationId, user.id);
-	    const reasons = normalizeSkillReasons(body.reasons);
-    const content = typeof body.content === "string" ? body.content.slice(0, 80000) : null;
-    const contentPreview = typeof body.contentPreview === "string" ? body.contentPreview.slice(0, 12000) : content?.slice(0, 12000) ?? null;
+    const skillName = String(body.skillName ?? "").trim();
+    const skillPath = String(body.skillPath ?? "").trim();
+    if (!skillName || !skillPath)
+      return res
+        .status(400)
+        .json({ error: "skillName and skillPath are required" });
+    const runtimePlugins = await pluginSettingsForRuntime(
+      organizationId,
+      user.id,
+    );
+    const reasons = normalizeSkillReasons(body.reasons);
+    const content =
+      typeof body.content === "string" ? body.content.slice(0, 80000) : null;
+    const contentPreview =
+      typeof body.contentPreview === "string"
+        ? body.contentPreview.slice(0, 12000)
+        : (content?.slice(0, 12000) ?? null);
     const agentKind = String(body.agentKind ?? "unknown") as AgentKind;
     const agentName = body.agentName ?? "Local agent";
-    const requestedEventType = normalizeSkillObservationEventType(body.eventType);
+    const requestedEventType = normalizeSkillObservationEventType(
+      body.eventType,
+    );
     const existingSkill = await pool.query(
       `select id, status, risk_score, reasons, content_hash, purpose_summary
        from skills
        where organization_id = $1 and user_id = $2 and skill_path = $3
        limit 1`,
-      [organizationId, user.id, skillPath]
+      [organizationId, user.id, skillPath],
     );
-    const existing = existingSkill.rows[0] as { id: string; status: string; risk_score: number | string; reasons: unknown; content_hash: string; purpose_summary?: string | null } | undefined;
-    const contentHash = body.contentHash ?? existing?.content_hash ?? crypto.createHash("sha256").update(content ?? skillPath).digest("hex");
-    const skillEventType = inferSkillObservationEventType(requestedEventType, existing, contentHash);
+    const existing = existingSkill.rows[0] as
+      | {
+          id: string;
+          status: string;
+          risk_score: number | string;
+          reasons: unknown;
+          content_hash: string;
+          purpose_summary?: string | null;
+        }
+      | undefined;
+    const contentHash =
+      body.contentHash ??
+      existing?.content_hash ??
+      crypto
+        .createHash("sha256")
+        .update(content ?? skillPath)
+        .digest("hex");
+    const skillEventType = inferSkillObservationEventType(
+      requestedEventType,
+      existing,
+      contentHash,
+    );
     const pipelineSkillEvent = pipelineEventForSkillObservation(skillEventType);
-    const shouldScanSkill = runtimePlugins.get("openleash.skill-scanner")?.enabled !== false && (skillEventType === "detected" || skillEventType === "changed");
-    const tenantModelKey = shouldScanSkill ? await tenantModelKeyForEvaluation(organizationId) : undefined;
+    const shouldScanSkill =
+      runtimePlugins.get("openleash.skill-scanner")?.enabled !== false &&
+      (skillEventType === "detected" || skillEventType === "changed");
+    const tenantModelKey = shouldScanSkill
+      ? await tenantModelKeyForEvaluation(organizationId)
+      : undefined;
     const skillScanRequest: EvaluationRequest = {
       computer: {
         hostname: req.hostname || "unknown",
-        platform: "unknown"
+        platform: "unknown",
       },
       agent: {
         kind: agentKind,
-        displayName: agentName
+        displayName: agentName,
       },
       event: {
         eventName: "SubagentStart",
@@ -3043,35 +4280,41 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           skillPath,
           skillEventType,
           contentPreview: contentPreview ?? "",
-          contentHash
-        }
-      }
+          contentHash,
+        },
+      },
     };
     const skillScan = shouldScanSkill
-      ? await runSkillScanner({
-          event: pipelineSkillEvent,
-          agentKind,
-          agentName,
-          skillName,
-          skillPath,
-          content,
-          contentPreview,
-          status: body.status,
-          riskScore: body.riskScore,
-          reasons
-        }, createPluginCapabilities({
-          organizationId,
-          pluginId: "openleash.skill-scanner",
-          userId: user.id,
-          tenantModelKey,
-          request: skillScanRequest
-        }))
+      ? await runSkillScanner(
+          {
+            event: pipelineSkillEvent,
+            agentKind,
+            agentName,
+            skillName,
+            skillPath,
+            content,
+            contentPreview,
+            status: body.status,
+            riskScore: body.riskScore,
+            reasons,
+          },
+          createPluginCapabilities({
+            organizationId,
+            pluginId: "openleash.skill-scanner",
+            userId: user.id,
+            tenantModelKey,
+            request: skillScanRequest,
+          }),
+        )
       : {
-          status: skillEventType === "removed" ? "deleted" : normalizeSkillStatus(body.status, existing?.status),
+          status:
+            skillEventType === "removed"
+              ? "deleted"
+              : normalizeSkillStatus(body.status, existing?.status),
           riskScore: Number(existing?.risk_score ?? body.riskScore ?? 0),
           reasons: normalizeExistingSkillReasons(existing?.reasons, reasons),
           findings: [],
-          run: undefined
+          run: undefined,
         };
     const suspicious = shouldScanSkill && skillScan.status === "suspicious";
     const status = skillEventType === "removed" ? "deleted" : skillScan.status;
@@ -3079,10 +4322,11 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       provided: body.purposeSummary ?? existing?.purpose_summary ?? undefined,
       content: content ?? contentPreview ?? "",
       skillName,
-      skillPath
+      skillPath,
     });
     const client = await pool.connect();
-    let signalContext: { eventId: string; computerId: string; runtimeId: string } | undefined;
+    let signalContext:
+      { eventId: string; computerId: string; runtimeId: string } | undefined;
     try {
       await client.query("begin");
       const skill = await client.query(
@@ -3121,26 +4365,32 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           contentHash,
           content,
           contentPreview,
-          purposeSummary
-        ]
+          purposeSummary,
+        ],
       );
       let evaluationId: string | null = null;
       if (suspicious) {
-        const conversationEventName = skillEventType === "detected" ? "SkillDetected" : "SkillChanged";
+        const conversationEventName =
+          skillEventType === "detected" ? "SkillDetected" : "SkillChanged";
         const skillPluginRuns = skillScan.run ? [skillScan.run] : [];
         const computer = await client.query(
           `insert into computers (user_id, hostname, platform, last_seen_at)
            values ($1, $2, $3, now())
            on conflict (user_id, hostname) do update set last_seen_at = now()
            returning id`,
-          [user.id, req.hostname || "unknown", "unknown"]
+          [user.id, req.hostname || "unknown", "unknown"],
         );
         const runtime = await client.query(
           `insert into agent_runtimes (computer_id, kind, display_name, executable_path, last_seen_at)
            values ($1, $2, $3, $4, now())
            on conflict (computer_id, kind, executable_path_key) do update set display_name = excluded.display_name, last_seen_at = now()
            returning id`,
-          [computer.rows[0].id, body.agentKind ?? "unknown", body.agentName ?? "Local agent", ""]
+          [
+            computer.rows[0].id,
+            body.agentKind ?? "unknown",
+            body.agentName ?? "Local agent",
+            "",
+          ],
         );
         const event = await client.query(
           `insert into conversation_events
@@ -3163,9 +4413,9 @@ app.post("/v1/skills/observations", async (req, res, next) => {
               reasons: skillScan.reasons,
               contentPreview: contentPreview ?? "",
               purposeSummary,
-              openleashPluginRuns: skillPluginRuns
-            })
-          ]
+              openleashPluginRuns: skillPluginRuns,
+            }),
+          ],
         );
         const evaluation = await client.query(
           `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
@@ -3174,14 +4424,14 @@ app.post("/v1/skills/observations", async (req, res, next) => {
             event.rows[0].id,
             user.id,
             "OpenLeash detected a possibly malicious agent skill.",
-            "OpenLeash detected a possibly malicious agent skill. Delete this skill or approve it?"
-          ]
+            "OpenLeash detected a possibly malicious agent skill. Delete this skill or approve it?",
+          ],
         );
         evaluationId = evaluation.rows[0].id;
         signalContext = {
           eventId: event.rows[0].id,
           computerId: computer.rows[0].id,
-          runtimeId: runtime.rows[0].id
+          runtimeId: runtime.rows[0].id,
         };
         await client.query(
           `insert into policy_results (evaluation_id, policy_id, policy_name, status, severity, explanation, evidence, question)
@@ -3189,9 +4439,15 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           [
             evaluationId,
             "A newly added or edited agent skill may contain unsafe instructions or executable behavior.",
-            JSON.stringify(skillScan.reasons.map((reason) => reason.quote ? `${reason.reason}: ${reason.quote}` : reason.reason)),
-            "Delete this skill or approve it?"
-          ]
+            JSON.stringify(
+              skillScan.reasons.map((reason) =>
+                reason.quote
+                  ? `${reason.reason}: ${reason.quote}`
+                  : reason.reason,
+              ),
+            ),
+            "Delete this skill or approve it?",
+          ],
         );
       }
       const event = await client.query(
@@ -3215,8 +4471,8 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           skillScan.riskScore,
           JSON.stringify(skillScan.reasons),
           contentPreview,
-          purposeSummary
-        ]
+          purposeSummary,
+        ],
       );
       await client.query("commit");
       if (signalContext) {
@@ -3227,7 +4483,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           userId: user.id,
           computerId: signalContext.computerId,
           runtimeId: signalContext.runtimeId,
-          request: skillScanRequest
+          request: skillScanRequest,
         }).signals.emit({
           kind: "security.finding",
           severity: "high",
@@ -3242,17 +4498,28 @@ app.post("/v1/skills/observations", async (req, res, next) => {
             skillPath,
             agentKind: body.agentKind ?? "unknown",
             agentName: body.agentName ?? "Local agent",
-            riskScore: skillScan.riskScore
+            riskScore: skillScan.riskScore,
           },
-          correlationKeys: [`skill:${skillName}`, `agent:${body.agentKind ?? "unknown"}`]
+          correlationKeys: [
+            `skill:${skillName}`,
+            `agent:${body.agentKind ?? "unknown"}`,
+          ],
         });
       }
       if (evaluationId) {
-        notifyMobileApprovers(user.id, evaluationId, "Possible malicious skill", "Delete this skill or approve it?", undefined).catch((error) => {
+        notifyMobileApprovers(
+          user.id,
+          evaluationId,
+          "Possible malicious skill",
+          "Delete this skill or approve it?",
+          undefined,
+        ).catch((error) => {
           console.warn("mobile skill notification failed", error);
         });
       }
-      res.status(201).json({ skill: skill.rows[0], event: event.rows[0], evaluationId });
+      res
+        .status(201)
+        .json({ skill: skill.rows[0], event: event.rows[0], evaluationId });
     } catch (error) {
       await client.query("rollback");
       throw error;
@@ -3293,7 +4560,7 @@ app.get("/admin/pending-decisions", async (_req, res, next) => {
        ) triggered on true
        where e.decision = 'ask' and e.resolution is null
        order by e.created_at asc
-       limit 20`
+       limit 20`,
     );
     res.json({ pending: pending.rows });
   } catch (error) {
@@ -3331,7 +4598,7 @@ app.get("/admin/tray-status", async (_req, res, next) => {
          ) triggered on true
          where e.decision = 'ask' and e.resolution is null
          order by e.created_at asc
-         limit 20`
+         limit 20`,
       ),
       pool.query(
         `select ar.id, ar.kind, ar.display_name, ar.version, ar.last_seen_at,
@@ -3390,16 +4657,16 @@ app.get("/admin/tray-status", async (_req, res, next) => {
          where ar.last_seen_at > now() - interval '5 minutes'
             or latest.created_at > now() - interval '5 minutes'
          order by greatest(ar.last_seen_at, coalesce(latest.created_at, ar.last_seen_at)) desc
-         limit 12`
-      )
+         limit 12`,
+      ),
     ]);
 
     res.json({
       pending: pending.rows,
       agents: agents.rows.map((agent) => ({
         ...agent,
-        short_summary: summarizeAgentActivity(agent)
-      }))
+        short_summary: summarizeAgentActivity(agent),
+      })),
     });
   } catch (error) {
     next(error);
@@ -3411,13 +4678,14 @@ app.get("/v1/decisions/:id", async (req, res, next) => {
     const auth = req.header("authorization") ?? "";
     const token = auth.replace(/^Bearer\s+/i, "");
     const user = token ? await getUserByToken(token) : undefined;
-    if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
+    if (!user)
+      return res.status(401).json({ error: "invalid OpenLeash token" });
 
     const decision = await pool.query(
       `select id, decision, resolution, summary, question, resolved_at
        from evaluations
        where id = $1 and user_id = $2`,
-      [req.params.id, user.id]
+      [req.params.id, user.id],
     );
     res.json(decision.rows[0] ?? null);
   } catch (error) {
@@ -3428,7 +4696,13 @@ app.get("/v1/decisions/:id", async (req, res, next) => {
 app.post("/admin/decisions/:id/resolve", async (req, res, next) => {
   try {
     const resolution = req.body.resolution === "allow" ? "allow" : "deny";
-    const result = await resolveApprovalGroup(req.params.id, resolution, req.body.resolvedBy ?? "local-user", {}, req.body.resolutionGuidance);
+    const result = await resolveApprovalGroup(
+      req.params.id,
+      resolution,
+      req.body.resolvedBy ?? "local-user",
+      {},
+      req.body.resolutionGuidance,
+    );
     res.json(result ?? null);
   } catch (error) {
     next(error);
@@ -3442,7 +4716,12 @@ app.post("/admin/users", async (req, res, next) => {
       `insert into users (email, display_name, role, token_hash)
        values ($1, $2, $3, $4)
        returning id, email, display_name, role, created_at`,
-      [req.body.email, req.body.displayName, req.body.role ?? "engineer", hashToken(token)]
+      [
+        req.body.email,
+        req.body.displayName,
+        req.body.role ?? "engineer",
+        hashToken(token),
+      ],
     );
     res.status(201).json({ user: user.rows[0], token });
   } catch (error) {
@@ -3456,7 +4735,7 @@ app.get("/admin/deployment-tokens", async (_req, res, next) => {
       `select id, label, mode, tenant_url, mdm, expires_at, revoked_at, created_at, last_used_at
        from deployment_tokens
        order by created_at desc
-       limit 50`
+       limit 50`,
     );
     res.json({ tokens: tokens.rows });
   } catch (error) {
@@ -3467,18 +4746,37 @@ app.get("/admin/deployment-tokens", async (_req, res, next) => {
 app.post("/admin/deployment-tokens", async (req, res, next) => {
   try {
     const token = `ol_deploy_${crypto.randomBytes(24).toString("base64url")}`;
-    const label = String(req.body.label ?? "MDM deployment").trim() || "MDM deployment";
+    const label =
+      String(req.body.label ?? "MDM deployment").trim() || "MDM deployment";
     const mode = req.body.mode === "private" ? "private" : "cloud";
-    const tenantUrl = String(req.body.tenantUrl ?? process.env.OPENLEASH_TENANT_URL ?? "openleash.com").trim();
-    const mdm = typeof req.body.mdm === "string" && req.body.mdm.trim() ? req.body.mdm.trim() : null;
+    const tenantUrl = String(
+      req.body.tenantUrl ?? process.env.OPENLEASH_TENANT_URL ?? "openleash.com",
+    ).trim();
+    const mdm =
+      typeof req.body.mdm === "string" && req.body.mdm.trim()
+        ? req.body.mdm.trim()
+        : null;
     const expiresInDays = Number(req.body.expiresInDays ?? 30);
     const result = await pool.query(
       `insert into deployment_tokens (label, token_hash, mode, tenant_url, mdm, expires_at)
        values ($1, $2, $3, $4, $5, now() + ($6::text || ' days')::interval)
        returning id, label, mode, tenant_url, mdm, expires_at, created_at`,
-      [label, hashToken(token), mode, tenantUrl, mdm, Number.isFinite(expiresInDays) ? Math.max(1, Math.min(365, expiresInDays)) : 30]
+      [
+        label,
+        hashToken(token),
+        mode,
+        tenantUrl,
+        mdm,
+        Number.isFinite(expiresInDays)
+          ? Math.max(1, Math.min(365, expiresInDays))
+          : 30,
+      ],
     );
-    res.status(201).json({ token, deploymentToken: result.rows[0], command: enrollmentCommand(tenantUrl, token) });
+    res.status(201).json({
+      token,
+      deploymentToken: result.rows[0],
+      command: enrollmentCommand(tenantUrl, token),
+    });
   } catch (error) {
     next(error);
   }
@@ -3488,7 +4786,7 @@ app.post("/admin/deployment-tokens/:id/revoke", async (req, res, next) => {
   try {
     const result = await pool.query(
       `update deployment_tokens set revoked_at = now() where id = $1 returning id, revoked_at`,
-      [req.params.id]
+      [req.params.id],
     );
     res.json(result.rows[0] ?? null);
   } catch (error) {
@@ -3503,7 +4801,7 @@ app.get("/admin/events/:id", async (req, res, next) => {
        from conversation_events ce
        left join evaluations e on e.conversation_event_id = ce.id
        where ce.id = $1`,
-      [req.params.id]
+      [req.params.id],
     );
     res.json(event.rows[0] ?? null);
   } catch (error) {
@@ -3515,11 +4813,23 @@ app.post("/admin/policies", async (req, res, next) => {
   try {
     const naturalLanguageRule = String(req.body.naturalLanguageRule ?? "");
     const name = summarizePolicyTitle(naturalLanguageRule);
-    const category = policyCategory(String(req.body.category ?? ""), name, naturalLanguageRule);
+    const category = policyCategory(
+      String(req.body.category ?? ""),
+      name,
+      naturalLanguageRule,
+    );
     const result = await pool.query(
       `insert into policies (name, category, description, severity, natural_language_rule, enabled, locked)
        values ($1, $2, $3, $4, $5, $6, $7) returning *`,
-      [name, category, req.body.description ?? "", req.body.severity ?? "medium", naturalLanguageRule, req.body.enabled ?? true, Boolean(req.body.locked)]
+      [
+        name,
+        category,
+        req.body.description ?? "",
+        req.body.severity ?? "medium",
+        naturalLanguageRule,
+        req.body.enabled ?? true,
+        Boolean(req.body.locked),
+      ],
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -3538,9 +4848,17 @@ app.get("/admin/plugins", async (req, res, next) => {
 
 app.get("/v1/plugins", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    res.json(await pluginCatalogForOrganization(session.organization.id, session.user.id));
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    res.json(
+      await pluginCatalogForOrganization(
+        session.organization.id,
+        session.user.id,
+      ),
+    );
   } catch (error) {
     next(error);
   }
@@ -3548,9 +4866,18 @@ app.get("/v1/plugins", async (req, res, next) => {
 
 app.get("/v1/plugin-marketplace", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    res.json(await pluginMarketplaceForOrganization(session.organization.id, String(req.query.search ?? ""), { userId: session.user.id }));
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    res.json(
+      await pluginMarketplaceForOrganization(
+        session.organization.id,
+        String(req.query.search ?? ""),
+        { userId: session.user.id },
+      ),
+    );
   } catch (error) {
     next(error);
   }
@@ -3558,7 +4885,9 @@ app.get("/v1/plugin-marketplace", async (req, res, next) => {
 
 app.get("/public/plugins", async (req, res, next) => {
   try {
-    res.json({ listings: await readMarketplaceListings(String(req.query.search ?? "")) });
+    res.json({
+      listings: await readMarketplaceListings(String(req.query.search ?? "")),
+    });
   } catch (error) {
     next(error);
   }
@@ -3577,7 +4906,13 @@ app.get("/public/plugins/:slug", async (req, res, next) => {
 app.get("/admin/plugin-marketplace", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
-    res.json(await pluginMarketplaceForOrganization(organizationId, String(req.query.search ?? ""), { includePending: true }));
+    res.json(
+      await pluginMarketplaceForOrganization(
+        organizationId,
+        String(req.query.search ?? ""),
+        { includePending: true },
+      ),
+    );
   } catch (error) {
     next(error);
   }
@@ -3586,7 +4921,9 @@ app.get("/admin/plugin-marketplace", async (req, res, next) => {
 app.get("/admin/plugin-releases", async (req, res, next) => {
   try {
     await organizationIdForAdminRequest(req);
-    res.json({ releases: await listPluginReleases(String(req.query.status ?? "")) });
+    res.json({
+      releases: await listPluginReleases(String(req.query.status ?? "")),
+    });
   } catch (error) {
     next(error);
   }
@@ -3595,8 +4932,13 @@ app.get("/admin/plugin-releases", async (req, res, next) => {
 app.post("/admin/plugin-releases/:id/approve", async (req, res, next) => {
   try {
     const reviewer = await adminUserForRequest(req);
-    const result = await approvePluginRelease(req.params.id, reviewer?.id, req.body);
-    if (!result) return res.status(404).json({ error: "plugin release not found" });
+    const result = await approvePluginRelease(
+      req.params.id,
+      reviewer?.id,
+      req.body,
+    );
+    if (!result)
+      return res.status(404).json({ error: "plugin release not found" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -3606,8 +4948,14 @@ app.post("/admin/plugin-releases/:id/approve", async (req, res, next) => {
 app.post("/admin/plugin-releases/:id/reject", async (req, res, next) => {
   try {
     const reviewer = await adminUserForRequest(req);
-    const result = await reviewPluginRelease(req.params.id, "rejected", reviewer?.id, req.body?.reviewerNote);
-    if (!result) return res.status(404).json({ error: "plugin release not found" });
+    const result = await reviewPluginRelease(
+      req.params.id,
+      "rejected",
+      reviewer?.id,
+      req.body?.reviewerNote,
+    );
+    if (!result)
+      return res.status(404).json({ error: "plugin release not found" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -3617,8 +4965,14 @@ app.post("/admin/plugin-releases/:id/reject", async (req, res, next) => {
 app.post("/admin/plugin-releases/:id/yank", async (req, res, next) => {
   try {
     const reviewer = await adminUserForRequest(req);
-    const result = await reviewPluginRelease(req.params.id, "yanked", reviewer?.id, req.body?.reviewerNote);
-    if (!result) return res.status(404).json({ error: "plugin release not found" });
+    const result = await reviewPluginRelease(
+      req.params.id,
+      "yanked",
+      reviewer?.id,
+      req.body?.reviewerNote,
+    );
+    if (!result)
+      return res.status(404).json({ error: "plugin release not found" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -3628,7 +4982,11 @@ app.post("/admin/plugin-releases/:id/yank", async (req, res, next) => {
 app.post("/admin/plugins/:pluginId/settings", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
-    const result = await savePluginSettingsForOrganization(organizationId, req.params.pluginId, req.body);
+    const result = await savePluginSettingsForOrganization(
+      organizationId,
+      req.params.pluginId,
+      req.body,
+    );
     if (!result) return res.status(404).json({ error: "plugin not found" });
     res.json(result);
   } catch (error) {
@@ -3639,8 +4997,14 @@ app.post("/admin/plugins/:pluginId/settings", async (req, res, next) => {
 app.post("/admin/plugins/:pluginId/update", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
-    const result = await updateMarketplacePluginForOrganization(organizationId, req.params.pluginId);
-    if (!result) return res.status(404).json({ error: "plugin not found or not installed" });
+    const result = await updateMarketplacePluginForOrganization(
+      organizationId,
+      req.params.pluginId,
+    );
+    if (!result)
+      return res
+        .status(404)
+        .json({ error: "plugin not found or not installed" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -3650,7 +5014,11 @@ app.post("/admin/plugins/:pluginId/update", async (req, res, next) => {
 app.post("/admin/plugins/:pluginId/policy", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
-    const result = await saveOrganizationPluginPolicy(organizationId, req.params.pluginId, req.body);
+    const result = await saveOrganizationPluginPolicy(
+      organizationId,
+      req.params.pluginId,
+      req.body,
+    );
     if (!result) return res.status(404).json({ error: "plugin not found" });
     res.json(result);
   } catch (error) {
@@ -3669,9 +5037,17 @@ app.post("/admin/plugin-marketplace/policy", async (req, res, next) => {
 
 app.post("/v1/plugins/:pluginId/settings", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await savePluginSettingsForUser(session.organization.id, session.user.id, req.params.pluginId, req.body);
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const result = await savePluginSettingsForUser(
+      session.organization.id,
+      session.user.id,
+      req.params.pluginId,
+      req.body,
+    );
     if (!result) return res.status(404).json({ error: "plugin not found" });
     res.json(result);
   } catch (error) {
@@ -3681,10 +5057,20 @@ app.post("/v1/plugins/:pluginId/settings", async (req, res, next) => {
 
 app.post("/v1/plugins/:pluginId/install", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await installMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId);
-    if (!result) return res.status(404).json({ error: "plugin not found or not installable" });
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const result = await installMarketplacePluginForUser(
+      session.organization.id,
+      session.user.id,
+      req.params.pluginId,
+    );
+    if (!result)
+      return res
+        .status(404)
+        .json({ error: "plugin not found or not installable" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -3693,10 +5079,20 @@ app.post("/v1/plugins/:pluginId/install", async (req, res, next) => {
 
 app.post("/v1/plugins/:pluginId/update", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await updateMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId);
-    if (!result) return res.status(404).json({ error: "plugin not found or not installed" });
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const result = await updateMarketplacePluginForUser(
+      session.organization.id,
+      session.user.id,
+      req.params.pluginId,
+    );
+    if (!result)
+      return res
+        .status(404)
+        .json({ error: "plugin not found or not installed" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -3705,10 +5101,18 @@ app.post("/v1/plugins/:pluginId/update", async (req, res, next) => {
 
 app.post("/v1/plugins/:pluginId/uninstall", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await uninstallMarketplacePluginForUser(session.organization.id, session.user.id, req.params.pluginId);
-    if (!result) return res.status(404).json({ error: "plugin not found or mandatory" });
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const result = await uninstallMarketplacePluginForUser(
+      session.organization.id,
+      session.user.id,
+      req.params.pluginId,
+    );
+    if (!result)
+      return res.status(404).json({ error: "plugin not found or mandatory" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -3717,9 +5121,16 @@ app.post("/v1/plugins/:pluginId/uninstall", async (req, res, next) => {
 
 app.post("/v1/plugin-submissions", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const submission = await createPluginSubmission(session.organization.id, session.user.id, req.body);
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const submission = await createPluginSubmission(
+      session.organization.id,
+      session.user.id,
+      req.body,
+    );
     res.status(201).json(submission);
   } catch (error) {
     next(error);
@@ -3728,74 +5139,122 @@ app.post("/v1/plugin-submissions", async (req, res, next) => {
 
 app.post("/v1/plugin-releases", async (req, res, next) => {
   try {
-    const session = await getClientOrDashboardSession(req.header("authorization") ?? "");
-    if (!session) return res.status(401).json({ error: "invalid OpenLeash session" });
-    const release = await createPluginReleaseSubmission(session.organization.id, session.user.id, req.body);
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const release = await createPluginReleaseSubmission(
+      session.organization.id,
+      session.user.id,
+      req.body,
+    );
     res.status(201).json(release);
   } catch (error) {
     next(error);
   }
 });
 
-type ApiUser = { id: string; email?: string; display_name?: string; organization_id?: string | null };
+type ApiUser = {
+  id: string;
+  email?: string;
+  display_name?: string;
+  organization_id?: string | null;
+};
 
-async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventName, request: EvaluationRequest, user: ApiUser) {
+async function handlePromptOnlyHook(
+  agent: HookAgentSlug,
+  eventName: HookEventName,
+  request: EvaluationRequest,
+  user: ApiUser,
+  responseFormat: "native" | "proxy" = "native",
+) {
   const intentKey = triggerIntentKey(request);
-  const { conversationEventId, computerId, runtimeId, organizationId } = await recordConversationEvent(request, user, intentKey);
+  const { conversationEventId, computerId, runtimeId, organizationId } =
+    await recordConversationEvent(request, user, intentKey);
   const [config, runtimePlugins, tenantModelKey, policies] = await Promise.all([
     readPromptTransformConfig(organizationId, user.id),
     pluginSettingsForRuntime(organizationId, user.id),
     tenantModelKeyForEvaluation(organizationId),
     pool.query<Policy>(
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
-       from policies where enabled = true order by created_at asc`
-    )
+       from policies where enabled = true order by created_at asc`,
+    ),
   ]);
-  const promptResult = request.event.prompt && promptTransformsEnabled(config)
-    ? await runPromptPipeline({
-        request,
-        config,
-        organizationId,
-        conversationEventId,
-        userId: user.id,
-        computerId,
-        runtimeId,
-        tenantModelKey,
-        plugins: runtimePlugins
-      })
-    : undefined;
+  const promptEvaluation =
+    request.event.prompt && promptTransformsEnabled(config)
+      ? runPromptPipeline({
+          request,
+          config,
+          organizationId,
+          conversationEventId,
+          userId: user.id,
+          computerId,
+          runtimeId,
+          tenantModelKey,
+          plugins: runtimePlugins,
+        })
+      : Promise.resolve(undefined);
+  const runtimePolicies = policiesForRulesEnforcer(
+    runtimePlugins,
+    policies.rows,
+  );
+  const [promptResult, pipeline] = await Promise.all([
+    promptEvaluation,
+    runEvaluationPipeline({
+      request,
+      organizationId,
+      conversationEventId,
+      userId: user.id,
+      computerId,
+      runtimeId,
+      policies: runtimePolicies,
+      tenantModelKey,
+      plugins: runtimePlugins,
+    }),
+  ]);
   if (promptResult) {
-    await recordPromptTransformResult(conversationEventId, user.id, request.event.prompt ?? "", promptResult);
+    await recordPromptTransformResult(
+      conversationEventId,
+      user.id,
+      request.event.prompt ?? "",
+      promptResult,
+    );
   }
-
-  const runtimePolicies = policiesForRulesEnforcer(runtimePlugins, policies.rows);
-  const pipeline = await runEvaluationPipeline({
-    request,
-    organizationId,
-    conversationEventId,
-    userId: user.id,
-    computerId,
-    runtimeId,
-    policies: runtimePolicies,
-    tenantModelKey,
-    plugins: runtimePlugins
-  });
   const results = applyConfiguredRuleActions(pipeline.results, runtimePolicies);
-  const decision = promptResult?.blocked || results.some((result) => result.status === "failed")
-    ? "deny"
-    : results.some((result) => result.status === "needs_question")
-      ? "ask"
-      : "allow";
+  const decision =
+    promptResult?.blocked ||
+    results.some((result) => result.status === "failed")
+      ? "deny"
+      : results.some((result) => result.status === "needs_question")
+        ? "ask"
+        : "allow";
   const blockingResult = results.find((result) => result.status === "failed");
-  const reviewResult = results.find((result) => result.status === "needs_question");
+  const reviewResult = results.find(
+    (result) => result.status === "needs_question",
+  );
   const summary = promptResult?.blocked
     ? promptResult.summary
-    : blockingResult?.explanation ?? reviewResult?.explanation ?? promptResult?.summary ?? "OpenLeash logged this prompt intent.";
-  const question = reviewResult?.question ?? (decision === "ask" ? `${request.agent.displayName} wants to proceed with sensitive access. Allow it once?` : undefined);
+    : (blockingResult?.explanation ??
+      reviewResult?.explanation ??
+      promptResult?.summary ??
+      "OpenLeash logged this prompt intent.");
+  const question =
+    reviewResult?.question ??
+    (decision === "ask"
+      ? `${request.agent.displayName} wants to proceed with sensitive access. Allow it once?`
+      : undefined);
   const evaluation = await pool.query<{ id: string }>(
     `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
      values ($1, $2, $3, $4, $5, $6) returning id`,
-    [conversationEventId, user.id, decision, summary, question ?? null, pipeline.model]
+    [
+      conversationEventId,
+      user.id,
+      decision,
+      summary,
+      question ?? null,
+      pipeline.model,
+    ],
   );
   for (const result of results) {
     const policyId = resolvePolicyResultPolicyId(result, policies.rows);
@@ -3811,35 +5270,76 @@ async function handlePromptOnlyHook(agent: HookAgentSlug, eventName: HookEventNa
         result.severity,
         result.explanation,
         JSON.stringify(result.evidence ?? []),
-        result.question ?? null
-      ]
+        result.question ?? null,
+      ],
     );
   }
-  await recordPluginRuns(conversationEventId, [...(promptResult?.runs ?? []), ...pipeline.runs]);
+  await recordPluginRuns(conversationEventId, [
+    ...(promptResult?.runs ?? []),
+    ...pipeline.runs,
+  ]);
   if (decision === "ask") {
-    const purposeSummary = await summarizeActionPurpose(request, tenantModelKey);
-    notifyMobileApprovers(user.id, evaluation.rows[0].id, summary, question, purposeSummary).catch((error) => {
+    const purposeSummary = await summarizeActionPurpose(
+      request,
+      tenantModelKey,
+    );
+    notifyMobileApprovers(
+      user.id,
+      evaluation.rows[0].id,
+      summary,
+      question,
+      purposeSummary,
+    ).catch((error) => {
       console.warn("mobile approval notification failed", error);
     });
   }
-  const response: EvaluationResponse = { decision, decisionId: evaluation.rows[0].id, summary, question, results };
+  const response: EvaluationResponse = {
+    decision,
+    decisionId: evaluation.rows[0].id,
+    summary,
+    question,
+    results,
+  };
   const resolvedDecision = await waitForHookDecision(user, response);
-  if (resolvedDecision.decision === "allow" && promptResult && promptResult.finalPrompt !== request.event.prompt) {
-    return promptTransformHookDecision(agent, eventName, promptResult.finalPrompt, promptResult.summary);
+  const finalPrompt =
+    resolvedDecision.decision === "allow" && promptResult
+      ? promptResult.finalPrompt
+      : request.event.prompt;
+  if (responseFormat === "proxy") {
+    return { ...resolvedDecision, finalPrompt };
+  }
+  if (
+    resolvedDecision.decision === "allow" &&
+    promptResult &&
+    promptResult.finalPrompt !== request.event.prompt
+  ) {
+    return promptTransformHookDecision(
+      agent,
+      eventName,
+      promptResult.finalPrompt,
+      promptResult.summary,
+    );
   }
   return nativeHookDecision(agent, eventName, resolvedDecision);
 }
 
-async function readPromptTransformConfig(organizationId: string, userId?: string): Promise<PromptTransformConfig> {
+async function readPromptTransformConfig(
+  organizationId: string,
+  userId?: string,
+): Promise<PromptTransformConfig> {
   const row = await pool.query<{ config: unknown }>(
     "select config from prompt_transform_settings where organization_id = $1",
-    [organizationId]
+    [organizationId],
   );
-  const config = normalizePromptTransformConfig(row.rows[0]?.config ?? defaultPromptTransformConfig);
+  const config = normalizePromptTransformConfig(
+    row.rows[0]?.config ?? defaultPromptTransformConfig,
+  );
   const [pluginSettings, userPluginSettings, policy] = await Promise.all([
     readPluginSettings(organizationId),
-    userId ? readUserPluginSettings(organizationId, userId) : Promise.resolve(new Map<string, PluginSettingRecord>()),
-    readOrganizationPluginPolicy(organizationId)
+    userId
+      ? readUserPluginSettings(organizationId, userId)
+      : Promise.resolve(new Map<string, PluginSettingRecord>()),
+    readOrganizationPluginPolicy(organizationId),
   ]);
   const effectiveTransformPlugin = (pluginId: string) => {
     const organizationStored = pluginSettings.get(pluginId);
@@ -3848,11 +5348,16 @@ async function readPromptTransformConfig(organizationId: string, userId?: string
     const configLocked = Boolean(pluginPolicy?.configLocked);
     if (!organizationStored && !userStored && !pluginPolicy) return undefined;
     return {
-      enabled: pluginPolicy?.mandatory ? true : userStored?.enabled ?? organizationStored?.enabled ?? pluginPolicy?.defaultEnabled ?? false,
+      enabled: pluginPolicy?.mandatory
+        ? true
+        : (userStored?.enabled ??
+          organizationStored?.enabled ??
+          pluginPolicy?.defaultEnabled ??
+          false),
       config: {
         ...(organizationStored?.config ?? {}),
-        ...(configLocked ? {} : userStored?.config ?? {})
-      }
+        ...(configLocked ? {} : (userStored?.config ?? {})),
+      },
     };
   };
   const compression = effectiveTransformPlugin("openleash.prompt-compression");
@@ -3861,8 +5366,8 @@ async function readPromptTransformConfig(organizationId: string, userId?: string
       compression: {
         ...config.compression,
         ...(compression.config ?? {}),
-        enabled: compression.enabled
-      }
+        enabled: compression.enabled,
+      },
     }).compression;
   }
   const dlp = effectiveTransformPlugin("openleash.dlp");
@@ -3871,8 +5376,8 @@ async function readPromptTransformConfig(organizationId: string, userId?: string
       dlp: {
         ...config.dlp,
         ...(dlp.config ?? {}),
-        enabled: dlp.enabled
-      }
+        enabled: dlp.enabled,
+      },
     }).dlp;
   }
   return config;
@@ -3901,22 +5406,33 @@ type MarketplacePolicyRecord = {
   allowUserCommunityPlugins: boolean;
 };
 
-async function pluginCatalogForOrganization(organizationId: string, userId?: string): Promise<{ plugins: PluginCatalogItem[]; marketplacePolicy: MarketplacePolicyRecord }> {
+async function pluginCatalogForOrganization(
+  organizationId: string,
+  userId?: string,
+): Promise<{
+  plugins: PluginCatalogItem[];
+  marketplacePolicy: MarketplacePolicyRecord;
+}> {
   const [settings, userSettings, policyRows] = await Promise.all([
     readPluginSettings(organizationId),
-    userId ? readUserPluginSettings(organizationId, userId) : Promise.resolve(new Map<string, PluginSettingRecord>()),
+    userId
+      ? readUserPluginSettings(organizationId, userId)
+      : Promise.resolve(new Map<string, PluginSettingRecord>()),
     pool.query<Policy>(
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
        from policies
        where enabled = true
-       order by created_at asc`
-    )
+       order by created_at asc`,
+    ),
   ]);
   const policy = await readOrganizationPluginPolicy(organizationId);
-  const marketplacePolicy = await readOrganizationMarketplacePolicy(organizationId);
+  const marketplacePolicy =
+    await readOrganizationMarketplacePolicy(organizationId);
   const marketplace = await readMarketplaceListings("");
   const marketplaceById = new Map(marketplace.map((item) => [item.id, item]));
-  const manifestsById = new Map(firstPartyPluginManifests.map((manifest) => [manifest.id, manifest]));
+  const manifestsById = new Map(
+    firstPartyPluginManifests.map((manifest) => [manifest.id, manifest]),
+  );
   const ids = new Set([...marketplaceById.keys(), ...manifestsById.keys()]);
   return {
     marketplacePolicy,
@@ -3925,9 +5441,17 @@ async function pluginCatalogForOrganization(organizationId: string, userId?: str
         const listing = marketplaceById.get(pluginId);
         const manifest = manifestsById.get(pluginId) ?? listing;
         if (!manifest) return undefined;
-        return pluginCatalogItem(manifest, settings.get(pluginId), userSettings.get(pluginId), listing, policy.get(pluginId), marketplacePolicy, policyRows.rows);
+        return pluginCatalogItem(
+          manifest,
+          settings.get(pluginId),
+          userSettings.get(pluginId),
+          listing,
+          policy.get(pluginId),
+          marketplacePolicy,
+          policyRows.rows,
+        );
       })
-      .filter((item): item is PluginCatalogItem => Boolean(item))
+      .filter((item): item is PluginCatalogItem => Boolean(item)),
   };
 }
 
@@ -3938,18 +5462,29 @@ function pluginCatalogItem(
   marketplace?: PluginMarketplaceListing,
   policy?: PluginPolicyRecord,
   marketplacePolicy?: MarketplacePolicyRecord,
-  fallbackPolicies: Policy[] = []
+  fallbackPolicies: Policy[] = [],
 ): PluginCatalogItem {
-  const enabled = policy?.mandatory ? true : userSettings?.enabled ?? organizationSettings?.enabled ?? policy?.defaultEnabled ?? false;
+  const enabled = policy?.mandatory
+    ? true
+    : (userSettings?.enabled ??
+      organizationSettings?.enabled ??
+      policy?.defaultEnabled ??
+      false);
   const configLocked = Boolean(policy?.configLocked);
   const availableVersion = marketplace?.version ?? manifest.version;
-  const installedVersion = userSettings?.installedVersion ?? organizationSettings?.installedVersion ?? (enabled ? availableVersion : undefined);
+  const installedVersion =
+    userSettings?.installedVersion ??
+    organizationSettings?.installedVersion ??
+    (enabled ? availableVersion : undefined);
   const effectiveConfig = {
     ...(manifest.defaultConfig ?? {}),
     ...(organizationSettings?.config ?? {}),
-    ...(configLocked ? {} : userSettings?.config ?? {})
+    ...(configLocked ? {} : (userSettings?.config ?? {})),
   };
-  if (manifest.id === "openleash.rules-enforcer" && normalizeRuleConfigs(effectiveConfig.rules).length === 0) {
+  if (
+    manifest.id === "openleash.rules-enforcer" &&
+    normalizeRuleConfigs(effectiveConfig.rules).length === 0
+  ) {
     effectiveConfig.rules = policyRulesForConfig(fallbackPolicies);
   }
   return {
@@ -3960,33 +5495,59 @@ function pluginCatalogItem(
     settings: {
       enabled,
       config: effectiveConfig,
-      orderingPriority: userSettings?.orderingPriority ?? organizationSettings?.orderingPriority ?? manifest.ordering?.priority ?? null,
+      orderingPriority:
+        userSettings?.orderingPriority ??
+        organizationSettings?.orderingPriority ??
+        manifest.ordering?.priority ??
+        null,
       installedVersion,
       availableVersion,
-      updateAvailable: Boolean(enabled && installedVersion && installedVersion !== availableVersion),
-      updatePolicy: userSettings?.updatePolicy ?? organizationSettings?.updatePolicy ?? "manual",
-      updatedAt: userSettings?.updatedAt ?? organizationSettings?.updatedAt
+      updateAvailable: Boolean(
+        enabled && installedVersion && installedVersion !== availableVersion,
+      ),
+      updatePolicy:
+        userSettings?.updatePolicy ??
+        organizationSettings?.updatePolicy ??
+        "manual",
+      updatedAt: userSettings?.updatedAt ?? organizationSettings?.updatedAt,
     },
     organizationPolicy: {
       mandatory: Boolean(policy?.mandatory),
       defaultEnabled: Boolean(policy?.defaultEnabled ?? false),
-      userInstallAllowed: Boolean(policy?.userInstallAllowed ?? marketplacePolicy?.allowUserMarketplaceInstalls ?? true),
-      configLocked
-    }
+      userInstallAllowed: Boolean(
+        policy?.userInstallAllowed ??
+        marketplacePolicy?.allowUserMarketplaceInstalls ??
+        true,
+      ),
+      configLocked,
+    },
   };
 }
 
-async function savePluginSettingsForOrganization(organizationId: string, pluginId: string, body: Record<string, unknown>) {
+async function savePluginSettingsForOrganization(
+  organizationId: string,
+  pluginId: string,
+  body: Record<string, unknown>,
+) {
   const manifest = await manifestForPluginId(pluginId, body.marketplace);
   if (!manifest) return undefined;
-  const policy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
-  const enabled = policy?.mandatory ? true : typeof body.enabled === "boolean" ? body.enabled : true;
-  const config = body.config && typeof body.config === "object" && !Array.isArray(body.config)
-    ? body.config as Record<string, unknown>
-    : manifest.defaultConfig ?? {};
+  const policy = (await readOrganizationPluginPolicy(organizationId)).get(
+    pluginId,
+  );
+  const enabled = policy?.mandatory
+    ? true
+    : typeof body.enabled === "boolean"
+      ? body.enabled
+      : true;
+  const config =
+    body.config &&
+    typeof body.config === "object" &&
+    !Array.isArray(body.config)
+      ? (body.config as Record<string, unknown>)
+      : (manifest.defaultConfig ?? {});
   const orderingPriority = Number.isFinite(Number(body.orderingPriority))
     ? Number(body.orderingPriority)
-    : manifest.ordering?.priority ?? null;
+    : (manifest.ordering?.priority ?? null);
   const requestedInstalledVersion = optionalString(body.installedVersion);
   const availableVersion = manifest.version;
   const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
@@ -4002,32 +5563,63 @@ async function savePluginSettingsForOrganization(organizationId: string, pluginI
        updated_at = now()
      returning plugin_id, enabled, config, ordering_priority as "orderingPriority",
                installed_version as "installedVersion", update_policy as "updatePolicy", updated_at`,
-    [organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority, requestedInstalledVersion, updatePolicy, availableVersion]
+    [
+      organizationId,
+      manifest.id,
+      enabled,
+      JSON.stringify(config),
+      orderingPriority,
+      requestedInstalledVersion,
+      updatePolicy,
+      availableVersion,
+    ],
   );
   return { pluginId: manifest.id, settings: result.rows[0] };
 }
 
-async function savePluginSettingsForUser(organizationId: string, userId: string, pluginId: string, body: Record<string, unknown>) {
+async function savePluginSettingsForUser(
+  organizationId: string,
+  userId: string,
+  pluginId: string,
+  body: Record<string, unknown>,
+) {
   const manifest = await manifestForPluginId(pluginId, body.marketplace);
   if (!manifest) return undefined;
   const [policy, marketplacePolicy, organizationSettings] = await Promise.all([
     readOrganizationPluginPolicy(organizationId),
     readOrganizationMarketplacePolicy(organizationId),
-    readPluginSettings(organizationId)
+    readPluginSettings(organizationId),
   ]);
   const pluginPolicy = policy.get(manifest.id);
-  if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false) return undefined;
-  if (!pluginPolicy?.mandatory && !marketplacePolicy.allowUserMarketplaceInstalls) return undefined;
-  if (manifest.publisher !== "openleash" && !marketplacePolicy.allowUserCommunityPlugins) return undefined;
-  const enabled = pluginPolicy?.mandatory ? true : typeof body.enabled === "boolean" ? body.enabled : true;
+  if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false)
+    return undefined;
+  if (
+    !pluginPolicy?.mandatory &&
+    !marketplacePolicy.allowUserMarketplaceInstalls
+  )
+    return undefined;
+  if (
+    manifest.publisher !== "openleash" &&
+    !marketplacePolicy.allowUserCommunityPlugins
+  )
+    return undefined;
+  const enabled = pluginPolicy?.mandatory
+    ? true
+    : typeof body.enabled === "boolean"
+      ? body.enabled
+      : true;
   const config = pluginPolicy?.configLocked
     ? {}
-    : body.config && typeof body.config === "object" && !Array.isArray(body.config)
-      ? body.config as Record<string, unknown>
+    : body.config &&
+        typeof body.config === "object" &&
+        !Array.isArray(body.config)
+      ? (body.config as Record<string, unknown>)
       : {};
   const orderingPriority = Number.isFinite(Number(body.orderingPriority))
     ? Number(body.orderingPriority)
-    : organizationSettings.get(manifest.id)?.orderingPriority ?? manifest.ordering?.priority ?? null;
+    : (organizationSettings.get(manifest.id)?.orderingPriority ??
+      manifest.ordering?.priority ??
+      null);
   const requestedInstalledVersion = optionalString(body.installedVersion);
   const availableVersion = manifest.version;
   const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
@@ -4052,7 +5644,17 @@ async function savePluginSettingsForUser(organizationId: string, userId: string,
        updated_at = now()
      returning plugin_id, enabled, config, ordering_priority as "orderingPriority",
                installed_version as "installedVersion", update_policy as "updatePolicy", updated_at`,
-    [userId, organizationId, manifest.id, enabled, JSON.stringify(config), orderingPriority, requestedInstalledVersion, updatePolicy, availableVersion]
+    [
+      userId,
+      organizationId,
+      manifest.id,
+      enabled,
+      JSON.stringify(config),
+      orderingPriority,
+      requestedInstalledVersion,
+      updatePolicy,
+      availableVersion,
+    ],
   );
   const stored = result.rows[0];
   return {
@@ -4067,41 +5669,63 @@ async function savePluginSettingsForUser(organizationId: string, userId: string,
         orderingPriority: stored.orderingPriority,
         installedVersion: stored.installedVersion ?? undefined,
         updatePolicy: stored.updatePolicy,
-        updatedAt: stored.updated_at
+        updatedAt: stored.updated_at,
       },
       undefined,
       pluginPolicy,
-      marketplacePolicy
-    ).settings
+      marketplacePolicy,
+    ).settings,
   };
 }
 
-async function pluginMarketplaceForOrganization(organizationId: string, search: string, options: { includePending?: boolean; userId?: string } = {}) {
+async function pluginMarketplaceForOrganization(
+  organizationId: string,
+  search: string,
+  options: { includePending?: boolean; userId?: string } = {},
+) {
   const [plugins, marketplacePolicy] = await Promise.all([
     pluginCatalogForOrganization(organizationId, options.userId),
-    readOrganizationMarketplacePolicy(organizationId)
+    readOrganizationMarketplacePolicy(organizationId),
   ]);
   let listings = await readMarketplaceListings(search, options);
   if (!marketplacePolicy.allowUserCommunityPlugins) {
     listings = listings.filter((listing) => listing.source === "first_party");
   }
-  const installed = new Set(plugins.plugins.filter((plugin) => plugin.settings.enabled).map((plugin) => plugin.id));
-  const mandatory = new Set(plugins.plugins.filter((plugin) => plugin.organizationPolicy?.mandatory).map((plugin) => plugin.id));
+  const installed = new Set(
+    plugins.plugins
+      .filter((plugin) => plugin.settings.enabled)
+      .map((plugin) => plugin.id),
+  );
+  const mandatory = new Set(
+    plugins.plugins
+      .filter((plugin) => plugin.organizationPolicy?.mandatory)
+      .map((plugin) => plugin.id),
+  );
   return {
     marketplacePolicy,
     listings: listings.map((listing) => ({
       ...listing,
       installed: installed.has(listing.id),
       mandatory: mandatory.has(listing.id),
-      installable: marketplacePolicy.allowUserMarketplaceInstalls || mandatory.has(listing.id) || installed.has(listing.id)
-    }))
+      installable:
+        marketplacePolicy.allowUserMarketplaceInstalls ||
+        mandatory.has(listing.id) ||
+        installed.has(listing.id),
+    })),
   };
 }
 
-async function readMarketplaceListings(search: string, options: { includePending?: boolean } = {}): Promise<PluginMarketplaceListing[]> {
+async function readMarketplaceListings(
+  search: string,
+  options: { includePending?: boolean } = {},
+): Promise<PluginMarketplaceListing[]> {
   const query = search.trim();
   const params: unknown[] = [];
-  const where = [options.includePending ? "review_status <> 'rejected'" : "review_status = 'approved'"];
+  const where = [
+    options.includePending
+      ? "review_status <> 'rejected'"
+      : "review_status = 'approved'",
+  ];
   if (query) {
     params.push(query);
     where.push(`(
@@ -4115,23 +5739,27 @@ async function readMarketplaceListings(search: string, options: { includePending
      where ${where.join(" and ")}
      order by featured_rank nulls last, slug asc
      limit 50`,
-    params
+    params,
   );
   return rows.rows.map(marketplaceListingFromRow);
 }
 
-async function readMarketplaceListingBySlug(slug: string): Promise<PluginMarketplaceListing | undefined> {
+async function readMarketplaceListingBySlug(
+  slug: string,
+): Promise<PluginMarketplaceListing | undefined> {
   const rows = await pool.query(
     `select *
      from plugin_marketplace
      where slug = $1 and review_status = 'approved'
      limit 1`,
-    [slug]
+    [slug],
   );
   return rows.rows[0] ? marketplaceListingFromRow(rows.rows[0]) : undefined;
 }
 
-function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketplaceListing {
+function marketplaceListingFromRow(
+  row: Record<string, unknown>,
+): PluginMarketplaceListing {
   const slug = String(row.slug);
   return {
     id: String(row.plugin_id),
@@ -4143,52 +5771,99 @@ function marketplaceListingFromRow(row: Record<string, unknown>): PluginMarketpl
     developerName: String(row.developer_name),
     developerUrl: optionalString(row.developer_url),
     source: String(row.source) as PluginMarketplaceListing["source"],
-    reviewStatus: String(row.review_status) as PluginMarketplaceListing["reviewStatus"],
+    reviewStatus: String(
+      row.review_status,
+    ) as PluginMarketplaceListing["reviewStatus"],
     shortDescription: String(row.short_description),
     longDescription: String(row.long_description),
     heroTagline: String(row.hero_tagline),
     packageUrl: optionalString(row.package_url),
-    repositoryUrl: normalizedPluginRepositoryUrl(String(row.plugin_id), slug, optionalString(row.repository_url)),
+    repositoryUrl: normalizedPluginRepositoryUrl(
+      String(row.plugin_id),
+      slug,
+      optionalString(row.repository_url),
+    ),
     documentationUrl: optionalString(row.documentation_url),
     runtime: String(row.runtime) as PluginMarketplaceListing["runtime"],
     entrypoint: String(row.entrypoint),
     events: arrayValue(row.events) as PluginMarketplaceListing["events"],
-    permissions: arrayValue(row.permissions) as PluginMarketplaceListing["permissions"],
+    permissions: arrayValue(
+      row.permissions,
+    ) as PluginMarketplaceListing["permissions"],
     effects: arrayValue(row.effects) as PluginMarketplaceListing["effects"],
     ordering: objectValue(row.ordering) as PluginMarketplaceListing["ordering"],
-    configSchema: objectValue(row.config_schema) as PluginMarketplaceListing["configSchema"],
+    configSchema: objectValue(
+      row.config_schema,
+    ) as PluginMarketplaceListing["configSchema"],
     defaultConfig: objectValue(row.default_config) ?? {},
     tags: arrayValue(row.tags),
     iconText: String(row.icon_text ?? "OL"),
     visualPng: optionalString(row.visual_png),
-    installCount: row.install_count === undefined ? undefined : Number(row.install_count ?? 0),
-    downloadCount: row.download_count === undefined ? undefined : Number(row.download_count ?? 0),
-    weeklyDownloadCount: row.weekly_download_count === undefined ? undefined : Number(row.weekly_download_count ?? 0),
-    trendPercent: row.trend_percent === undefined ? undefined : Number(row.trend_percent ?? 0),
+    installCount:
+      row.install_count === undefined
+        ? undefined
+        : Number(row.install_count ?? 0),
+    downloadCount:
+      row.download_count === undefined
+        ? undefined
+        : Number(row.download_count ?? 0),
+    weeklyDownloadCount:
+      row.weekly_download_count === undefined
+        ? undefined
+        : Number(row.weekly_download_count ?? 0),
+    trendPercent:
+      row.trend_percent === undefined
+        ? undefined
+        : Number(row.trend_percent ?? 0),
     rating: row.rating === undefined ? undefined : Number(row.rating ?? 0),
-    ratingCount: row.rating_count === undefined ? undefined : Number(row.rating_count ?? 0),
-    featuredRank: row.featured_rank === null || row.featured_rank === undefined ? null : Number(row.featured_rank),
+    ratingCount:
+      row.rating_count === undefined
+        ? undefined
+        : Number(row.rating_count ?? 0),
+    featuredRank:
+      row.featured_rank === null || row.featured_rank === undefined
+        ? null
+        : Number(row.featured_rank),
     seoTitle: String(row.seo_title),
     seoDescription: String(row.seo_description),
     createdAt: optionalString(row.created_at),
-    updatedAt: optionalString(row.updated_at)
+    updatedAt: optionalString(row.updated_at),
   };
 }
 
-function normalizedPluginRepositoryUrl(pluginId: string, slug: string, repositoryUrl?: string) {
-  if (pluginId === "openleash.prompt-compression") return "https://github.com/open-leash/plugin-token-saver";
-  if (pluginId === "openleash.dlp") return "https://github.com/open-leash/plugin-data-leakage-prevention";
-  if (pluginId.startsWith("openleash.")) return `https://github.com/open-leash/plugin-${slug}`;
-  if (repositoryUrl === "https://github.com/open-leash/open-leash") return undefined;
-  if (repositoryUrl === "https://github.com/open-leash/plugins") return undefined;
+function normalizedPluginRepositoryUrl(
+  pluginId: string,
+  slug: string,
+  repositoryUrl?: string,
+) {
+  if (pluginId === "openleash.prompt-compression")
+    return "https://github.com/open-leash/plugin-token-saver";
+  if (pluginId === "openleash.dlp")
+    return "https://github.com/open-leash/plugin-data-leakage-prevention";
+  if (pluginId.startsWith("openleash."))
+    return `https://github.com/open-leash/plugin-${slug}`;
+  if (repositoryUrl === "https://github.com/open-leash/open-leash")
+    return undefined;
+  if (repositoryUrl === "https://github.com/open-leash/plugins")
+    return undefined;
   return repositoryUrl;
 }
 
-async function manifestForPluginId(pluginId: string, marketplaceInput?: unknown): Promise<OpenLeashPluginManifest | undefined> {
-  const firstParty = firstPartyPluginManifests.find((plugin) => plugin.id === pluginId);
+async function manifestForPluginId(
+  pluginId: string,
+  marketplaceInput?: unknown,
+): Promise<OpenLeashPluginManifest | undefined> {
+  const firstParty = firstPartyPluginManifests.find(
+    (plugin) => plugin.id === pluginId,
+  );
   if (firstParty) return firstParty;
-  const rows = await pool.query("select * from plugin_marketplace where plugin_id = $1 and review_status = 'approved'", [pluginId]);
-  const listing = rows.rows[0] ? marketplaceListingFromRow(rows.rows[0]) : undefined;
+  const rows = await pool.query(
+    "select * from plugin_marketplace where plugin_id = $1 and review_status = 'approved'",
+    [pluginId],
+  );
+  const listing = rows.rows[0]
+    ? marketplaceListingFromRow(rows.rows[0])
+    : undefined;
   if (listing) return listing;
   const imported = marketplaceListingFromInput(pluginId, marketplaceInput);
   if (!imported) return undefined;
@@ -4196,36 +5871,56 @@ async function manifestForPluginId(pluginId: string, marketplaceInput?: unknown)
   return imported;
 }
 
-async function installMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
+async function installMarketplacePluginForUser(
+  organizationId: string,
+  userId: string,
+  pluginId: string,
+) {
   const policy = await readOrganizationMarketplacePolicy(organizationId);
-  const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
+  const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(
+    pluginId,
+  );
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
-  if (!pluginPolicy?.mandatory && !policy.allowUserMarketplaceInstalls) return undefined;
-  if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false) return undefined;
-  if (manifest.publisher !== "openleash" && !policy.allowUserCommunityPlugins) return undefined;
+  if (!pluginPolicy?.mandatory && !policy.allowUserMarketplaceInstalls)
+    return undefined;
+  if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false)
+    return undefined;
+  if (manifest.publisher !== "openleash" && !policy.allowUserCommunityPlugins)
+    return undefined;
   return savePluginSettingsForUser(organizationId, userId, pluginId, {
     enabled: true,
     config: manifest.defaultConfig ?? {},
-    installedVersion: manifest.version
+    installedVersion: manifest.version,
   });
 }
 
-function marketplaceListingFromInput(pluginId: string, input: unknown): PluginMarketplaceListing | undefined {
+function marketplaceListingFromInput(
+  pluginId: string,
+  input: unknown,
+): PluginMarketplaceListing | undefined {
   if (!input || typeof input !== "object") return undefined;
   const value = input as Record<string, unknown>;
   const id = optionalString(value.id);
   if (!id || id !== pluginId) return undefined;
   const name = optionalString(value.name) || optionalString(value.slug) || id;
-  const description = optionalString(value.description) || optionalString(value.shortDescription) || "OpenLeash plugin.";
+  const description =
+    optionalString(value.description) ||
+    optionalString(value.shortDescription) ||
+    "OpenLeash plugin.";
   const version = optionalString(value.version) || "0.0.0";
   const publisher = optionalString(value.publisher) || "openleash";
-  const runtime = optionalString(value.runtime) as OpenLeashPluginManifest["runtime"] | undefined;
+  const runtime = optionalString(value.runtime) as
+    OpenLeashPluginManifest["runtime"] | undefined;
   const entrypoint = optionalString(value.entrypoint);
   if (!runtime || !entrypoint) return undefined;
   const slug = slugify(optionalString(value.slug) || name || id);
-  const shortDescription = sentence(optionalString(value.shortDescription) || description);
-  const developerName = optionalString(value.developerName) || (publisher === "openleash" ? "OpenLeash" : titleize(publisher));
+  const shortDescription = sentence(
+    optionalString(value.shortDescription) || description,
+  );
+  const developerName =
+    optionalString(value.developerName) ||
+    (publisher === "openleash" ? "OpenLeash" : titleize(publisher));
   return {
     id,
     slug,
@@ -4236,7 +5931,13 @@ function marketplaceListingFromInput(pluginId: string, input: unknown): PluginMa
     publisher,
     developerName,
     developerUrl: optionalString(value.developerUrl),
-    source: (["first_party", "community", "private"].includes(String(value.source)) ? String(value.source) : publisher === "openleash" ? "first_party" : "community") as PluginMarketplaceListing["source"],
+    source: (["first_party", "community", "private"].includes(
+      String(value.source),
+    )
+      ? String(value.source)
+      : publisher === "openleash"
+        ? "first_party"
+        : "community") as PluginMarketplaceListing["source"],
     reviewStatus: "approved",
     shortDescription,
     longDescription: optionalString(value.longDescription) || description,
@@ -4246,17 +5947,27 @@ function marketplaceListingFromInput(pluginId: string, input: unknown): PluginMa
     runtime,
     entrypoint,
     events: arrayValue(value.events) as PluginMarketplaceListing["events"],
-    permissions: arrayValue(value.permissions) as PluginMarketplaceListing["permissions"],
+    permissions: arrayValue(
+      value.permissions,
+    ) as PluginMarketplaceListing["permissions"],
     effects: arrayValue(value.effects) as PluginMarketplaceListing["effects"],
-    ordering: objectValue(value.ordering) as PluginMarketplaceListing["ordering"],
-    configSchema: objectValue(value.configSchema) as PluginMarketplaceListing["configSchema"],
+    ordering: objectValue(
+      value.ordering,
+    ) as PluginMarketplaceListing["ordering"],
+    configSchema: objectValue(
+      value.configSchema,
+    ) as PluginMarketplaceListing["configSchema"],
     defaultConfig: objectValue(value.defaultConfig) ?? {},
     tags: arrayValue(value.tags),
-    iconText: optionalString(value.iconText) || slug.slice(0, 2).toUpperCase() || "OL",
+    iconText:
+      optionalString(value.iconText) || slug.slice(0, 2).toUpperCase() || "OL",
     visualPng: optionalString(value.visualPng),
-    featuredRank: typeof value.featuredRank === "number" ? value.featuredRank : null,
+    featuredRank:
+      typeof value.featuredRank === "number" ? value.featuredRank : null,
     seoTitle: optionalString(value.seoTitle) || `${slug} Plugin for OpenLeash`,
-    seoDescription: optionalString(value.seoDescription) || `Install ${slug} for OpenLeash. ${shortDescription}`
+    seoDescription:
+      optionalString(value.seoDescription) ||
+      `Install ${slug} for OpenLeash. ${shortDescription}`,
   };
 }
 
@@ -4336,35 +6047,53 @@ async function upsertLocalMarketplaceListing(plugin: PluginMarketplaceListing) {
       plugin.visualPng ?? null,
       plugin.featuredRank ?? null,
       plugin.seoTitle,
-      plugin.seoDescription
-    ]
+      plugin.seoDescription,
+    ],
   );
 }
 
-async function updateMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
+async function updateMarketplacePluginForUser(
+  organizationId: string,
+  userId: string,
+  pluginId: string,
+) {
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
-  const settings = (await readUserPluginSettings(organizationId, userId)).get(manifest.id);
+  const settings = (await readUserPluginSettings(organizationId, userId)).get(
+    manifest.id,
+  );
   if (!settings?.enabled) return undefined;
   return savePluginSettingsForUser(organizationId, userId, pluginId, {
     enabled: true,
     config: settings.config,
     orderingPriority: settings.orderingPriority,
     installedVersion: manifest.version,
-    updatePolicy: settings.updatePolicy
+    updatePolicy: settings.updatePolicy,
   });
 }
 
-async function uninstallMarketplacePluginForUser(organizationId: string, userId: string, pluginId: string) {
-  const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
+async function uninstallMarketplacePluginForUser(
+  organizationId: string,
+  userId: string,
+  pluginId: string,
+) {
+  const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(
+    pluginId,
+  );
   if (pluginPolicy?.mandatory) return undefined;
   if (!pluginPolicy?.userInstallAllowed) return undefined;
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
-  return savePluginSettingsForUser(organizationId, userId, pluginId, { enabled: false, config: manifest.defaultConfig ?? {} });
+  return savePluginSettingsForUser(organizationId, userId, pluginId, {
+    enabled: false,
+    config: manifest.defaultConfig ?? {},
+  });
 }
 
-async function updateMarketplacePluginForOrganization(organizationId: string, pluginId: string) {
+async function updateMarketplacePluginForOrganization(
+  organizationId: string,
+  pluginId: string,
+) {
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
   const settings = (await readPluginSettings(organizationId)).get(manifest.id);
@@ -4374,15 +6103,21 @@ async function updateMarketplacePluginForOrganization(organizationId: string, pl
     config: settings.config,
     orderingPriority: settings.orderingPriority,
     installedVersion: manifest.version,
-    updatePolicy: settings.updatePolicy
+    updatePolicy: settings.updatePolicy,
   });
 }
 
-async function saveOrganizationPluginPolicy(organizationId: string, pluginId: string, body: Record<string, unknown>) {
-  if (!await manifestForPluginId(pluginId)) return undefined;
+async function saveOrganizationPluginPolicy(
+  organizationId: string,
+  pluginId: string,
+  body: Record<string, unknown>,
+) {
+  if (!(await manifestForPluginId(pluginId))) return undefined;
   const mandatory = Boolean(body.mandatory);
   const defaultEnabled = mandatory || Boolean(body.defaultEnabled);
-  const userInstallAllowed = mandatory ? false : body.userInstallAllowed !== false;
+  const userInstallAllowed = mandatory
+    ? false
+    : body.userInstallAllowed !== false;
   const configLocked = mandatory || Boolean(body.configLocked);
   const result = await pool.query(
     `insert into organization_plugin_policy (organization_id, plugin_id, mandatory, default_enabled, user_install_allowed, config_locked, updated_at)
@@ -4394,14 +6129,28 @@ async function saveOrganizationPluginPolicy(organizationId: string, pluginId: st
        config_locked = excluded.config_locked,
        updated_at = now()
      returning plugin_id as "pluginId", mandatory, default_enabled as "defaultEnabled", user_install_allowed as "userInstallAllowed", config_locked as "configLocked", updated_at as "updatedAt"`,
-    [organizationId, pluginId, mandatory, defaultEnabled, userInstallAllowed, configLocked]
+    [
+      organizationId,
+      pluginId,
+      mandatory,
+      defaultEnabled,
+      userInstallAllowed,
+      configLocked,
+    ],
   );
-  if (mandatory) await savePluginSettingsForOrganization(organizationId, pluginId, { enabled: true });
+  if (mandatory)
+    await savePluginSettingsForOrganization(organizationId, pluginId, {
+      enabled: true,
+    });
   return { pluginId, policy: result.rows[0] };
 }
 
-async function saveOrganizationMarketplacePolicy(organizationId: string, body: Record<string, unknown>) {
-  const allowUserMarketplaceInstalls = body.allowUserMarketplaceInstalls !== false;
+async function saveOrganizationMarketplacePolicy(
+  organizationId: string,
+  body: Record<string, unknown>,
+) {
+  const allowUserMarketplaceInstalls =
+    body.allowUserMarketplaceInstalls !== false;
   const allowUserCommunityPlugins = Boolean(body.allowUserCommunityPlugins);
   const result = await pool.query(
     `insert into organization_plugin_marketplace_policy (organization_id, allow_user_marketplace_installs, allow_user_community_plugins, updated_at)
@@ -4413,7 +6162,7 @@ async function saveOrganizationMarketplacePolicy(organizationId: string, body: R
      returning allow_user_marketplace_installs as "allowUserMarketplaceInstalls",
                allow_user_community_plugins as "allowUserCommunityPlugins",
                updated_at as "updatedAt"`,
-    [organizationId, allowUserMarketplaceInstalls, allowUserCommunityPlugins]
+    [organizationId, allowUserMarketplaceInstalls, allowUserCommunityPlugins],
   );
   return { marketplacePolicy: result.rows[0] };
 }
@@ -4429,18 +6178,25 @@ async function readOrganizationPluginPolicy(organizationId: string) {
     `select plugin_id, mandatory, default_enabled, user_install_allowed, config_locked
      from organization_plugin_policy
      where organization_id = $1`,
-    [organizationId]
+    [organizationId],
   );
-  return new Map<string, PluginPolicyRecord>(rows.rows.map((row) => [row.plugin_id, {
-    pluginId: row.plugin_id,
-    mandatory: row.mandatory,
-    defaultEnabled: row.default_enabled,
-    userInstallAllowed: row.user_install_allowed,
-    configLocked: row.config_locked
-  }]));
+  return new Map<string, PluginPolicyRecord>(
+    rows.rows.map((row) => [
+      row.plugin_id,
+      {
+        pluginId: row.plugin_id,
+        mandatory: row.mandatory,
+        defaultEnabled: row.default_enabled,
+        userInstallAllowed: row.user_install_allowed,
+        configLocked: row.config_locked,
+      },
+    ]),
+  );
 }
 
-async function readOrganizationMarketplacePolicy(organizationId: string): Promise<MarketplacePolicyRecord> {
+async function readOrganizationMarketplacePolicy(
+  organizationId: string,
+): Promise<MarketplacePolicyRecord> {
   const rows = await pool.query<{
     allow_user_marketplace_installs: boolean;
     allow_user_community_plugins: boolean;
@@ -4448,15 +6204,21 @@ async function readOrganizationMarketplacePolicy(organizationId: string): Promis
     `select allow_user_marketplace_installs, allow_user_community_plugins
      from organization_plugin_marketplace_policy
      where organization_id = $1`,
-    [organizationId]
+    [organizationId],
   );
   return {
-    allowUserMarketplaceInstalls: rows.rows[0]?.allow_user_marketplace_installs ?? true,
-    allowUserCommunityPlugins: rows.rows[0]?.allow_user_community_plugins ?? true
+    allowUserMarketplaceInstalls:
+      rows.rows[0]?.allow_user_marketplace_installs ?? true,
+    allowUserCommunityPlugins:
+      rows.rows[0]?.allow_user_community_plugins ?? true,
   };
 }
 
-async function createPluginSubmission(organizationId: string, submittedBy: string, body: Record<string, unknown>) {
+async function createPluginSubmission(
+  organizationId: string,
+  submittedBy: string,
+  body: Record<string, unknown>,
+) {
   const slug = slugify(String(body.slug ?? body.name ?? ""));
   const pluginId = String(body.pluginId ?? `community.${slug}`).trim();
   const developerName = String(body.developerName ?? "").trim();
@@ -4471,32 +6233,60 @@ async function createPluginSubmission(organizationId: string, submittedBy: strin
     (error as Error & { status?: number }).status = 400;
     throw error;
   }
-  const manifest = body.manifest && typeof body.manifest === "object" && !Array.isArray(body.manifest) ? body.manifest : {};
+  const manifest =
+    body.manifest &&
+    typeof body.manifest === "object" &&
+    !Array.isArray(body.manifest)
+      ? body.manifest
+      : {};
   const result = await pool.query(
     `insert into plugin_submissions (organization_id, submitted_by, plugin_id, slug, name, developer_name, package_url, repository_url, manifest)
      values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
      returning id, plugin_id as "pluginId", slug, name, developer_name as "developerName", status, created_at as "createdAt"`,
-    [organizationId, submittedBy, pluginId, slug, slug, developerName, optionalString(body.packageUrl), repositoryUrl, JSON.stringify(manifest)]
+    [
+      organizationId,
+      submittedBy,
+      pluginId,
+      slug,
+      slug,
+      developerName,
+      optionalString(body.packageUrl),
+      repositoryUrl,
+      JSON.stringify(manifest),
+    ],
   );
   return { submission: result.rows[0] };
 }
 
-async function createPluginReleaseSubmission(organizationId: string, submittedBy: string, body: Record<string, unknown>) {
+async function createPluginReleaseSubmission(
+  organizationId: string,
+  submittedBy: string,
+  body: Record<string, unknown>,
+) {
   const repositoryUrl = normalizeGithubRepositoryUrl(body.repositoryUrl);
-  if (!repositoryUrl) throw new HttpError(400, "A public GitHub repository URL is required.");
-  const manifestPath = optionalString(body.manifestPath) ?? "openleash.plugin.json";
+  if (!repositoryUrl)
+    throw new HttpError(400, "A public GitHub repository URL is required.");
+  const manifestPath =
+    optionalString(body.manifestPath) ?? "openleash.plugin.json";
   const gitRef = optionalString(body.gitRef) ?? optionalString(body.version);
-  if (!gitRef) throw new HttpError(400, "gitRef is required for an immutable plugin release.");
-  const rawManifest = body.manifest && typeof body.manifest === "object" && !Array.isArray(body.manifest)
-    ? body.manifest as Record<string, unknown>
-    : await fetchGithubPluginManifest(repositoryUrl, gitRef, manifestPath);
+  if (!gitRef)
+    throw new HttpError(
+      400,
+      "gitRef is required for an immutable plugin release.",
+    );
+  const rawManifest =
+    body.manifest &&
+    typeof body.manifest === "object" &&
+    !Array.isArray(body.manifest)
+      ? (body.manifest as Record<string, unknown>)
+      : await fetchGithubPluginManifest(repositoryUrl, gitRef, manifestPath);
   const release = pluginReleaseFieldsFromManifest(rawManifest, {
     repositoryUrl,
     gitRef,
     manifestPath,
     commitSha: optionalString(body.commitSha),
     source: body.source === "private" ? "private" : "community",
-    developerName: optionalString(body.developerName)
+    developerName: optionalString(body.developerName),
   });
   const result = await pool.query(
     `insert into plugin_releases (
@@ -4580,14 +6370,24 @@ async function createPluginReleaseSubmission(organizationId: string, submittedBy
       release.commitSha ?? null,
       release.manifestPath,
       JSON.stringify(rawManifest),
-      submittedBy
-    ]
+      submittedBy,
+    ],
   );
   await pool.query(
     `insert into plugin_submissions (organization_id, submitted_by, plugin_id, slug, name, developer_name, package_url, repository_url, manifest, status, updated_at)
      values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'pending_review', now())
      on conflict do nothing`,
-    [organizationId, submittedBy, release.pluginId, release.slug, release.name, release.developerName, release.packageUrl ?? null, release.repositoryUrl, JSON.stringify(rawManifest)]
+    [
+      organizationId,
+      submittedBy,
+      release.pluginId,
+      release.slug,
+      release.name,
+      release.developerName,
+      release.packageUrl ?? null,
+      release.repositoryUrl,
+      JSON.stringify(rawManifest),
+    ],
   );
   return { release: pluginReleaseFromRow(result.rows[0]) };
 }
@@ -4595,7 +6395,12 @@ async function createPluginReleaseSubmission(organizationId: string, submittedBy
 async function listPluginReleases(status: string) {
   const params: unknown[] = [];
   const where: string[] = [];
-  if (status === "pending_review" || status === "approved" || status === "rejected" || status === "yanked") {
+  if (
+    status === "pending_review" ||
+    status === "approved" ||
+    status === "rejected" ||
+    status === "yanked"
+  ) {
     params.push(status);
     where.push(`review_status = $${params.length}`);
   }
@@ -4604,13 +6409,22 @@ async function listPluginReleases(status: string) {
      ${where.length ? `where ${where.join(" and ")}` : ""}
      order by created_at desc
      limit 100`,
-    params
+    params,
   );
   return rows.rows.map(pluginReleaseFromRow);
 }
 
-async function approvePluginRelease(id: string, reviewerId: string | undefined, body: Record<string, unknown>) {
-  const reviewed = await reviewPluginRelease(id, "approved", reviewerId, body?.reviewerNote);
+async function approvePluginRelease(
+  id: string,
+  reviewerId: string | undefined,
+  body: Record<string, unknown>,
+) {
+  const reviewed = await reviewPluginRelease(
+    id,
+    "approved",
+    reviewerId,
+    body?.reviewerNote,
+  );
   if (!reviewed) return undefined;
   const release = reviewed.release;
   await pool.query(
@@ -4686,17 +6500,22 @@ async function approvePluginRelease(id: string, reviewerId: string | undefined, 
       release.iconText,
       release.visualPng ?? null,
       `${release.slug} Plugin for OpenLeash`,
-      `Install ${release.slug} for OpenLeash. ${release.shortDescription}`
-    ]
+      `Install ${release.slug} for OpenLeash. ${release.shortDescription}`,
+    ],
   );
   await pool.query(
     "update plugin_submissions set status = 'approved', updated_at = now() where plugin_id = $1 and status = 'pending_review'",
-    [release.pluginId]
+    [release.pluginId],
   );
   return reviewed;
 }
 
-async function reviewPluginRelease(id: string, status: "approved" | "rejected" | "yanked", reviewerId?: string, reviewerNote?: unknown) {
+async function reviewPluginRelease(
+  id: string,
+  status: "approved" | "rejected" | "yanked",
+  reviewerId?: string,
+  reviewerNote?: unknown,
+) {
   const result = await pool.query(
     `update plugin_releases
      set review_status = $2,
@@ -4706,9 +6525,11 @@ async function reviewPluginRelease(id: string, status: "approved" | "rejected" |
          updated_at = now()
      where id = $1
      returning *`,
-    [id, status, reviewerId ?? null, optionalString(reviewerNote) ?? null]
+    [id, status, reviewerId ?? null, optionalString(reviewerNote) ?? null],
   );
-  return result.rows[0] ? { release: pluginReleaseFromRow(result.rows[0]) } : undefined;
+  return result.rows[0]
+    ? { release: pluginReleaseFromRow(result.rows[0]) }
+    : undefined;
 }
 
 type PluginReleaseFields = {
@@ -4743,33 +6564,45 @@ type PluginReleaseFields = {
   manifestPath: string;
 };
 
-function pluginReleaseFieldsFromManifest(manifest: Record<string, unknown>, source: {
-  repositoryUrl: string;
-  gitRef: string;
-  manifestPath: string;
-  commitSha?: string;
-  source: "community" | "private";
-  developerName?: string;
-}): PluginReleaseFields {
+function pluginReleaseFieldsFromManifest(
+  manifest: Record<string, unknown>,
+  source: {
+    repositoryUrl: string;
+    gitRef: string;
+    manifestPath: string;
+    commitSha?: string;
+    source: "community" | "private";
+    developerName?: string;
+  },
+): PluginReleaseFields {
   const pluginId = optionalString(manifest.id) ?? "";
   const version = optionalString(manifest.version) ?? "";
   const name = optionalString(manifest.name) ?? pluginId.split(".").pop() ?? "";
   const slug = slugify(optionalString(manifest.slug) ?? name);
-  const publisher = optionalString(manifest.publisher) ?? pluginId.split(".")[0] ?? "community";
+  const publisher =
+    optionalString(manifest.publisher) ?? pluginId.split(".")[0] ?? "community";
   const description = optionalString(manifest.description) ?? "";
   if (!pluginId || !version || !slug || !description) {
-    throw new HttpError(400, "Plugin manifest requires id, version, name or slug, and description.");
+    throw new HttpError(
+      400,
+      "Plugin manifest requires id, version, name or slug, and description.",
+    );
   }
   const runtime = manifest.runtime === "node" ? "node" : "openleash-core";
   const entrypoint = optionalString(manifest.entrypoint) ?? "";
-  if (!entrypoint) throw new HttpError(400, "Plugin manifest requires entrypoint.");
+  if (!entrypoint)
+    throw new HttpError(400, "Plugin manifest requires entrypoint.");
   const events = pluginStringArray(manifest.events);
   const permissions = pluginStringArray(manifest.permissions);
   const effects = pluginStringArray(manifest.effects);
   if (events.length === 0 || permissions.length === 0 || effects.length === 0) {
-    throw new HttpError(400, "Plugin manifest requires events, permissions, and effects.");
+    throw new HttpError(
+      400,
+      "Plugin manifest requires events, permissions, and effects.",
+    );
   }
-  const shortDescription = optionalString(manifest.shortDescription) ?? sentence(description);
+  const shortDescription =
+    optionalString(manifest.shortDescription) ?? sentence(description);
   return {
     pluginId,
     version,
@@ -4791,43 +6624,71 @@ function pluginReleaseFieldsFromManifest(manifest: Record<string, unknown>, sour
     events: events as OpenLeashPluginManifest["events"],
     permissions: permissions as OpenLeashPluginManifest["permissions"],
     effects: effects as OpenLeashPluginManifest["effects"],
-    ordering: objectValue(manifest.ordering) as OpenLeashPluginManifest["ordering"],
-    configSchema: objectValue(manifest.configSchema) as OpenLeashPluginManifest["configSchema"],
+    ordering: objectValue(
+      manifest.ordering,
+    ) as OpenLeashPluginManifest["ordering"],
+    configSchema: objectValue(
+      manifest.configSchema,
+    ) as OpenLeashPluginManifest["configSchema"],
     defaultConfig: objectValue(manifest.defaultConfig) ?? {},
     tags: pluginStringArray(manifest.tags),
     iconText: optionalString(manifest.iconText) ?? iconText(slug),
     visualPng: optionalString(manifest.visualPng),
     gitRef: source.gitRef,
     commitSha: source.commitSha,
-    manifestPath: source.manifestPath
+    manifestPath: source.manifestPath,
   };
 }
 
-async function fetchGithubPluginManifest(repositoryUrl: string, gitRef: string, manifestPath: string): Promise<Record<string, unknown>> {
+async function fetchGithubPluginManifest(
+  repositoryUrl: string,
+  gitRef: string,
+  manifestPath: string,
+): Promise<Record<string, unknown>> {
   const rawUrl = githubRawUrl(repositoryUrl, gitRef, manifestPath);
-  if (!rawUrl) throw new HttpError(400, "repositoryUrl must point to a GitHub repository.");
+  if (!rawUrl)
+    throw new HttpError(
+      400,
+      "repositoryUrl must point to a GitHub repository.",
+    );
   const response = await fetch(rawUrl, {
     headers: { accept: "application/json" },
-    signal: AbortSignal.timeout(Number(process.env.OPENLEASH_PLUGIN_MANIFEST_FETCH_TIMEOUT_MS ?? 10000))
+    signal: AbortSignal.timeout(
+      Number(process.env.OPENLEASH_PLUGIN_MANIFEST_FETCH_TIMEOUT_MS ?? 10000),
+    ),
   });
-  if (!response.ok) throw new HttpError(400, `Could not fetch plugin manifest from GitHub (${response.status}).`);
+  if (!response.ok)
+    throw new HttpError(
+      400,
+      `Could not fetch plugin manifest from GitHub (${response.status}).`,
+    );
   const text = await response.text();
   try {
     const parsed = JSON.parse(text) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("manifest must be an object");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      throw new Error("manifest must be an object");
     return parsed as Record<string, unknown>;
   } catch {
     throw new HttpError(400, "Plugin manifest must be JSON.");
   }
 }
 
-function githubRawUrl(repositoryUrl: string, gitRef: string, manifestPath: string) {
+function githubRawUrl(
+  repositoryUrl: string,
+  gitRef: string,
+  manifestPath: string,
+) {
   try {
     const url = new URL(repositoryUrl);
     if (url.hostname.toLowerCase() !== "github.com") return undefined;
     const [owner, repo] = url.pathname.replace(/^\/+|\/+$/g, "").split("/");
     if (!owner || !repo) return undefined;
-    const pathParts = manifestPath.replace(/^\/+/, "").split("/").filter(Boolean).map(encodeURIComponent).join("/");
+    const pathParts = manifestPath
+      .replace(/^\/+/, "")
+      .split("/")
+      .filter(Boolean)
+      .map(encodeURIComponent)
+      .join("/");
     return `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(gitRef)}/${pathParts}`;
   } catch {
     return undefined;
@@ -4871,28 +6732,45 @@ function pluginReleaseFromRow(row: Record<string, unknown>) {
     reviewerNote: optionalString(row.reviewer_note),
     approvedAt: optionalString(row.approved_at),
     createdAt: optionalString(row.created_at),
-    updatedAt: optionalString(row.updated_at)
+    updatedAt: optionalString(row.updated_at),
   };
 }
 
 function pluginStringArray(value: unknown) {
-  return Array.isArray(value) ? value.map(String).map((item) => item.trim()).filter(Boolean) : [];
+  return Array.isArray(value)
+    ? value
+        .map(String)
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : [];
 }
 
 function sentence(value: string) {
-  return value.replace(/\s+/g, " ").trim().replace(/[.!?]+$/, "").slice(0, 180) + ".";
+  return (
+    value
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/[.!?]+$/, "")
+      .slice(0, 180) + "."
+  );
 }
 
 function titleize(value: string) {
-  return value
-    .replace(/^@/, "")
-    .replace(/[-_.]+/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase())
-    .trim() || "Community";
+  return (
+    value
+      .replace(/^@/, "")
+      .replace(/[-_.]+/g, " ")
+      .replace(/\b\w/g, (letter) => letter.toUpperCase())
+      .trim() || "Community"
+  );
 }
 
 function iconText(value: string) {
-  const letters = value.split(/[-_\s.]+/).map((part) => part[0]).join("").toUpperCase();
+  const letters = value
+    .split(/[-_\s.]+/)
+    .map((part) => part[0])
+    .join("")
+    .toUpperCase();
   return (letters || value.slice(0, 2).toUpperCase() || "OL").slice(0, 2);
 }
 
@@ -4909,20 +6787,24 @@ async function readPluginSettings(organizationId: string) {
     `select plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at
      from plugin_settings
      where organization_id = $1`,
-    [organizationId]
+    [organizationId],
   );
-  return withLegacyRulesEnforcerSetting(new Map<string, PluginSettingRecord>(rows.rows.map((row) => [
-    row.plugin_id,
-    {
-      pluginId: row.plugin_id,
-      enabled: row.enabled,
-      config: row.config ?? {},
-      orderingPriority: row.ordering_priority,
-      installedVersion: row.installed_version ?? undefined,
-      updatePolicy: row.update_policy ?? "manual",
-      updatedAt: row.updated_at
-    }
-  ])));
+  return withLegacyRulesEnforcerSetting(
+    new Map<string, PluginSettingRecord>(
+      rows.rows.map((row) => [
+        row.plugin_id,
+        {
+          pluginId: row.plugin_id,
+          enabled: row.enabled,
+          config: row.config ?? {},
+          orderingPriority: row.ordering_priority,
+          installedVersion: row.installed_version ?? undefined,
+          updatePolicy: row.update_policy ?? "manual",
+          updatedAt: row.updated_at,
+        },
+      ]),
+    ),
+  );
 }
 
 async function readUserPluginSettings(organizationId: string, userId: string) {
@@ -4938,67 +6820,93 @@ async function readUserPluginSettings(organizationId: string, userId: string) {
     `select plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at
      from user_plugin_settings
      where organization_id = $1 and user_id = $2`,
-    [organizationId, userId]
+    [organizationId, userId],
   );
-  return withLegacyRulesEnforcerSetting(new Map<string, PluginSettingRecord>(rows.rows.map((row) => [
-    row.plugin_id,
-    {
-      pluginId: row.plugin_id,
-      enabled: row.enabled,
-      config: row.config ?? {},
-      orderingPriority: row.ordering_priority,
-      installedVersion: row.installed_version ?? undefined,
-      updatePolicy: row.update_policy ?? "manual",
-      updatedAt: row.updated_at
-    }
-  ])));
+  return withLegacyRulesEnforcerSetting(
+    new Map<string, PluginSettingRecord>(
+      rows.rows.map((row) => [
+        row.plugin_id,
+        {
+          pluginId: row.plugin_id,
+          enabled: row.enabled,
+          config: row.config ?? {},
+          orderingPriority: row.ordering_priority,
+          installedVersion: row.installed_version ?? undefined,
+          updatePolicy: row.update_policy ?? "manual",
+          updatedAt: row.updated_at,
+        },
+      ]),
+    ),
+  );
 }
 
-function withLegacyRulesEnforcerSetting(settings: Map<string, PluginSettingRecord>) {
+function withLegacyRulesEnforcerSetting(
+  settings: Map<string, PluginSettingRecord>,
+) {
   if (!settings.has("openleash.rules-enforcer")) {
     const legacy = settings.get("openleash.security-evaluator");
     if (legacy) {
       settings.set("openleash.rules-enforcer", {
         ...legacy,
-        pluginId: "openleash.rules-enforcer"
+        pluginId: "openleash.rules-enforcer",
       });
     }
   }
   return settings;
 }
 
-async function pluginSettingsForRuntime(organizationId: string, userId?: string) {
+async function pluginSettingsForRuntime(
+  organizationId: string,
+  userId?: string,
+) {
   const [settings, userSettings, policy] = await Promise.all([
     readPluginSettings(organizationId),
-    userId ? readUserPluginSettings(organizationId, userId) : Promise.resolve(new Map<string, PluginSettingRecord>()),
-    readOrganizationPluginPolicy(organizationId)
+    userId
+      ? readUserPluginSettings(organizationId, userId)
+      : Promise.resolve(new Map<string, PluginSettingRecord>()),
+    readOrganizationPluginPolicy(organizationId),
   ]);
-  return new Map(firstPartyPluginManifests.map((manifest) => {
-    const organizationStored = settings.get(manifest.id);
-    const userStored = userSettings.get(manifest.id);
-    const pluginPolicy = policy.get(manifest.id);
-    const configLocked = Boolean(pluginPolicy?.configLocked);
-    return [
-      manifest.id,
-      {
-        enabled: pluginPolicy?.mandatory ? true : userStored?.enabled ?? organizationStored?.enabled ?? pluginPolicy?.defaultEnabled ?? false,
-        config: {
-          ...(manifest.defaultConfig ?? {}),
-          ...(organizationStored?.config ?? {}),
-          ...(configLocked ? {} : userStored?.config ?? {})
+  return new Map(
+    firstPartyPluginManifests.map((manifest) => {
+      const organizationStored = settings.get(manifest.id);
+      const userStored = userSettings.get(manifest.id);
+      const pluginPolicy = policy.get(manifest.id);
+      const configLocked = Boolean(pluginPolicy?.configLocked);
+      return [
+        manifest.id,
+        {
+          enabled: pluginPolicy?.mandatory
+            ? true
+            : (userStored?.enabled ??
+              organizationStored?.enabled ??
+              pluginPolicy?.defaultEnabled ??
+              false),
+          config: {
+            ...(manifest.defaultConfig ?? {}),
+            ...(organizationStored?.config ?? {}),
+            ...(configLocked ? {} : (userStored?.config ?? {})),
+          },
+          orderingPriority:
+            userStored?.orderingPriority ??
+            organizationStored?.orderingPriority ??
+            manifest.ordering?.priority ??
+            null,
+          updatedAt: userStored?.updatedAt ?? organizationStored?.updatedAt,
         },
-        orderingPriority: userStored?.orderingPriority ?? organizationStored?.orderingPriority ?? manifest.ordering?.priority ?? null,
-        updatedAt: userStored?.updatedAt ?? organizationStored?.updatedAt
-      }
-    ];
-  }));
+      ];
+    }),
+  );
 }
 
 async function organizationIdForAdminRequest(req: express.Request) {
   const session = await getDashboardSession(req.header("authorization") ?? "");
   if (!session) throw new HttpError(401, "dashboard session required");
-  if (!isDashboardAccessRole(session.user.role)) throw new HttpError(403, "dashboard admin role required");
-  const slug = typeof req.query.organizationSlug === "string" ? req.query.organizationSlug : undefined;
+  if (!isDashboardAccessRole(session.user.role))
+    throw new HttpError(403, "dashboard admin role required");
+  const slug =
+    typeof req.query.organizationSlug === "string"
+      ? req.query.organizationSlug
+      : undefined;
   if (slug && slug !== session.organization.slug) {
     throw new HttpError(403, "cannot access another organization");
   }
@@ -5008,39 +6916,106 @@ async function organizationIdForAdminRequest(req: express.Request) {
 async function adminUserForRequest(req: express.Request) {
   const session = await getDashboardSession(req.header("authorization") ?? "");
   if (!session) throw new HttpError(401, "dashboard session required");
-  if (!isDashboardAccessRole(session.user.role)) throw new HttpError(403, "dashboard admin role required");
+  if (!isDashboardAccessRole(session.user.role))
+    throw new HttpError(403, "dashboard admin role required");
   return session.user;
 }
 
-async function recordPromptTransformResult(conversationEventId: string, _userId: string, originalPrompt: string, result: PromptPipelineResult) {
+async function recordPromptTransformResult(
+  conversationEventId: string,
+  _userId: string,
+  originalPrompt: string,
+  result: PromptPipelineResult,
+) {
   await pool.query(
     `update conversation_events
      set payload = payload || $2::jsonb
      where id = $1`,
-    [conversationEventId, JSON.stringify({
-      openleashPromptTransform: {
-        originalPrompt,
-        finalPrompt: result.finalPrompt,
-        blocked: result.blocked,
-        compression: result.compression,
-        dlp: result.dlp
-      },
-      openleashPluginRuns: result.runs
-    })]
+    [
+      conversationEventId,
+      JSON.stringify({
+        openleashPromptTransform: {
+          originalPrompt,
+          finalPrompt: result.finalPrompt,
+          blocked: result.blocked,
+          compression: result.compression,
+          dlp: result.dlp,
+        },
+        openleashPluginRuns: result.runs,
+      }),
+    ],
   );
 }
 
-async function recordPluginRuns(conversationEventId: string, runs: PluginRunRecord[]) {
+async function recordPluginRuns(
+  conversationEventId: string,
+  runs: PluginRunRecord[],
+) {
   if (runs.length === 0) return;
+  await writePipelineTrace("pipeline.plugins", {
+    traceId: conversationEventId,
+    conversationEventId,
+    runs: runs.map((run) => ({
+      pluginId: run.pluginId,
+      event: run.event,
+      status: run.status,
+      summary: run.summary,
+      durationMs: run.durationMs,
+      findings: run.findings,
+      metadata: run.metadata,
+    })),
+  });
   await pool.query(
     `update conversation_events
      set payload = payload || $2::jsonb
      where id = $1`,
-    [conversationEventId, JSON.stringify({ openleashPluginRuns: runs })]
+    [conversationEventId, JSON.stringify({ openleashPluginRuns: runs })],
   );
 }
 
-async function readPluginLogsForConversation(conversationEventId: string): Promise<PluginLogRecord[]> {
+async function writePipelineTrace(
+  stage: string,
+  details: Record<string, unknown>,
+) {
+  if (!pipelineTraceEnabled) return;
+  const record = {
+    timestamp: new Date().toISOString(),
+    stage,
+    ...(redactTraceValue(details) as Record<string, unknown>),
+  };
+  const agent = String(details.agent ?? "-");
+  const event = String(details.event ?? "-");
+  const sessionId = String(details.sessionId ?? "-").slice(0, 20);
+  const traceId = String(details.traceId ?? "-").slice(0, 12);
+  const decision = details.decision ? ` decision=${details.decision}` : "";
+  console.log(
+    `[openleash:flow] stage=${stage} trace=${traceId} session=${sessionId} agent=${agent} event=${event}${decision}`,
+  );
+  if (!pipelineTraceFile) return;
+  await fs.mkdir(path.dirname(pipelineTraceFile), { recursive: true });
+  await fs.appendFile(pipelineTraceFile, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+function redactTraceValue(value: unknown, key = ""): unknown {
+  if (
+    /authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|password|secret|cookie/i.test(
+      key,
+    )
+  )
+    return "[REDACTED]";
+  if (Array.isArray(value)) return value.map((item) => redactTraceValue(item));
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(
+        ([childKey, child]) => [childKey, redactTraceValue(child, childKey)],
+      ),
+    );
+  return value;
+}
+
+async function readPluginLogsForConversation(
+  conversationEventId: string,
+): Promise<PluginLogRecord[]> {
   const rows = await pool.query<{
     id: string;
     plugin_id: string;
@@ -5056,7 +7031,7 @@ async function readPluginLogsForConversation(conversationEventId: string): Promi
      from plugin_log_events
      where conversation_event_id = $1
      order by created_at asc`,
-    [conversationEventId]
+    [conversationEventId],
   );
   return rows.rows.map((row) => ({
     id: row.id,
@@ -5067,7 +7042,7 @@ async function readPluginLogsForConversation(conversationEventId: string): Promi
     message: row.message,
     scope: row.scope ?? undefined,
     data: row.data ?? {},
-    createdAt: row.created_at
+    createdAt: row.created_at,
   }));
 }
 
@@ -5080,7 +7055,7 @@ async function recordOpenLeashSystemLog({
   level,
   code,
   message,
-  data
+  data,
 }: {
   organizationId: string;
   conversationEventId: string;
@@ -5105,8 +7080,8 @@ async function recordOpenLeashSystemLog({
       level,
       code,
       message,
-      JSON.stringify(data ?? {})
-    ]
+      JSON.stringify(data ?? {}),
+    ],
   );
 }
 
@@ -5116,7 +7091,7 @@ async function exportPluginLogs({
   user,
   request,
   conversationEventId,
-  plugins
+  plugins,
 }: {
   logs: PluginLogRecord[];
   organization: { id: string; name?: string; slug?: string | null };
@@ -5127,38 +7102,54 @@ async function exportPluginLogs({
 }) {
   const runs: PluginRunRecord[] = [];
   for (const log of logs) {
-    runs.push(...await runLogExportPlugins({
-      log,
-      organization,
-      user,
-      request,
-      conversationEventId,
-      plugins
-    }));
+    runs.push(
+      ...(await runLogExportPlugins({
+        log,
+        organization,
+        user,
+        request,
+        conversationEventId,
+        plugins,
+      })),
+    );
   }
   return runs;
 }
 
-async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Promise<EvaluationResponse> {
+async function evaluateAndRecord(
+  request: EvaluationRequest,
+  user: ApiUser,
+): Promise<EvaluationResponse> {
   const intentKey = triggerIntentKey(request);
-  const { conversationEventId, computerId, runtimeId, organizationId } = await recordConversationEvent(request, user, intentKey);
-  const handledIntent = intentKey ? await findRecentHandledIntent(user.id, request, intentKey) : undefined;
+  const { conversationEventId, computerId, runtimeId, organizationId } =
+    await recordConversationEvent(request, user, intentKey);
+  const handledIntent = intentKey
+    ? await findRecentHandledIntent(user.id, request, intentKey)
+    : undefined;
   if (handledIntent) {
     return {
       decision: handledIntent.resolution ?? handledIntent.decision,
       decisionId: handledIntent.id,
       summary: handledIntent.summary,
-      question: handledIntent.resolution ? undefined : handledIntent.question ?? undefined,
-      results: []
+      question: handledIntent.resolution
+        ? undefined
+        : (handledIntent.question ?? undefined),
+      results: [],
     };
   }
   const tenantModelKey = await tenantModelKeyForEvaluation(organizationId);
-  const runtimePlugins = await pluginSettingsForRuntime(organizationId, user.id);
-  const policies = await pool.query<Policy>(
-      `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
-     from policies where enabled = true order by created_at asc`
+  const runtimePlugins = await pluginSettingsForRuntime(
+    organizationId,
+    user.id,
   );
-  const runtimePolicies = policiesForRulesEnforcer(runtimePlugins, policies.rows);
+  const policies = await pool.query<Policy>(
+    `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
+     from policies where enabled = true order by created_at asc`,
+  );
+  const runtimePolicies = policiesForRulesEnforcer(
+    runtimePlugins,
+    policies.rows,
+  );
   const pipeline = await runEvaluationPipeline({
     request,
     organizationId,
@@ -5168,38 +7159,42 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     runtimeId,
     policies: runtimePolicies,
     tenantModelKey,
-    plugins: runtimePlugins
+    plugins: runtimePlugins,
   });
   const { results: evaluatedResults, model } = pipeline;
-  const actionedResults = applyConfiguredRuleActions(evaluatedResults, runtimePolicies);
-  const promptOnlyDeferred = shouldDeferPromptOnlyApproval(request, actionedResults);
-  const results = promptOnlyDeferred ? deferPromptOnlyPolicyResults(actionedResults) : actionedResults;
+  const actionedResults = applyConfiguredRuleActions(
+    evaluatedResults,
+    runtimePolicies,
+  );
+  const approvalDeferred =
+    shouldDeferPromptOnlyApproval(request, actionedResults) ||
+    isNonActionableHookEvent(request.event.eventName) ||
+    eventEnvelope(request).capabilities?.block === false;
+  const results = approvalDeferred
+    ? deferPromptOnlyPolicyResults(actionedResults)
+    : actionedResults;
   const decision = results.some((r) => r.status === "failed")
     ? "deny"
     : results.some((r) => r.status === "needs_question")
       ? "ask"
       : "allow";
   const blockingResult = results.find((r) => r.status === "failed");
-  const approvalSummary =
-    blockingResult
-      ? summarizeBlockedAction(request, blockingResult.policyName)
-      : results.find((r) => r.status === "needs_question")?.explanation ??
-        "OpenLeash needs a human decision before continuing.";
-  const question =
-    blockingResult
-      ? `${approvalSummary} Allow this action once?`
-      : results.find((r) => r.status === "needs_question")?.question ??
-        (decision === "ask"
-          ? `${request.agent.displayName} needs approval for ${request.event.tool?.name ?? request.event.eventName}. Allow it?`
-          : undefined);
+  const approvalSummary = blockingResult
+    ? summarizeBlockedAction(request, blockingResult.policyName)
+    : (results.find((r) => r.status === "needs_question")?.explanation ??
+      "OpenLeash needs a human decision before continuing.");
+  const question = blockingResult
+    ? `${approvalSummary} Allow this action once?`
+    : (results.find((r) => r.status === "needs_question")?.question ??
+      (decision === "ask"
+        ? `${request.agent.displayName} needs approval for ${request.event.tool?.name ?? request.event.eventName}. Allow it?`
+        : undefined));
   const summary =
-    decision === "allow"
-      ? "All active policies passed."
-      : approvalSummary;
+    decision === "allow" ? "All active policies passed." : approvalSummary;
   const evaluation = await pool.query(
     `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
      values ($1, $2, $3, $4, $5, $6) returning id`,
-    [conversationEventId, user.id, decision, summary, question ?? null, model]
+    [conversationEventId, user.id, decision, summary, question ?? null, model],
   );
   for (const result of results) {
     const policyId = resolvePolicyResultPolicyId(result, policies.rows);
@@ -5215,8 +7210,8 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
         result.severity,
         result.explanation,
         JSON.stringify(result.evidence ?? []),
-        result.question ?? null
-      ]
+        result.question ?? null,
+      ],
     );
   }
   await recordMcpToolCall({
@@ -5228,7 +7223,7 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     computerId,
     runtimeId,
     request,
-    decision
+    decision,
   });
   if (decision === "ask") {
     await recordOpenLeashSystemLog({
@@ -5245,9 +7240,12 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
         eventName: request.event.eventName,
         toolName: request.event.tool?.name,
         policyNames: results
-          .filter((result) => result.status === "failed" || result.status === "needs_question")
-          .map((result) => result.policyName)
-      }
+          .filter(
+            (result) =>
+              result.status === "failed" || result.status === "needs_question",
+          )
+          .map((result) => result.policyName),
+      },
     });
   }
   const organization = await organizationSummary(organizationId);
@@ -5258,11 +7256,11 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     user: {
       id: user.id,
       email: user.email,
-      displayName: user.display_name
+      displayName: user.display_name,
     },
     request,
     conversationEventId,
-    plugins: runtimePlugins
+    plugins: runtimePlugins,
   });
   const exportRuns = await runExportPlugins({
     request,
@@ -5275,16 +7273,20 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
     user: {
       id: user.id,
       email: user.email,
-      displayName: user.display_name
+      displayName: user.display_name,
     },
     computerId,
     runtimeId,
     policyResults: results,
     pluginRuns: pipeline.runs,
     pluginLogs,
-    plugins: runtimePlugins
+    plugins: runtimePlugins,
   });
-  await recordPluginRuns(conversationEventId, [...pipeline.runs, ...logExportRuns, ...exportRuns]);
+  await recordPluginRuns(conversationEventId, [
+    ...pipeline.runs,
+    ...logExportRuns,
+    ...exportRuns,
+  ]);
   let purposeSummary: string | undefined;
   if (decision === "ask") {
     purposeSummary = await summarizeActionPurpose(request, tenantModelKey);
@@ -5292,31 +7294,52 @@ async function evaluateAndRecord(request: EvaluationRequest, user: ApiUser): Pro
       `update conversation_events
        set payload = payload || $2::jsonb
        where id = $1`,
-      [conversationEventId, JSON.stringify({ openleashPurposeSummary: purposeSummary })]
+      [
+        conversationEventId,
+        JSON.stringify({ openleashPurposeSummary: purposeSummary }),
+      ],
     );
-    notifyMobileApprovers(user.id, evaluation.rows[0].id, summary, question, purposeSummary).catch((error) => {
+    notifyMobileApprovers(
+      user.id,
+      evaluation.rows[0].id,
+      summary,
+      question,
+      purposeSummary,
+    ).catch((error) => {
       console.warn("mobile approval notification failed", error);
     });
   } else if (decision === "deny") {
     notifyMobileEvent(user.id, {
       title: "OpenLeash blocked an agent action",
       body: summary,
-      data: { decisionId: evaluation.rows[0].id, kind: "blocked" }
+      data: { decisionId: evaluation.rows[0].id, kind: "blocked" },
     }).catch((error) => {
       console.warn("mobile blocked notification failed", error);
     });
   }
-  return { decision, decisionId: evaluation.rows[0].id, summary, question, results };
+  return {
+    decision,
+    decisionId: evaluation.rows[0].id,
+    summary,
+    question,
+    results,
+  };
 }
 
-function resolvePolicyResultPolicyId(result: PolicyDecision, policies: Policy[]) {
+function resolvePolicyResultPolicyId(
+  result: PolicyDecision,
+  policies: Policy[],
+) {
   const byId = policies.find((policy) => policy.id === result.policyId);
   if (byId) return byId.id;
   const byName = policies.find((policy) => policy.name === result.policyName);
   return byName?.id ?? null;
 }
 
-function policiesForRulesEnforcer(settings: Map<string, PluginSettingRecord | PluginSettingState>, fallback: Policy[]): Policy[] {
+function policiesForRulesEnforcer(
+  settings: Map<string, PluginSettingRecord | PluginSettingState>,
+  fallback: Policy[],
+): Policy[] {
   const rulesPlugin = settings.get("openleash.rules-enforcer");
   const rules = normalizeRuleConfigs(rulesPlugin?.config?.rules);
   if (rules.length === 0) return fallback;
@@ -5328,11 +7351,13 @@ function policiesForRulesEnforcer(settings: Map<string, PluginSettingRecord | Pl
     naturalLanguageRule: rule.text,
     enabled: true,
     locked: false,
-    enforcementAction: rule.action
+    enforcementAction: rule.action,
   }));
 }
 
-function normalizeRuleConfigs(value: unknown): Array<{ text: string; action: "ask" | "block" }> {
+function normalizeRuleConfigs(
+  value: unknown,
+): Array<{ text: string; action: "ask" | "block" }> {
   if (Array.isArray(value)) {
     const seen = new Set<string>();
     const rules: Array<{ text: string; action: "ask" | "block" }> = [];
@@ -5345,59 +7370,81 @@ function normalizeRuleConfigs(value: unknown): Array<{ text: string; action: "as
     return rules;
   }
   if (typeof value === "string") {
-    return [...new Set(splitRuleString(value)
-      .map((line) => line.replace(/^[-*]\s+/, "").trim())
-      .filter(Boolean)
-    )].map((text) => ({ text, action: "ask" }));
+    return [
+      ...new Set(
+        splitRuleString(value)
+          .map((line) => line.replace(/^[-*]\s+/, "").trim())
+          .filter(Boolean),
+      ),
+    ].map((text) => ({ text, action: "ask" }));
   }
   return [];
 }
 
-function normalizeRuleConfig(value: unknown): { text: string; action: "ask" | "block" } | undefined {
+function normalizeRuleConfig(
+  value: unknown,
+): { text: string; action: "ask" | "block" } | undefined {
   if (typeof value === "string") {
     const text = value.trim();
     return text ? { text, action: "ask" } : undefined;
   }
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
-  const text = String(record.text ?? record.rule ?? record.description ?? "").trim();
+  const text = String(
+    record.text ?? record.rule ?? record.description ?? "",
+  ).trim();
   if (!text) return undefined;
   return {
     text,
-    action: record.action === "block" ? "block" : "ask"
+    action: record.action === "block" ? "block" : "ask",
   };
 }
 
 function splitRuleString(value: string) {
   const lines = value.split(/\r?\n/g);
   if (lines.length > 1) return lines;
-  return value.split(/,\s+(?=Ask before|Never|Do not|Don't|Always|Require|Block|Pause)/gi);
+  return value.split(
+    /,\s+(?=Ask before|Never|Do not|Don't|Always|Require|Block|Pause)/gi,
+  );
 }
 
 function policyRulesForConfig(policies: Policy[]) {
-  return policies.map((policy) => ({
-    text: String(policy.naturalLanguageRule || policy.description || policy.name || "").trim(),
-    action: policy.enforcementAction === "block" ? "block" : "ask"
-  })).filter((rule) => rule.text);
+  return policies
+    .map((policy) => ({
+      text: String(
+        policy.naturalLanguageRule || policy.description || policy.name || "",
+      ).trim(),
+      action: policy.enforcementAction === "block" ? "block" : "ask",
+    }))
+    .filter((rule) => rule.text);
 }
 
-function applyConfiguredRuleActions(results: PolicyDecision[], policies: Policy[]): PolicyDecision[] {
-  const policyActions = new Map(policies.map((policy) => [policy.id, policy.enforcementAction ?? "ask"]));
+function applyConfiguredRuleActions(
+  results: PolicyDecision[],
+  policies: Policy[],
+): PolicyDecision[] {
+  const policyActions = new Map(
+    policies.map((policy) => [policy.id, policy.enforcementAction ?? "ask"]),
+  );
   return results.map((result) => {
     if (result.status === "passed") return result;
-    const action = policyActions.get(result.policyId) ?? policyActions.get(policyIdForPolicyName(result.policyName, policies));
+    const action =
+      policyActions.get(result.policyId) ??
+      policyActions.get(policyIdForPolicyName(result.policyName, policies));
     if (!action) return result;
     if (action === "block") {
       return {
         ...result,
         status: "failed",
-        question: undefined
+        question: undefined,
       };
     }
     return {
       ...result,
       status: "needs_question",
-      question: result.question ?? "OpenLeash found a rule match. Allow this action once?"
+      question:
+        result.question ??
+        "OpenLeash found a rule match. Allow this action once?",
     };
   });
 }
@@ -5419,16 +7466,22 @@ async function tenantModelKeyForEvaluation(organizationId: string) {
   try {
     return await readTenantModelKey(organizationId);
   } catch (error) {
-    console.warn("tenant model key unavailable; falling back to managed or heuristic evaluation", error);
+    console.warn(
+      "tenant model key unavailable; falling back to managed or heuristic evaluation",
+      error,
+    );
     return undefined;
   }
 }
 
 async function organizationSummary(organizationId: string) {
-  const result = await pool.query<{ id: string; name: string; slug: string | null }>(
-    "select id, name, slug from organizations where id = $1 limit 1",
-    [organizationId]
-  );
+  const result = await pool.query<{
+    id: string;
+    name: string;
+    slug: string | null;
+  }>("select id, name, slug from organizations where id = $1 limit 1", [
+    organizationId,
+  ]);
   return result.rows[0] ?? { id: organizationId };
 }
 
@@ -5436,12 +7489,17 @@ function eventForRequest(request: EvaluationRequest) {
   return eventForHookEvent(request.event.eventName);
 }
 
-async function recordConversationEvent(request: EvaluationRequest, user: ApiUser, intentKey?: string) {
+async function recordConversationEvent(
+  request: EvaluationRequest,
+  user: ApiUser,
+  intentKey?: string,
+) {
   const client = await pool.connect();
   let conversationEventId = "";
   let computerId = "";
   let runtimeId = "";
-  const organizationId = user.organization_id ?? (await ensureDefaultOrganization()).id;
+  const organizationId =
+    user.organization_id ?? (await ensureDefaultOrganization()).id;
   try {
     await client.query("begin");
     const computer = await client.query(
@@ -5449,7 +7507,12 @@ async function recordConversationEvent(request: EvaluationRequest, user: ApiUser
        values ($1, $2, $3, $4, now())
        on conflict (user_id, hostname) do update set platform = excluded.platform, os_release = excluded.os_release, last_seen_at = now()
        returning id`,
-      [user.id, request.computer.hostname, request.computer.platform, request.computer.osRelease ?? null]
+      [
+        user.id,
+        request.computer.hostname,
+        request.computer.platform,
+        request.computer.osRelease ?? null,
+      ],
     );
     computerId = computer.rows[0].id;
     const runtime = await client.query(
@@ -5462,14 +7525,15 @@ async function recordConversationEvent(request: EvaluationRequest, user: ApiUser
         request.agent.kind,
         request.agent.displayName,
         request.agent.version ?? null,
-        request.agent.executablePath ?? ""
-      ]
+        request.agent.executablePath ?? "",
+      ],
     );
     runtimeId = runtime.rows[0].id;
     const event = await client.query(
       `insert into conversation_events
-       (user_id, computer_id, agent_runtime_id, session_id, event_name, project_path, prompt, tool_name, payload, occurred_at)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       (user_id, computer_id, agent_runtime_id, session_id, event_name, project_path, prompt, tool_name, payload, occurred_at,
+        source, provider, idempotency_key, correlation_id, source_capabilities)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        returning id`,
       [
         user.id,
@@ -5480,9 +7544,22 @@ async function recordConversationEvent(request: EvaluationRequest, user: ApiUser
         request.event.projectPath ?? null,
         request.event.prompt ?? null,
         request.event.tool?.name ?? null,
-          { ...request.event, raw: { ...(request.event.raw && typeof request.event.raw === "object" ? request.event.raw : {}), openleashIntentKey: intentKey } },
-        request.event.occurredAt
-      ]
+        {
+          ...request.event,
+          raw: {
+            ...(request.event.raw && typeof request.event.raw === "object"
+              ? request.event.raw
+              : {}),
+            openleashIntentKey: intentKey,
+          },
+        },
+        request.event.occurredAt,
+        eventEnvelope(request).source,
+        eventEnvelope(request).provider,
+        eventEnvelope(request).idempotencyKey ?? null,
+        eventEnvelope(request).correlationId ?? null,
+        eventEnvelope(request).capabilities,
+      ],
     );
     conversationEventId = event.rows[0].id;
     await client.query("commit");
@@ -5495,6 +7572,56 @@ async function recordConversationEvent(request: EvaluationRequest, user: ApiUser
   return { conversationEventId, computerId, runtimeId, organizationId };
 }
 
+function attachEventEnvelope(raw: unknown, envelope: NormalizedAgentEvent) {
+  return {
+    ...(raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}),
+    openleashEventEnvelope: {
+      schemaVersion: envelope.schemaVersion,
+      source: envelope.source,
+      provider: envelope.provider,
+      idempotencyKey: envelope.idempotencyKey,
+      correlationId: envelope.correlationId,
+      capabilities: envelope.capabilities,
+    },
+  };
+}
+
+function eventEnvelope(request: EvaluationRequest) {
+  const raw =
+    request.event.raw && typeof request.event.raw === "object"
+      ? (request.event.raw as Record<string, unknown>)
+      : {};
+  const stored =
+    raw.openleashEventEnvelope && typeof raw.openleashEventEnvelope === "object"
+      ? (raw.openleashEventEnvelope as Partial<NormalizedAgentEvent>)
+      : undefined;
+  return (
+    stored ?? {
+      source: "api_hook" as const,
+      provider: request.agent.kind,
+      idempotencyKey: undefined,
+      correlationId: undefined,
+      capabilities: {
+        observe: true as const,
+        block: true,
+        rewritePrompt: false,
+        rewriteToolInput: true,
+        rewriteResponse: false,
+      },
+    }
+  );
+}
+
+async function existingNormalizedEvent(userId: string, key: string) {
+  const row = await pool.query(
+    `select ev.decision, ev.id as "decisionId", ev.summary, ev.question
+     from conversation_events ce join evaluations ev on ev.conversation_event_id = ce.id
+     where ce.user_id = $1 and ce.idempotency_key = $2 order by ev.created_at desc limit 1`,
+    [userId, key],
+  );
+  return row.rows[0] as EvaluationResponse | undefined;
+}
+
 async function recordMcpToolCall({
   call,
   organizationId,
@@ -5504,7 +7631,7 @@ async function recordMcpToolCall({
   computerId,
   runtimeId,
   request,
-  decision
+  decision,
 }: {
   call?: McpToolCall;
   organizationId?: string | null;
@@ -5531,7 +7658,12 @@ async function recordMcpToolCall({
                (select count(distinct tool_name)::int + 1 from mcp_tool_calls where mcp_server_id = mcp_servers.id and tool_name <> $4)
              )
        returning id`,
-      [organizationId ?? null, call.serverName, request.event.occurredAt, call.toolName]
+      [
+        organizationId ?? null,
+        call.serverName,
+        request.event.occurredAt,
+        call.toolName,
+      ],
     );
     await client.query(
       `insert into mcp_tool_calls
@@ -5555,8 +7687,8 @@ async function recordMcpToolCall({
         request.event.sessionId,
         decision,
         decision === "ask" ? "policy_review" : "observed",
-        request.event.occurredAt
-      ]
+        request.event.occurredAt,
+      ],
     );
     await client.query(
       `update mcp_servers s
@@ -5570,7 +7702,7 @@ async function recordMcpToolCall({
          group by mcp_server_id
        ) stats
        where s.id = stats.mcp_server_id`,
-      [server.rows[0].id]
+      [server.rows[0].id],
     );
     await client.query("commit");
   } catch (error) {
@@ -5581,10 +7713,15 @@ async function recordMcpToolCall({
   }
 }
 
-async function waitForHookDecision(user: ApiUser, decision: EvaluationResponse): Promise<EvaluationResponse> {
+async function waitForHookDecision(
+  user: ApiUser,
+  decision: EvaluationResponse,
+): Promise<EvaluationResponse> {
   if (decision.decision !== "ask") return decision;
-  const timeoutMs = Number(process.env.OPENLEASH_HOOK_APPROVAL_TIMEOUT_MS ?? 120000);
-  const pollMs = Number(process.env.OPENLEASH_HOOK_APPROVAL_POLL_MS ?? 750);
+  const timeoutMs = Number(
+    process.env.OPENLEASH_HOOK_APPROVAL_TIMEOUT_MS ?? 600000,
+  );
+  const pollMs = Number(process.env.OPENLEASH_HOOK_APPROVAL_POLL_MS ?? 250);
   const deadline = Date.now() + Math.max(1000, timeoutMs);
   while (Date.now() < deadline) {
     const result = await pool.query<{
@@ -5595,16 +7732,22 @@ async function waitForHookDecision(user: ApiUser, decision: EvaluationResponse):
       `select resolution, resolution_guidance, summary
        from evaluations
        where id = $1 and user_id = $2`,
-      [decision.decisionId, user.id]
+      [decision.decisionId, user.id],
     );
     const row = result.rows[0];
     if (row?.resolution === "allow" || row?.resolution === "deny") {
       return {
         ...decision,
         decision: row.resolution,
-        summary: row.resolution === "allow" ? "OpenLeash approved this action." : row.summary ?? decision.summary,
-        resolutionGuidance: row.resolution === "deny" ? row.resolution_guidance ?? undefined : undefined,
-        question: undefined
+        summary:
+          row.resolution === "allow"
+            ? "OpenLeash approved this action."
+            : (row.summary ?? decision.summary),
+        resolutionGuidance:
+          row.resolution === "deny"
+            ? (row.resolution_guidance ?? undefined)
+            : undefined,
+        question: undefined,
       };
     }
     await new Promise((resolve) => setTimeout(resolve, Math.max(100, pollMs)));
@@ -5613,19 +7756,26 @@ async function waitForHookDecision(user: ApiUser, decision: EvaluationResponse):
     ...decision,
     decision: "deny",
     summary: "OpenLeash timed out waiting for approval.",
-    question: undefined
+    question: undefined,
   };
 }
 
 async function ensureExternalUser(provider: string): Promise<ApiUser> {
-  const displayName = provider === "external-agents" ? "SaaS agents" : externalProviderLabel(provider);
+  const displayName =
+    provider === "external-agents"
+      ? "SaaS agents"
+      : externalProviderLabel(provider);
   const email = `${slug(displayName)}@external.openleash.com`;
-  const result = await pool.query<{ id: string; email: string; display_name: string }>(
+  const result = await pool.query<{
+    id: string;
+    email: string;
+    display_name: string;
+  }>(
     `insert into users (email, display_name, role)
      values ($1, $2, 'external-agent')
      on conflict (email) do update set display_name = excluded.display_name
      returning id, email, display_name`,
-    [email, displayName]
+    [email, displayName],
   );
   return result.rows[0];
 }
@@ -5636,12 +7786,16 @@ async function externalEventExists(key: string) {
      from conversation_events
      where payload->'raw'->>'externalEvaluationKey' = $1
      limit 1`,
-    [key]
+    [key],
   );
   return (result.rowCount ?? 0) > 0;
 }
 
-async function findRecentHandledIntent(userId: string, request: EvaluationRequest, intentKey: string) {
+async function findRecentHandledIntent(
+  userId: string,
+  request: EvaluationRequest,
+  intentKey: string,
+) {
   const sessionScoped = !isSessionlessIntentKey(intentKey);
   const canonicalKey = canonicalIntentKey(intentKey);
   const result = await pool.query<{
@@ -5665,10 +7819,19 @@ async function findRecentHandledIntent(userId: string, request: EvaluationReques
        and e.created_at > now() - interval '5 minutes'
      order by e.created_at desc
      limit 25`,
-    [userId, request.agent.kind, request.event.sessionId, request.event.projectPath ?? "", intentKey, sessionScoped]
+    [
+      userId,
+      request.agent.kind,
+      request.event.sessionId,
+      request.event.projectPath ?? "",
+      intentKey,
+      sessionScoped,
+    ],
   );
   if (sessionScoped) return result.rows[0];
-  return result.rows.find((row) => canonicalIntentKey(row.intent_key) === canonicalKey);
+  return result.rows.find(
+    (row) => canonicalIntentKey(row.intent_key) === canonicalKey,
+  );
 }
 
 function triggerIntentKey(request: EvaluationRequest) {
@@ -5679,7 +7842,7 @@ function triggerIntentKey(request: EvaluationRequest) {
       request.agent.kind,
       request.event.projectPath ?? "",
       category,
-      primaryResource(request)
+      primaryResource(request),
     ].join("|");
   }
   return [
@@ -5687,7 +7850,7 @@ function triggerIntentKey(request: EvaluationRequest) {
     request.event.sessionId,
     request.event.projectPath ?? "",
     category,
-    primaryResource(request)
+    primaryResource(request),
   ].join("|");
 }
 
@@ -5709,14 +7872,43 @@ function canonicalIntentKey(intentKey?: string | null) {
 
 function intentCategory(request: EvaluationRequest) {
   const text = eventTextForIntent(request).toLowerCase();
-  if (/(git init|gh repo create|create (a )?(new )?git repo|initialize (a )?(new )?repository)/i.test(text)) return "git-repo";
-  if (/(\.env(?:\b|["'\\/\s])|\.npmrc|id_rsa|id_ed25519|credentials|kubeconfig|private key|api[_ -]?key|secret|token|password)/i.test(text)) {
+  if (
+    /(git init|gh repo create|create (a )?(new )?git repo|initialize (a )?(new )?repository)/i.test(
+      text,
+    )
+  )
+    return "git-repo";
+  if (
+    /(\.env(?:\b|["'\\/\s])|\.npmrc|id_rsa|id_ed25519|credentials|kubeconfig|private key|api[_ -]?key|secret|token|password)/i.test(
+      text,
+    )
+  ) {
     return `credential-${credentialActionVerb((request.event.tool?.name ?? "").toLowerCase(), text)}`;
   }
-  if (/(rm\s+-rf|sudo rm|delete all|format disk|chmod\s+-r|chown\s+-r|git reset\s+--hard|terraform destroy)/i.test(text)) return "destructive";
-  if (/(curl|wget|upload|pastebin|gist|send .*code|post .*secret|external domain|webhook)/i.test(text)) return "exfiltration";
-  if (/(ssn|social security|passport|credit card|personal data|customer list|employee data|customer emails?|email export)/i.test(text)) return "personal-data";
-  if (/(npm install|pip install|brew install|curl .* sh|unknown package)/i.test(text)) return "package-install";
+  if (
+    /(rm\s+-rf|sudo rm|delete all|format disk|chmod\s+-r|chown\s+-r|git reset\s+--hard|terraform destroy)/i.test(
+      text,
+    )
+  )
+    return "destructive";
+  if (
+    /(curl|wget|upload|pastebin|gist|send .*code|post .*secret|external domain|webhook)/i.test(
+      text,
+    )
+  )
+    return "exfiltration";
+  if (
+    /(ssn|social security|passport|credit card|personal data|customer list|employee data|customer emails?|email export)/i.test(
+      text,
+    )
+  )
+    return "personal-data";
+  if (
+    /(npm install|pip install|brew install|curl .* sh|unknown package)/i.test(
+      text,
+    )
+  )
+    return "package-install";
   return undefined;
 }
 
@@ -5725,26 +7917,48 @@ function eventTextForIntent(request: EvaluationRequest) {
     request.event.prompt,
     request.event.tool?.name,
     JSON.stringify(request.event.tool?.input ?? ""),
-    JSON.stringify(request.event.raw ?? "")
-  ].filter(Boolean).join("\n");
+    JSON.stringify(request.event.raw ?? ""),
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function credentialActionVerb(toolName: string, text: string) {
-  if (/(curl|wget|upload|post|webhook|pastebin|gist|send|exfiltrat|external|remote)/i.test(text)) return "send";
-  if (/read|cat|open|print|show|display|dump|list|grep|scan|parse|copy/i.test(`${toolName} ${text}`)) return "read";
-  if (/write|create|add|generate|save|put|touch|edit|multiedit/i.test(`${toolName} ${text}`)) return "write";
+  if (
+    /(curl|wget|upload|post|webhook|pastebin|gist|send|exfiltrat|external|remote)/i.test(
+      text,
+    )
+  )
+    return "send";
+  if (
+    /read|cat|open|print|show|display|dump|list|grep|scan|parse|copy/i.test(
+      `${toolName} ${text}`,
+    )
+  )
+    return "read";
+  if (
+    /write|create|add|generate|save|put|touch|edit|multiedit/i.test(
+      `${toolName} ${text}`,
+    )
+  )
+    return "write";
   return "other";
 }
 
 function stableHookSessionId(agent: string, raw: any) {
-  const projectPath = raw?.cwd ?? raw?.workspace ?? raw?.project_dir ?? raw?.context?.workspaceDir ?? process.cwd();
+  const projectPath =
+    raw?.cwd ??
+    raw?.workspace ??
+    raw?.project_dir ??
+    raw?.context?.workspaceDir ??
+    process.cwd();
   const seed = [
     agent,
     projectPath,
     raw?.pid ?? "",
     raw?.process_id ?? "",
     raw?.terminal_id ?? "",
-    raw?.conversation_id ?? ""
+    raw?.conversation_id ?? "",
   ].join("|");
   return `${agent}-${crypto.createHash("sha256").update(seed).digest("hex").slice(0, 16)}`;
 }
@@ -5761,7 +7975,9 @@ function primaryResource(request: EvaluationRequest) {
   }
   const text = values.join(" ") || eventTextForIntent(request);
   if (/\.env(?:\b|["'\\/\s])/.test(text)) return ".env";
-  const match = text.match(/(?:^|[/"'\s])([A-Za-z0-9._-]*(?:credentials|kubeconfig|id_rsa|id_ed25519|\.npmrc)[A-Za-z0-9._-]*)/i);
+  const match = text.match(
+    /(?:^|[/"'\s])([A-Za-z0-9._-]*(?:credentials|kubeconfig|id_rsa|id_ed25519|\.npmrc)[A-Za-z0-9._-]*)/i,
+  );
   return match?.[1] ? truncate(match[1], 80) : "unknown-resource";
 }
 
@@ -5769,11 +7985,24 @@ app.put("/admin/policies/:id", async (req, res, next) => {
   try {
     const naturalLanguageRule = String(req.body.naturalLanguageRule ?? "");
     const name = summarizePolicyTitle(naturalLanguageRule);
-    const category = policyCategory(String(req.body.category ?? ""), name, naturalLanguageRule);
+    const category = policyCategory(
+      String(req.body.category ?? ""),
+      name,
+      naturalLanguageRule,
+    );
     const result = await pool.query(
       `update policies set name = $2, category = $3, description = $4, severity = $5, natural_language_rule = $6, enabled = $7, locked = $8, updated_at = now()
        where id = $1 returning *`,
-      [req.params.id, name, category, req.body.description ?? "", req.body.severity ?? "medium", naturalLanguageRule, req.body.enabled, Boolean(req.body.locked)]
+      [
+        req.params.id,
+        name,
+        category,
+        req.body.description ?? "",
+        req.body.severity ?? "medium",
+        naturalLanguageRule,
+        req.body.enabled,
+        Boolean(req.body.locked),
+      ],
     );
     res.json(result.rows[0]);
   } catch (error) {
@@ -5781,12 +8010,22 @@ app.put("/admin/policies/:id", async (req, res, next) => {
   }
 });
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error(err);
-  const status = typeof (err as { status?: unknown })?.status === "number" ? (err as { status: number }).status : 500;
-  const message = err instanceof Error ? err.message : "unknown error";
-  res.status(status).json({ success: false, error: message, message });
-});
+app.use(
+  (
+    err: unknown,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction,
+  ) => {
+    console.error(err);
+    const status =
+      typeof (err as { status?: unknown })?.status === "number"
+        ? (err as { status: number }).status
+        : 500;
+    const message = err instanceof Error ? err.message : "unknown error";
+    res.status(status).json({ success: false, error: message, message });
+  },
+);
 
 function summarizeAgentActivity(agent: {
   display_name: string;
@@ -5800,7 +8039,8 @@ function summarizeAgentActivity(agent: {
   decision_summary?: string;
   payload?: unknown;
 }) {
-  if (agent.question && !agent.resolution) return `Waiting for approval: ${agent.question}`;
+  if (agent.question && !agent.resolution)
+    return `Waiting for approval: ${agent.question}`;
   const purpose = actionPurposeFromPayload(agent.payload);
   if (purpose) return truncate(purpose, 140);
 
@@ -5813,7 +8053,10 @@ function summarizeAgentActivity(agent: {
   if (agent.event_name === "UserPromptSubmit" && agent.prompt) {
     return `Prompt: ${truncate(agent.prompt, 100)}`;
   }
-  if (agent.decision_summary && !isBoringEvaluationSummary(agent.decision_summary)) {
+  if (
+    agent.decision_summary &&
+    !isBoringEvaluationSummary(agent.decision_summary)
+  ) {
     return truncate(agent.decision_summary, 140);
   }
   return agent.prompt ? `Prompt: ${truncate(agent.prompt, 100)}` : "Active";
@@ -5825,14 +8068,18 @@ function extractTarget(payload: unknown) {
   const input = event.tool?.input;
   if (!input || typeof input !== "object") return undefined;
   const record = input as Record<string, unknown>;
-  const candidate = record.file_path ?? record.path ?? record.command ?? record.url;
+  const candidate =
+    record.file_path ?? record.path ?? record.command ?? record.url;
   return typeof candidate === "string" ? candidate : undefined;
 }
 
 function actionPurposeFromPayload(payload: unknown) {
   if (!payload || typeof payload !== "object") return undefined;
-  const summary = (payload as { openleashPurposeSummary?: unknown }).openleashPurposeSummary;
-  return typeof summary === "string" && summary.trim() ? summary.trim() : undefined;
+  const summary = (payload as { openleashPurposeSummary?: unknown })
+    .openleashPurposeSummary;
+  return typeof summary === "string" && summary.trim()
+    ? summary.trim()
+    : undefined;
 }
 
 function isBoringEvaluationSummary(summary?: string | null) {
@@ -5840,42 +8087,82 @@ function isBoringEvaluationSummary(summary?: string | null) {
   return /all active policies passed/i.test(summary);
 }
 
-function shouldDeferPromptOnlyApproval(request: EvaluationRequest, results: PolicyDecision[]) {
+function shouldDeferPromptOnlyApproval(
+  request: EvaluationRequest,
+  results: PolicyDecision[],
+) {
   if (!isPromptOnlyHook(request)) return false;
-  return results.some((result) => result.status === "failed" || result.status === "needs_question");
+  return results.some(
+    (result) =>
+      result.status === "failed" || result.status === "needs_question",
+  );
 }
 
 function isPromptOnlyHook(request: EvaluationRequest) {
-  return request.event.eventName === "UserPromptSubmit" && !request.event.tool?.name;
+  return (
+    request.event.eventName === "UserPromptSubmit" && !request.event.tool?.name
+  );
 }
 
-function deferPromptOnlyPolicyResults(results: PolicyDecision[]): PolicyDecision[] {
-  return results.map((result) => result.status === "passed"
-    ? result
-    : {
-        ...result,
-        status: "passed",
-        explanation: "Prompt-only intent observed. Enforcement is deferred until the agent attempts the actual tool action.",
-        evidence: [],
-        question: undefined
-      });
+function isNonActionableHookEvent(eventName: string) {
+  return [
+    "PostToolUse",
+    "Stop",
+    "SessionStart",
+    "SessionEnd",
+    "SubagentStart",
+    "SubagentStop",
+    "Notification",
+  ].includes(eventName);
 }
 
-async function withTranscriptContext(payload: unknown, occurredAt?: string | Date) {
+function deferPromptOnlyPolicyResults(
+  results: PolicyDecision[],
+): PolicyDecision[] {
+  return results.map((result) =>
+    result.status === "passed"
+      ? result
+      : {
+          ...result,
+          status: "passed",
+          explanation:
+            "Prompt-only intent observed. Enforcement is deferred until the agent attempts the actual tool action.",
+          evidence: [],
+          question: undefined,
+        },
+  );
+}
+
+async function withTranscriptContext(
+  payload: unknown,
+  occurredAt?: string | Date,
+) {
   if (!payload || typeof payload !== "object") return payload;
-  const event = payload as { transcript?: unknown; raw?: { transcript_path?: unknown; transcriptPath?: unknown } };
-  if (Array.isArray(event.transcript) && event.transcript.length > 0) return payload;
-  const transcript = await readClaudeTranscript(event.raw?.transcript_path ?? event.raw?.transcriptPath, occurredAt);
+  const event = payload as {
+    transcript?: unknown;
+    raw?: { transcript_path?: unknown; transcriptPath?: unknown };
+  };
+  if (Array.isArray(event.transcript) && event.transcript.length > 0)
+    return payload;
+  const transcript = await readClaudeTranscript(
+    event.raw?.transcript_path ?? event.raw?.transcriptPath,
+    occurredAt,
+  );
   return transcript ? { ...event, transcript } : payload;
 }
 
-async function readClaudeTranscript(filePath: unknown, occurredAt?: string | Date): Promise<ConversationTurn[] | undefined> {
+async function readClaudeTranscript(
+  filePath: unknown,
+  occurredAt?: string | Date,
+): Promise<ConversationTurn[] | undefined> {
   if (typeof filePath !== "string" || !filePath.trim()) return undefined;
   const resolved = path.resolve(filePath);
   const claudeProjects = path.join(os.homedir(), ".claude", "projects");
   if (!resolved.startsWith(claudeProjects)) return undefined;
   try {
-    const cutoff = occurredAt ? new Date(occurredAt).getTime() + 5000 : undefined;
+    const cutoff = occurredAt
+      ? new Date(occurredAt).getTime() + 5000
+      : undefined;
     const content = await fs.readFile(resolved, "utf8");
     const turns = content
       .split(/\r?\n/)
@@ -5899,15 +8186,20 @@ function claudeTranscriptTurn(line: string): ConversationTurn[] {
       timestamp?: unknown;
       message?: { role?: unknown; content?: unknown };
     };
-    const role = typeof record.message?.role === "string" ? record.message.role : record.type;
+    const role =
+      typeof record.message?.role === "string"
+        ? record.message.role
+        : record.type;
     if (role !== "user" && role !== "assistant") return [];
     const content = transcriptContentToText(record.message?.content);
     if (!content || shouldSkipTranscriptText(content)) return [];
-    return [{
-      role,
-      content,
-      at: typeof record.timestamp === "string" ? record.timestamp : undefined
-    }];
+    return [
+      {
+        role,
+        content,
+        at: typeof record.timestamp === "string" ? record.timestamp : undefined,
+      },
+    ];
   } catch {
     return [];
   }
@@ -5919,9 +8211,15 @@ function transcriptContentToText(value: unknown): string {
   return value
     .map((item) => {
       if (!item || typeof item !== "object") return "";
-      const record = item as { type?: unknown; text?: unknown; content?: unknown };
-      if (record.type === "text" && typeof record.text === "string") return record.text;
-      if (record.type === "tool_result" && typeof record.content === "string") return record.content;
+      const record = item as {
+        type?: unknown;
+        text?: unknown;
+        content?: unknown;
+      };
+      if (record.type === "text" && typeof record.text === "string")
+        return record.text;
+      if (record.type === "tool_result" && typeof record.content === "string")
+        return record.content;
       return "";
     })
     .filter(Boolean)
@@ -5951,7 +8249,10 @@ function projectTag(value?: string) {
 }
 
 function publicApiUrl(req: express.Request) {
-  return process.env.OPENLEASH_PUBLIC_API_URL ?? `${req.protocol}://${req.get("host")}`;
+  return (
+    process.env.OPENLEASH_PUBLIC_API_URL ??
+    `${req.protocol}://${req.get("host")}`
+  );
 }
 
 function desktopRedirectUriFallback() {
@@ -5959,28 +8260,43 @@ function desktopRedirectUriFallback() {
 }
 
 function webGoogleRedirectUri(req: express.Request) {
-  return process.env.OPENLEASH_GOOGLE_WEB_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/google/callback`;
+  return (
+    process.env.OPENLEASH_GOOGLE_WEB_REDIRECT_URI ??
+    `${publicApiUrl(req)}/v1/auth/google/callback`
+  );
 }
 
 function webMicrosoftRedirectUri(req: express.Request) {
-  return process.env.OPENLEASH_MICROSOFT_WEB_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/microsoft/callback`;
+  return (
+    process.env.OPENLEASH_MICROSOFT_WEB_REDIRECT_URI ??
+    `${publicApiUrl(req)}/v1/auth/microsoft/callback`
+  );
 }
 
 function webGithubRedirectUri(req: express.Request) {
   return githubRedirectUriForRequest(req, "web");
 }
 
-function publicCloudAuthRedirectUri(req: express.Request, providerType: "google" | "azure_ad" | "github", finalRedirectUri: string) {
-  const surface = isMainWebAccountCallbackRedirect(finalRedirectUri) ? "web" : "desktop";
+function publicCloudAuthRedirectUri(
+  req: express.Request,
+  providerType: "google" | "azure_ad" | "github",
+  finalRedirectUri: string,
+) {
+  const surface = isMainWebAccountCallbackRedirect(finalRedirectUri)
+    ? "web"
+    : "desktop";
   if (providerType === "azure_ad") {
     return surface === "web"
       ? `${publicApiUrl(req)}/v1/auth/microsoft/callback`
-      : process.env.OPENLEASH_MICROSOFT_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/microsoft/callback`;
+      : (process.env.OPENLEASH_MICROSOFT_REDIRECT_URI ??
+          `${publicApiUrl(req)}/v1/auth/microsoft/callback`);
   }
-  if (providerType === "github") return githubRedirectUriForRequest(req, surface);
+  if (providerType === "github")
+    return githubRedirectUriForRequest(req, surface);
   return surface === "web"
     ? `${publicApiUrl(req)}/v1/auth/google/callback`
-    : process.env.OPENLEASH_GOOGLE_REDIRECT_URI ?? `${publicApiUrl(req)}/v1/auth/google/callback`;
+    : (process.env.OPENLEASH_GOOGLE_REDIRECT_URI ??
+        `${publicApiUrl(req)}/v1/auth/google/callback`);
 }
 
 function isMainWebAccountCallbackRedirect(redirectUri: string) {
@@ -5996,11 +8312,14 @@ async function ensureDefaultOrganization() {
   const existing = await pool.query(
     `select * from organizations
      order by setup_completed desc, updated_at desc, created_at desc
-     limit 1`
+     limit 1`,
   );
   if (existing.rows[0]) {
     const organization = existing.rows[0];
-    await pool.query(`update users set organization_id = $1 where organization_id is null`, [organization.id]);
+    await pool.query(
+      `update users set organization_id = $1 where organization_id is null`,
+      [organization.id],
+    );
     return organization as {
       id: string;
       name: string;
@@ -6025,11 +8344,14 @@ async function ensureDefaultOrganization() {
       process.env.OPENLEASH_ORG_NAME ?? "",
       process.env.OPENLEASH_ORG_SLUG ?? "openleash",
       process.env.OPENLEASH_ORG_REGION ?? null,
-      process.env.OPENLEASH_ONBOARDING_CODE ?? null
-    ]
+      process.env.OPENLEASH_ONBOARDING_CODE ?? null,
+    ],
   );
   const organization = result.rows[0];
-  await pool.query(`update users set organization_id = $1 where organization_id is null`, [organization.id]);
+  await pool.query(
+    `update users set organization_id = $1 where organization_id is null`,
+    [organization.id],
+  );
   return organization as {
     id: string;
     name: string;
@@ -6047,7 +8369,12 @@ async function ensureDefaultOrganization() {
 }
 
 async function resolveOnboardingOrganization(req: express.Request) {
-  const slug = String(req.query.organizationSlug ?? req.body?.organizationSlug ?? req.query.slug ?? "").trim();
+  const slug = String(
+    req.query.organizationSlug ??
+      req.body?.organizationSlug ??
+      req.query.slug ??
+      "",
+  ).trim();
   if (slug) {
     const organization = await getOrganizationBySlug(slug);
     if (!organization) {
@@ -6055,8 +8382,13 @@ async function resolveOnboardingOrganization(req: express.Request) {
       (error as Error & { status?: number }).status = 404;
       throw error;
     }
-    await pool.query(`update users set organization_id = $1 where organization_id is null`, [organization.id]);
-    return organization as Awaited<ReturnType<typeof ensureDefaultOrganization>>;
+    await pool.query(
+      `update users set organization_id = $1 where organization_id is null`,
+      [organization.id],
+    );
+    return organization as Awaited<
+      ReturnType<typeof ensureDefaultOrganization>
+    >;
   }
   return ensureDefaultOrganization();
 }
@@ -6064,10 +8396,12 @@ async function resolveOnboardingOrganization(req: express.Request) {
 async function ensureManagedMobileOrganization() {
   const slug = slugifyTenant(
     process.env.OPENLEASH_MANAGED_MOBILE_ORG_SLUG ??
-    process.env.OPENLEASH_DEV_ORG_SLUG ??
-    "openleash-dev"
+      process.env.OPENLEASH_DEV_ORG_SLUG ??
+      "openleash-dev",
   );
-  const deploymentMode = normalizeDeploymentMode(process.env.OPENLEASH_DEPLOYMENT_MODE);
+  const deploymentMode = normalizeDeploymentMode(
+    process.env.OPENLEASH_DEPLOYMENT_MODE,
+  );
   const result = await pool.query(
     `insert into organizations (name, slug, region, setup_completed, current_step, deployment_mode)
      values ($1, $2, $3, true, 6, $4)
@@ -6077,8 +8411,8 @@ async function ensureManagedMobileOrganization() {
       process.env.OPENLEASH_MANAGED_MOBILE_ORG_NAME ?? "OpenLeash Managed Dev",
       slug,
       process.env.OPENLEASH_ORG_REGION ?? null,
-      deploymentMode
-    ]
+      deploymentMode,
+    ],
   );
   return result.rows[0] as {
     id: string;
@@ -6111,28 +8445,46 @@ type ManagedOrganization = {
   defaultUserRole?: string;
 };
 
-async function resolveManagedMobileOrganization(profile: ManagedAuthProfile, audience: "individual" | "organization" = "individual"): Promise<ManagedOrganization> {
+async function resolveManagedMobileOrganization(
+  profile: ManagedAuthProfile,
+  audience: "individual" | "organization" = "individual",
+): Promise<ManagedOrganization> {
   const email = profile.email.toLowerCase();
   const domain = email.split("@")[1]?.trim() ?? "";
-  const domainSlug = domain ? slugifyTenant(domain.split(".")[0] ?? domain) : "";
-  const configuredSlug = audience === "organization"
-    ? domainSlug
-    : process.env.OPENLEASH_MANAGED_MOBILE_ORG_SLUG ?? process.env.OPENLEASH_DEV_ORG_SLUG;
+  const domainSlug = domain
+    ? slugifyTenant(domain.split(".")[0] ?? domain)
+    : "";
+  const configuredSlug =
+    audience === "organization"
+      ? domainSlug
+      : (process.env.OPENLEASH_MANAGED_MOBILE_ORG_SLUG ??
+        process.env.OPENLEASH_DEV_ORG_SLUG);
   const existing = configuredSlug
     ? await getOrganizationBySlug(configuredSlug)
     : domain
       ? await getOrganizationBySlug(domainSlug)
       : undefined;
   if (existing) {
-    const configuredName = process.env.OPENLEASH_MANAGED_MOBILE_ORG_NAME?.trim();
+    const configuredName =
+      process.env.OPENLEASH_MANAGED_MOBILE_ORG_NAME?.trim();
     if (configuredName && !String(existing.name ?? "").trim()) {
       const updated = await pool.query(
         `update organizations set name = $2, deployment_mode = $3, updated_at = now() where id = $1 returning *`,
-        [existing.id, configuredName, normalizeDeploymentMode(process.env.OPENLEASH_DEPLOYMENT_MODE)]
+        [
+          existing.id,
+          configuredName,
+          normalizeDeploymentMode(process.env.OPENLEASH_DEPLOYMENT_MODE),
+        ],
       );
-      return { ...updated.rows[0], defaultUserRole: audience === "organization" ? "admin" : "engineer" };
+      return {
+        ...updated.rows[0],
+        defaultUserRole: audience === "organization" ? "admin" : "engineer",
+      };
     }
-    return { ...existing, defaultUserRole: audience === "organization" ? "admin" : "engineer" };
+    return {
+      ...existing,
+      defaultUserRole: audience === "organization" ? "admin" : "engineer",
+    };
   }
 
   if (audience === "organization" && domainSlug) {
@@ -6141,15 +8493,24 @@ async function resolveManagedMobileOrganization(profile: ManagedAuthProfile, aud
        values ($1, $2, $3, false, 1, 'cloud')
        on conflict (slug) do update set updated_at = now()
        returning id, name, slug, region, setup_completed, current_step, deployment_mode`,
-      [organizationNameFromDomain(domain), domainSlug, process.env.OPENLEASH_ORG_REGION ?? null]
+      [
+        organizationNameFromDomain(domain),
+        domainSlug,
+        process.env.OPENLEASH_ORG_REGION ?? null,
+      ],
     );
     return { ...result.rows[0], defaultUserRole: "admin" };
   }
 
-  return { ...(await ensureManagedMobileOrganization()), defaultUserRole: audience === "organization" ? "admin" : "engineer" };
+  return {
+    ...(await ensureManagedMobileOrganization()),
+    defaultUserRole: audience === "organization" ? "admin" : "engineer",
+  };
 }
 
-async function resolveExistingMobileOrganizationForProfile(profile: ManagedAuthProfile): Promise<ManagedOrganization> {
+async function resolveExistingMobileOrganizationForProfile(
+  profile: ManagedAuthProfile,
+): Promise<ManagedOrganization> {
   const result = await pool.query(
     `select o.id, o.name, o.slug, o.region, o.setup_completed, o.current_step, o.deployment_mode, u.role as default_user_role
      from users u
@@ -6158,26 +8519,30 @@ async function resolveExistingMobileOrganizationForProfile(profile: ManagedAuthP
        and u.status = 'active'
      order by case when u.role in ('owner', 'admin') then 0 else 1 end, u.last_login_at desc nulls last
      limit 1`,
-    [profile.email]
+    [profile.email],
   );
   if (result.rows[0]) {
     return {
       ...result.rows[0],
-      defaultUserRole: result.rows[0].default_user_role ?? "engineer"
+      defaultUserRole: result.rows[0].default_user_role ?? "engineer",
     };
   }
-  const error = new Error("No OpenLeash account exists for this email. Create your account from desktop or the web, then sign in on mobile.");
+  const error = new Error(
+    "No OpenLeash account exists for this email. Create your account from desktop or the web, then sign in on mobile.",
+  );
   (error as Error & { status?: number }).status = 403;
   throw error;
 }
 
 function organizationNameFromDomain(domain: string) {
   const first = domain.split(".")[0] || "Company";
-  return first
-    .split(/[-_]+/)
-    .filter(Boolean)
-    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
-    .join(" ") || "Company";
+  return (
+    first
+      .split(/[-_]+/)
+      .filter(Boolean)
+      .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+      .join(" ") || "Company"
+  );
 }
 
 function isPersonalEmailDomain(email: string) {
@@ -6195,7 +8560,7 @@ function isPersonalEmailDomain(email: string) {
     "yahoo.com",
     "proton.me",
     "protonmail.com",
-    "aol.com"
+    "aol.com",
   ]).has(domain);
 }
 
@@ -6208,23 +8573,37 @@ async function canUseCloudOwnerLogin(organizationId: string, email: string) {
        and role in ('owner', 'admin')
        and status = 'active'
      limit 1`,
-    [organizationId, email]
+    [organizationId, email],
   );
   return Boolean(result.rows[0]);
 }
 
 function generateOnboardingCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const chars = Array.from({ length: 12 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+  const chars = Array.from(
+    { length: 12 },
+    () => alphabet[Math.floor(Math.random() * alphabet.length)],
+  ).join("");
   return `${chars.slice(0, 4)}-${chars.slice(4, 8)}-${chars.slice(8)}`;
 }
 
 function slugifyTenant(value: string) {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "openleash";
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48) || "openleash"
+  );
 }
 
 function slugify(value: string) {
-  return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
 }
 
 function optionalString(value: unknown) {
@@ -6232,8 +8611,13 @@ function optionalString(value: unknown) {
   return text || undefined;
 }
 
-function pluginUpdatePolicy(value: unknown): PluginSettingRecord["updatePolicy"] | undefined {
-  return value === "manual" || value === "patch" || value === "minor" || value === "locked"
+function pluginUpdatePolicy(
+  value: unknown,
+): PluginSettingRecord["updatePolicy"] | undefined {
+  return value === "manual" ||
+    value === "patch" ||
+    value === "minor" ||
+    value === "locked"
     ? value
     : undefined;
 }
@@ -6248,7 +8632,8 @@ function normalizeGithubRepositoryUrl(value: unknown) {
     const parts = url.pathname.replace(/^\/+|\/+$/g, "").split("/");
     const owner = parts[0];
     const repo = parts[1]?.replace(/\.git$/i, "");
-    if (!owner || !repo || owner.startsWith(".") || repo.startsWith(".")) return undefined;
+    if (!owner || !repo || owner.startsWith(".") || repo.startsWith("."))
+      return undefined;
     return `https://github.com/${owner}/${repo}`;
   } catch {
     return undefined;
@@ -6260,25 +8645,39 @@ function arrayValue(value: unknown): string[] {
 }
 
 function objectValue(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 function normalizeDeploymentMode(value: unknown) {
   const normalized = String(value ?? "cloud").toLowerCase();
-  return normalized.includes("private") || normalized.includes("onprem") || normalized.includes("on-prem") ? "private" : "cloud";
+  return normalized.includes("private") ||
+    normalized.includes("onprem") ||
+    normalized.includes("on-prem")
+    ? "private"
+    : "cloud";
 }
 
 function normalizeAccountPackage(value: unknown) {
   const normalized = String(value ?? "").trim();
-  if (["personal-byok", "personal-managed", "work-byok", "work-managed"].includes(normalized)) {
-    return normalized as "personal-byok" | "personal-managed" | "work-byok" | "work-managed";
+  if (
+    ["personal-byok", "personal-managed", "work-byok", "work-managed"].includes(
+      normalized,
+    )
+  ) {
+    return normalized as
+      "personal-byok" | "personal-managed" | "work-byok" | "work-managed";
   }
   return null;
 }
 
 async function getOrganizationBySlug(slug: string) {
   const normalized = slugifyTenant(slug);
-  const result = await pool.query(`select * from organizations where slug = $1 limit 1`, [normalized]);
+  const result = await pool.query(
+    `select * from organizations where slug = $1 limit 1`,
+    [normalized],
+  );
   return result.rows[0] as
     | {
         id: string;
@@ -6291,7 +8690,10 @@ async function getOrganizationBySlug(slug: string) {
 }
 
 async function getOrganizationById(id: string) {
-  const result = await pool.query(`select * from organizations where id = $1 limit 1`, [id]);
+  const result = await pool.query(
+    `select * from organizations where id = $1 limit 1`,
+    [id],
+  );
   return result.rows[0] as
     | {
         id: string;
@@ -6310,61 +8712,124 @@ function ssoProviderType(provider: string) {
   if (normalized === "okta") return "okta";
   if (normalized === "google") return "google_workspace";
   if (normalized === "ping") return "ping";
-  if (normalized === "oidc" || normalized === "openidconnect" || normalized === "openid_connect" || normalized === "generic_oidc") return "oidc";
+  if (
+    normalized === "oidc" ||
+    normalized === "openidconnect" ||
+    normalized === "openid_connect" ||
+    normalized === "generic_oidc"
+  )
+    return "oidc";
   if (normalized === "activedirectory") return "active_directory";
   return normalized;
 }
 
 function normalizePublicCloudAuthProvider(provider: string) {
   const normalized = provider.toLowerCase().replace(/[\s-]+/g, "_");
-  if (normalized === "azure_ad" || normalized === "azuread" || normalized === "microsoft") return "azure_ad";
+  if (
+    normalized === "azure_ad" ||
+    normalized === "azuread" ||
+    normalized === "microsoft"
+  )
+    return "azure_ad";
   if (normalized === "github") return "github";
   return "google";
 }
 
 function clientModeFromEnvironment() {
-  const mode = String(process.env.OPENLEASH_CLIENT_MODE ?? process.env.OPENLEASH_DEPLOYMENT_MODE ?? "cloud").toLowerCase();
-  if (mode.includes("enterprise") || mode.includes("private") || mode.includes("onprem") || mode.includes("on-prem")) return "enterprise";
-  if (mode.includes("community") || mode.includes("personal")) return "community";
+  const mode = String(
+    process.env.OPENLEASH_CLIENT_MODE ??
+      process.env.OPENLEASH_DEPLOYMENT_MODE ??
+      "cloud",
+  ).toLowerCase();
+  if (
+    mode.includes("enterprise") ||
+    mode.includes("private") ||
+    mode.includes("onprem") ||
+    mode.includes("on-prem")
+  )
+    return "enterprise";
+  if (mode.includes("community") || mode.includes("personal"))
+    return "community";
   return "cloud";
 }
 
 function mobileGoogleConfig() {
   return {
-    ClientId: process.env.OPENLEASH_GOOGLE_CLIENT_ID ?? process.env.GOOGLE_CLIENT_ID ?? "",
-    ClientSecret: process.env.OPENLEASH_GOOGLE_CLIENT_SECRET ?? process.env.GOOGLE_CLIENT_SECRET ?? ""
+    ClientId:
+      process.env.OPENLEASH_GOOGLE_CLIENT_ID ??
+      process.env.GOOGLE_CLIENT_ID ??
+      "",
+    ClientSecret:
+      process.env.OPENLEASH_GOOGLE_CLIENT_SECRET ??
+      process.env.GOOGLE_CLIENT_SECRET ??
+      "",
   };
 }
 
 function cloudMicrosoftConfig() {
   return {
-    TenantId: process.env.OPENLEASH_MICROSOFT_TENANT_ID ?? process.env.MICROSOFT_ENTRA_TENANT_ID ?? process.env.AZURE_TENANT_ID ?? "organizations",
-    ClientId: process.env.OPENLEASH_MICROSOFT_CLIENT_ID ?? process.env.MICROSOFT_CLIENT_ID ?? process.env.AZURE_CLIENT_ID ?? "",
-    ClientSecret: process.env.OPENLEASH_MICROSOFT_CLIENT_SECRET ?? process.env.MICROSOFT_CLIENT_SECRET ?? process.env.AZURE_CLIENT_SECRET ?? ""
+    TenantId:
+      process.env.OPENLEASH_MICROSOFT_TENANT_ID ??
+      process.env.MICROSOFT_ENTRA_TENANT_ID ??
+      process.env.AZURE_TENANT_ID ??
+      "organizations",
+    ClientId:
+      process.env.OPENLEASH_MICROSOFT_CLIENT_ID ??
+      process.env.MICROSOFT_CLIENT_ID ??
+      process.env.AZURE_CLIENT_ID ??
+      "",
+    ClientSecret:
+      process.env.OPENLEASH_MICROSOFT_CLIENT_SECRET ??
+      process.env.MICROSOFT_CLIENT_SECRET ??
+      process.env.AZURE_CLIENT_SECRET ??
+      "",
   };
 }
 
 function cloudGithubConfig(redirectUri?: string) {
   const useDev = isLocalhostRedirectUri(redirectUri);
-  return useDev ? {
-    ClientId: process.env.OPENLEASH_GITHUB_DEV_CLIENT_ID ?? process.env.OPENLEASH_GITHUB_CLIENT_ID ?? process.env.GITHUB_CLIENT_ID ?? "",
-    ClientSecret: process.env.OPENLEASH_GITHUB_DEV_CLIENT_SECRET ?? process.env.OPENLEASH_GITHUB_CLIENT_SECRET ?? process.env.GITHUB_CLIENT_SECRET ?? ""
-  } : {
-    ClientId: process.env.OPENLEASH_GITHUB_CLIENT_ID ?? process.env.GITHUB_CLIENT_ID ?? "",
-    ClientSecret: process.env.OPENLEASH_GITHUB_CLIENT_SECRET ?? process.env.GITHUB_CLIENT_SECRET ?? ""
-  };
+  return useDev
+    ? {
+        ClientId:
+          process.env.OPENLEASH_GITHUB_DEV_CLIENT_ID ??
+          process.env.OPENLEASH_GITHUB_CLIENT_ID ??
+          process.env.GITHUB_CLIENT_ID ??
+          "",
+        ClientSecret:
+          process.env.OPENLEASH_GITHUB_DEV_CLIENT_SECRET ??
+          process.env.OPENLEASH_GITHUB_CLIENT_SECRET ??
+          process.env.GITHUB_CLIENT_SECRET ??
+          "",
+      }
+    : {
+        ClientId:
+          process.env.OPENLEASH_GITHUB_CLIENT_ID ??
+          process.env.GITHUB_CLIENT_ID ??
+          "",
+        ClientSecret:
+          process.env.OPENLEASH_GITHUB_CLIENT_SECRET ??
+          process.env.GITHUB_CLIENT_SECRET ??
+          "",
+      };
 }
 
-function githubRedirectUriForRequest(req: express.Request, surface: "desktop" | "web" = "desktop") {
+function githubRedirectUriForRequest(
+  req: express.Request,
+  surface: "desktop" | "web" = "desktop",
+) {
   const localDefault = `${publicApiUrl(req)}/v1/auth/github/callback`;
   if (isLocalhostRedirectUri(localDefault)) {
     return surface === "web"
-      ? process.env.OPENLEASH_GITHUB_DEV_WEB_REDIRECT_URI ?? process.env.OPENLEASH_GITHUB_DEV_REDIRECT_URI ?? localDefault
-      : process.env.OPENLEASH_GITHUB_DEV_REDIRECT_URI ?? localDefault;
+      ? (process.env.OPENLEASH_GITHUB_DEV_WEB_REDIRECT_URI ??
+          process.env.OPENLEASH_GITHUB_DEV_REDIRECT_URI ??
+          localDefault)
+      : (process.env.OPENLEASH_GITHUB_DEV_REDIRECT_URI ?? localDefault);
   }
   return surface === "web"
-    ? process.env.OPENLEASH_GITHUB_WEB_REDIRECT_URI ?? process.env.OPENLEASH_GITHUB_REDIRECT_URI ?? localDefault
-    : process.env.OPENLEASH_GITHUB_REDIRECT_URI ?? localDefault;
+    ? (process.env.OPENLEASH_GITHUB_WEB_REDIRECT_URI ??
+        process.env.OPENLEASH_GITHUB_REDIRECT_URI ??
+        localDefault)
+    : (process.env.OPENLEASH_GITHUB_REDIRECT_URI ?? localDefault);
 }
 
 function isLocalhostRedirectUri(redirectUri?: string) {
@@ -6377,22 +8842,47 @@ function isLocalhostRedirectUri(redirectUri?: string) {
   }
 }
 
-async function buildMobileGoogleAuthorizationUrl(redirectUri: string, state: string) {
-  return buildAuthorizationUrl("google_workspace", mobileGoogleConfig(), redirectUri, state);
+async function buildMobileGoogleAuthorizationUrl(
+  redirectUri: string,
+  state: string,
+) {
+  return buildAuthorizationUrl(
+    "google_workspace",
+    mobileGoogleConfig(),
+    redirectUri,
+    state,
+  );
 }
 
-function encodeMobileAuthState(state: { nonce: string; finalRedirectUri: string; exchangeRedirectUri?: string }) {
+function encodeMobileAuthState(state: {
+  nonce: string;
+  finalRedirectUri: string;
+  exchangeRedirectUri?: string;
+}) {
   return Buffer.from(JSON.stringify(state), "utf8").toString("base64url");
 }
 
 function decodeMobileAuthState(state: string) {
   try {
-    const parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8")) as { finalRedirectUri?: unknown; nonce?: unknown; exchangeRedirectUri?: unknown };
-    if (typeof parsed.finalRedirectUri !== "string" || typeof parsed.nonce !== "string") return undefined;
+    const parsed = JSON.parse(
+      Buffer.from(state, "base64url").toString("utf8"),
+    ) as {
+      finalRedirectUri?: unknown;
+      nonce?: unknown;
+      exchangeRedirectUri?: unknown;
+    };
+    if (
+      typeof parsed.finalRedirectUri !== "string" ||
+      typeof parsed.nonce !== "string"
+    )
+      return undefined;
     return {
       nonce: parsed.nonce,
       finalRedirectUri: parsed.finalRedirectUri,
-      exchangeRedirectUri: typeof parsed.exchangeRedirectUri === "string" ? parsed.exchangeRedirectUri : undefined
+      exchangeRedirectUri:
+        typeof parsed.exchangeRedirectUri === "string"
+          ? parsed.exchangeRedirectUri
+          : undefined,
     };
   } catch {
     return undefined;
@@ -6403,12 +8893,22 @@ function isAllowedAuthRedirectUri(redirectUri: string) {
   try {
     const url = new URL(redirectUri);
     if (url.protocol === "openleash:") return true;
-    if ((url.protocol === "http:" || url.protocol === "https:") && ["localhost", "127.0.0.1"].includes(url.hostname)) return true;
-    const allowedHosts = (process.env.OPENLEASH_ALLOWED_AUTH_REDIRECT_HOSTS ?? "localhost,127.0.0.1")
+    if (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      ["localhost", "127.0.0.1"].includes(url.hostname)
+    )
+      return true;
+    const allowedHosts = (
+      process.env.OPENLEASH_ALLOWED_AUTH_REDIRECT_HOSTS ?? "localhost,127.0.0.1"
+    )
       .split(",")
       .map((host) => host.trim().toLowerCase())
       .filter(Boolean);
-    if (url.protocol === "https:" && allowedHosts.includes(url.hostname.toLowerCase())) return true;
+    if (
+      url.protocol === "https:" &&
+      allowedHosts.includes(url.hostname.toLowerCase())
+    )
+      return true;
     return false;
   } catch {
     return false;
@@ -6420,55 +8920,77 @@ function defaultMobileProviders() {
     {
       id: "openleash-google",
       type: "google",
-      label: "Google Workspace"
+      label: "Google Workspace",
     },
     {
       id: "openleash-github",
       type: "github",
-      label: "GitHub"
+      label: "GitHub",
     },
     {
       id: "openleash-microsoft",
       type: "azure_ad",
-      label: "Microsoft 365"
-    }
+      label: "Microsoft 365",
+    },
   ];
 }
 
-async function mobileProvidersForOrganization(organizationId: string, organizationSlug: string) {
+async function mobileProvidersForOrganization(
+  organizationId: string,
+  organizationSlug: string,
+) {
   const result = await pool.query(
     `select id, provider, enabled, config
      from idp_connections
      where organization_id = $1 and enabled = true
      order by updated_at desc`,
-    [organizationId]
+    [organizationId],
   );
   return result.rows.map((row) => ({
     id: row.id,
     type: ssoProviderType(row.provider),
     label: ssoProviderLabel(row.provider),
     organizationId,
-    organizationSlug
+    organizationSlug,
   }));
 }
 
-async function configuredSsoProvider(organizationId: string, requestedProviderType?: string) {
+async function configuredSsoProvider(
+  organizationId: string,
+  requestedProviderType?: string,
+) {
   const result = await pool.query(
     `select provider, config from idp_connections where organization_id = $1 and enabled = true`,
-    [organizationId]
+    [organizationId],
   );
-  const row = result.rows.find((item) => ssoProviderType(item.provider) === requestedProviderType) ?? result.rows[0];
+  const row =
+    result.rows.find(
+      (item) => ssoProviderType(item.provider) === requestedProviderType,
+    ) ?? result.rows[0];
   if (!row) return undefined;
   return {
     providerType: ssoProviderType(row.provider),
-    config: (row.config ?? {}) as Record<string, unknown>
+    config: (row.config ?? {}) as Record<string, unknown>,
   };
 }
 
-async function exchangeOrganizationAuthorizationCode(organizationId: string, providerType: string, authorizationCode: string, redirectUri: string) {
+async function exchangeOrganizationAuthorizationCode(
+  organizationId: string,
+  providerType: string,
+  authorizationCode: string,
+  redirectUri: string,
+) {
   const provider = await configuredSsoProvider(organizationId, providerType);
-  if (!provider) throw new Error("Identity provider is not configured for this organization");
-  return exchangeAuthorizationCode(provider.providerType, provider.config, authorizationCode, redirectUri);
+  if (!provider)
+    throw new Error(
+      "Identity provider is not configured for this organization",
+    );
+  return exchangeAuthorizationCode(
+    provider.providerType,
+    provider.config,
+    authorizationCode,
+    redirectUri,
+  );
 }
 
 async function createDashboardSessionFromProfile({
@@ -6477,7 +8999,7 @@ async function createDashboardSessionFromProfile({
   profile,
   role = "engineer",
   provisionUser = true,
-  accountAudience = "individual"
+  accountAudience = "individual",
 }: {
   organizationId: string;
   providerType: string;
@@ -6486,22 +9008,29 @@ async function createDashboardSessionFromProfile({
   provisionUser?: boolean;
   accountAudience?: "individual" | "organization";
 }) {
-  const organizationResult = await pool.query(`select id, name, slug, region, setup_completed from organizations where id = $1 limit 1`, [organizationId]);
+  const organizationResult = await pool.query(
+    `select id, name, slug, region, setup_completed from organizations where id = $1 limit 1`,
+    [organizationId],
+  );
   const organization = organizationResult.rows[0];
   if (!organization) throw new Error("Organization not found");
   const profileNameParts = splitProfileName(profile.name || "");
   const firstName = profile.givenName || profileNameParts.givenName;
   const lastName = profile.familyName || profileNameParts.familyName;
-  const displayName = [firstName, lastName].filter(Boolean).join(" ") || profile.name || profile.email.split("@")[0] || "OpenLeash user";
+  const displayName =
+    [firstName, lastName].filter(Boolean).join(" ") ||
+    profile.name ||
+    profile.email.split("@")[0] ||
+    "OpenLeash user";
   const userEmail = profile.email.toLowerCase();
   const userResult = provisionUser
     ? await pool.query<{
-    id: string;
-    email: string;
-    display_name: string;
-    role: string;
-  }>(
-    `insert into users (organization_id, email, display_name, role, first_name, last_name, idp_user_id, idp_provider, status, last_login_at, metadata)
+        id: string;
+        email: string;
+        display_name: string;
+        role: string;
+      }>(
+        `insert into users (organization_id, email, display_name, role, first_name, last_name, idp_user_id, idp_provider, status, last_login_at, metadata)
      values ($1, $2, $3, $4, $5, $6, $7, $8, 'active', now(), $9)
      on conflict (email) do update set
        organization_id = excluded.organization_id,
@@ -6514,17 +9043,21 @@ async function createDashboardSessionFromProfile({
        last_login_at = now(),
        metadata = coalesce(users.metadata, '{}'::jsonb) || excluded.metadata
      returning id, email, display_name, role`,
-    [
-      organizationId,
-      userEmail,
-      displayName,
-      role,
-      firstName,
-      lastName,
-      profile.subject,
-      providerType,
-      JSON.stringify({ ssoProfile: profile.raw, mobile: true, accountAudience })
-    ]
+        [
+          organizationId,
+          userEmail,
+          displayName,
+          role,
+          firstName,
+          lastName,
+          profile.subject,
+          providerType,
+          JSON.stringify({
+            ssoProfile: profile.raw,
+            mobile: true,
+            accountAudience,
+          }),
+        ],
       )
     : await pool.query<{
         id: string;
@@ -6546,22 +9079,33 @@ async function createDashboardSessionFromProfile({
           userEmail,
           profile.subject || null,
           providerType || null,
-          JSON.stringify({ ssoProfile: profile.raw, accountAudience })
-        ]
+          JSON.stringify({ ssoProfile: profile.raw, accountAudience }),
+        ],
       );
   if (!userResult.rows[0] && !provisionUser) {
-    const error = new Error(accountAudience === "organization"
-      ? "This account is not provisioned for this OpenLeash organization. Ask an admin to sync or invite your identity first."
-      : "No OpenLeash account exists for this email. Create your account from desktop or the web, then sign in on mobile.");
+    const error = new Error(
+      accountAudience === "organization"
+        ? "This account is not provisioned for this OpenLeash organization. Ask an admin to sync or invite your identity first."
+        : "No OpenLeash account exists for this email. Create your account from desktop or the web, then sign in on mobile.",
+    );
     (error as Error & { status?: number }).status = 403;
     throw error;
   }
   const sessionToken = `ols_${crypto.randomBytes(32).toString("base64url")}`;
-  const expiresAt = new Date(Date.now() + Number(process.env.OPENLEASH_DASHBOARD_SESSION_DAYS ?? 14) * 86400000);
+  const expiresAt = new Date(
+    Date.now() +
+      Number(process.env.OPENLEASH_DASHBOARD_SESSION_DAYS ?? 14) * 86400000,
+  );
   await pool.query(
     `insert into dashboard_sessions (organization_id, user_id, token_hash, provider, expires_at)
      values ($1, $2, $3, $4, $5)`,
-    [organizationId, userResult.rows[0].id, hashToken(sessionToken), providerType, expiresAt.toISOString()]
+    [
+      organizationId,
+      userResult.rows[0].id,
+      hashToken(sessionToken),
+      providerType,
+      expiresAt.toISOString(),
+    ],
   );
   return {
     success: true,
@@ -6572,12 +9116,16 @@ async function createDashboardSessionFromProfile({
     organization,
     account: {
       audience: accountAudience,
-      packageId: null
-    }
+      packageId: null,
+    },
   };
 }
 
-async function mobilePendingApprovals(userId: string, organizationId: string, includeOrganization = true) {
+async function mobilePendingApprovals(
+  userId: string,
+  organizationId: string,
+  includeOrganization = true,
+) {
   const result = await pool.query(
     `select e.id, e.summary, e.question, e.created_at,
             ce.event_name, ce.tool_name, ce.project_path, ce.prompt, ce.payload, ce.occurred_at,
@@ -6614,24 +9162,35 @@ async function mobilePendingApprovals(userId: string, organizationId: string, in
        )))
      order by e.created_at asc
      limit 20`,
-    [userId, organizationId, includeOrganization]
+    [userId, organizationId, includeOrganization],
   );
   const rows = dedupePendingApprovalRows(result.rows);
   return {
     ...result,
-    rows: await Promise.all(rows.map((row) => enrichMobileApproval(row)))
+    rows: await Promise.all(rows.map((row) => enrichMobileApproval(row))),
   };
 }
 
-function dedupePendingApprovalRows<T extends { intent_key?: string | null; agent_kind?: string | null; project_path?: string | null; tool_name?: string | null; event_name?: string | null; summary?: string | null }>(rows: T[]) {
+function dedupePendingApprovalRows<
+  T extends {
+    intent_key?: string | null;
+    agent_kind?: string | null;
+    project_path?: string | null;
+    tool_name?: string | null;
+    event_name?: string | null;
+    summary?: string | null;
+  },
+>(rows: T[]) {
   const seen = new Set<string>();
   return rows.filter((row) => {
-    const key = canonicalIntentKey(row.intent_key) ?? [
-      row.agent_kind ?? "",
-      row.project_path ?? "",
-      row.tool_name ?? row.event_name ?? "",
-      row.summary ?? ""
-    ].join("|");
+    const key =
+      canonicalIntentKey(row.intent_key) ??
+      [
+        row.agent_kind ?? "",
+        row.project_path ?? "",
+        row.tool_name ?? row.event_name ?? "",
+        row.summary ?? "",
+      ].join("|");
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -6647,25 +9206,90 @@ async function enrichMobileApproval(row: {
   summary?: string | null;
   triggered_policies?: unknown;
 }) {
-  const payloadWithContext = await withTranscriptContext(row.payload, row.occurred_at);
-  const triggeredPolicies = Array.isArray(row.triggered_policies) ? row.triggered_policies : [];
-  const primaryPolicy = triggeredPolicies.find((policy) => policy && typeof policy === "object") as Record<string, unknown> | undefined;
-  const purposeSummary = await approvalPurposeSummary({ ...row, payload: payloadWithContext });
-  return {
+  const payloadWithContext = await withTranscriptContext(
+    row.payload,
+    row.occurred_at,
+  );
+  const triggeredPolicies = Array.isArray(row.triggered_policies)
+    ? row.triggered_policies
+    : [];
+  const primaryPolicy = triggeredPolicies.find(
+    (policy) => policy && typeof policy === "object",
+  ) as Record<string, unknown> | undefined;
+  const purposeSummary = await approvalPurposeSummary({
     ...row,
     payload: payloadWithContext,
+  });
+  return {
+    ...row,
+    ...notificationPluginAttribution(payloadWithContext),
+    payload: payloadWithContext,
     project_name: projectTag(row.project_path ?? undefined) ?? null,
-    primary_policy: typeof primaryPolicy?.policy_name === "string" ? primaryPolicy.policy_name : null,
+    primary_policy:
+      typeof primaryPolicy?.policy_name === "string"
+        ? primaryPolicy.policy_name
+        : null,
     purpose_summary: purposeSummary,
-    quote: approvalQuote({ ...row, payload: payloadWithContext }, primaryPolicy),
-    recent_context: approvalRecentContext(payloadWithContext)
+    quote: approvalQuote(
+      { ...row, payload: payloadWithContext },
+      primaryPolicy,
+    ),
+    recent_context: approvalRecentContext(payloadWithContext),
   };
 }
 
-async function approvalPurposeSummary(row: { payload?: unknown; project_path?: string | null; prompt?: string | null }) {
+function notificationPluginAttribution(payload: unknown) {
+  if (!payload || typeof payload !== "object")
+    return { plugin_id: "openleash.core", plugin_name: "OpenLeash core" };
+  const runs = Array.isArray(
+    (payload as { openleashPluginRuns?: unknown }).openleashPluginRuns,
+  )
+    ? (payload as { openleashPluginRuns: Array<Record<string, unknown>> })
+        .openleashPluginRuns
+    : [];
+  const responsible = runs.find((run) =>
+    ["blocked", "needs_question", "failed"].includes(
+      String(run.status ?? "").toLowerCase(),
+    ),
+  );
+  if (!responsible)
+    return { plugin_id: "openleash.core", plugin_name: "OpenLeash core" };
+  const pluginId = String(
+    responsible?.pluginId ?? responsible?.plugin_id ?? "openleash.core",
+  );
+  return { plugin_id: pluginId, plugin_name: pluginPackageSlug(pluginId) };
+}
+
+function pluginPackageSlug(pluginId: string) {
+  const slug = pluginId.replace(/^openleash\./, "");
+  return slug === "prompt-compression"
+    ? "token-saver"
+    : slug || "openleash-core";
+}
+
+async function approvalPurposeSummary(row: {
+  payload?: unknown;
+  project_path?: string | null;
+  prompt?: string | null;
+}) {
   if (!row.payload || typeof row.payload !== "object") return null;
-  const event = row.payload as { openleashPurposeSummary?: unknown; eventName?: string; agentKind?: string; agentVersion?: string; sessionId?: string; projectPath?: string; prompt?: string; tool?: { name?: string; input?: unknown; output?: unknown }; transcript?: ConversationTurn[]; raw?: unknown; occurredAt?: string };
-  if (typeof event.openleashPurposeSummary === "string" && event.openleashPurposeSummary.trim()) {
+  const event = row.payload as {
+    openleashPurposeSummary?: unknown;
+    eventName?: string;
+    agentKind?: string;
+    agentVersion?: string;
+    sessionId?: string;
+    projectPath?: string;
+    prompt?: string;
+    tool?: { name?: string; input?: unknown; output?: unknown };
+    transcript?: ConversationTurn[];
+    raw?: unknown;
+    occurredAt?: string;
+  };
+  if (
+    typeof event.openleashPurposeSummary === "string" &&
+    event.openleashPurposeSummary.trim()
+  ) {
     return event.openleashPurposeSummary.trim();
   }
   return summarizeActionPurpose({
@@ -6677,30 +9301,46 @@ async function approvalPurposeSummary(row: { payload?: unknown; project_path?: s
       sessionId: event.sessionId ?? "unknown",
       projectPath: event.projectPath ?? row.project_path ?? undefined,
       prompt: event.prompt ?? row.prompt ?? undefined,
-      tool: typeof event.tool?.name === "string" ? { name: event.tool.name, input: event.tool.input, output: event.tool.output } : undefined,
-      transcript: Array.isArray(event.transcript) ? event.transcript : undefined,
+      tool:
+        typeof event.tool?.name === "string"
+          ? {
+              name: event.tool.name,
+              input: event.tool.input,
+              output: event.tool.output,
+            }
+          : undefined,
+      transcript: Array.isArray(event.transcript)
+        ? event.transcript
+        : undefined,
       raw: event.raw,
-      occurredAt: event.occurredAt ?? new Date().toISOString()
-    }
+      occurredAt: event.occurredAt ?? new Date().toISOString(),
+    },
   });
 }
 
 function approvalQuote(
-  row: { prompt?: string | null; payload?: unknown; question?: string | null; summary?: string | null },
-  primaryPolicy?: Record<string, unknown>
+  row: {
+    prompt?: string | null;
+    payload?: unknown;
+    question?: string | null;
+    summary?: string | null;
+  },
+  primaryPolicy?: Record<string, unknown>,
 ) {
-  const evidence = primaryPolicy?.evidence;
-  const evidenceItems =
-    Array.isArray(evidence)
-      ? evidence
-      : typeof evidence === "string"
-        ? safeJsonArray(evidence)
-        : [];
-  const evidenceText = evidenceItems.find((item): item is string => typeof item === "string" && item.trim().length > 0);
-  if (evidenceText) return truncate(cleanContextText(evidenceText), 220);
-
   const prompt = typeof row.prompt === "string" ? row.prompt : undefined;
   if (prompt?.trim()) return truncate(cleanContextText(prompt), 220);
+
+  const evidence = primaryPolicy?.evidence;
+  const evidenceItems = Array.isArray(evidence)
+    ? evidence
+    : typeof evidence === "string"
+      ? safeJsonArray(evidence)
+      : [];
+  const evidenceText = evidenceItems.find(
+    (item): item is string =>
+      typeof item === "string" && item.trim().length > 0,
+  );
+  if (evidenceText) return truncate(cleanContextText(evidenceText), 220);
 
   const target = extractTarget(row.payload);
   if (target) return truncate(cleanContextText(target), 220);
@@ -6715,18 +9355,33 @@ function approvalRecentContext(payload: unknown) {
   const transcript = (payload as { transcript?: unknown }).transcript;
   if (!Array.isArray(transcript)) return [];
   return transcript
-    .filter((turn): turn is { role?: unknown; content?: unknown; at?: unknown } => Boolean(turn && typeof turn === "object"))
+    .filter(
+      (turn): turn is { role?: unknown; content?: unknown; at?: unknown } =>
+        Boolean(turn && typeof turn === "object"),
+    )
     .map((turn) => {
-      const role = typeof turn.role === "string" && isConversationRole(turn.role) ? turn.role : "user";
-      const content = typeof turn.content === "string" ? cleanContextText(turn.content) : "";
+      const role =
+        typeof turn.role === "string" && isConversationRole(turn.role)
+          ? turn.role
+          : "user";
+      const content =
+        typeof turn.content === "string" ? cleanContextText(turn.content) : "";
       if (!content) return undefined;
       return {
         role,
         content: truncate(content, 220),
-        ...(typeof turn.at === "string" ? { at: turn.at } : {})
+        ...(typeof turn.at === "string" ? { at: turn.at } : {}),
       };
     })
-    .filter((turn): turn is { role: ConversationTurn["role"]; content: string; at?: string } => Boolean(turn))
+    .filter(
+      (
+        turn,
+      ): turn is {
+        role: ConversationTurn["role"];
+        content: string;
+        at?: string;
+      } => Boolean(turn),
+    )
     .slice(-5);
 }
 
@@ -6870,10 +9525,12 @@ async function mobileAgents(organizationId: string, userId: string) {
      ) recent on true
      order by latest_runs.activity_at desc
      limit 50`,
-    [organizationId, userId]
+    [organizationId, userId],
   );
   const sessions = await mobileAgentSessions(organizationId, userId);
-  const seenRuntimeIds = new Set(result.rows.map((agent) => String(agent.agent_runtime_id || agent.id)));
+  const seenRuntimeIds = new Set(
+    result.rows.map((agent) => String(agent.agent_runtime_id || agent.id)),
+  );
   const inventory = await pool.query(
     `select ar.id,
             ar.id as agent_runtime_id,
@@ -6913,19 +9570,26 @@ async function mobileAgents(organizationId: string, userId: string) {
        and ar.last_seen_at > now() - interval '90 days'
      order by ar.last_seen_at desc
      limit 50`,
-    [organizationId, userId]
+    [organizationId, userId],
   );
   const rows = [
     ...result.rows,
-    ...inventory.rows.filter((agent) => !seenRuntimeIds.has(String(agent.agent_runtime_id || agent.id)))
+    ...inventory.rows.filter(
+      (agent) =>
+        !seenRuntimeIds.has(String(agent.agent_runtime_id || agent.id)),
+    ),
   ];
   return {
     ...result,
     rows: rows.map((agent) => ({
       ...agent,
-      sessions: sessions.filter((session) => session.agent_runtime_id === agent.agent_runtime_id).slice(0, 8),
-      short_summary: summarizeAgentActivity(agent)
-    }))
+      sessions: sessions
+        .filter(
+          (session) => session.agent_runtime_id === agent.agent_runtime_id,
+        )
+        .slice(0, 8),
+      short_summary: summarizeAgentActivity(agent),
+    })),
   };
 }
 
@@ -7046,7 +9710,7 @@ async function mobileAgentSessions(organizationId: string, userId: string) {
        ) item
      ) events on true
      order by sg.last_activity_at desc`,
-    [organizationId, userId]
+    [organizationId, userId],
   );
   return result.rows;
 }
@@ -7079,7 +9743,7 @@ function mobileSessionMetrics(organizationId: string, userId: string) {
        coalesce(sum(duration_seconds) filter (where last_activity_at >= now() - interval '30 days'), 0)::int as month_seconds,
        count(*) filter (where last_activity_at >= now() - interval '30 days')::int as month_sessions
      from sessions`,
-    [organizationId, userId]
+    [organizationId, userId],
   );
 }
 
@@ -7114,19 +9778,9 @@ function mobileRecentActivity(organizationId: string, userId: string) {
        where u.id = e.user_id and u.organization_id = $1
      )
        and e.user_id = $2
-       and ce.event_name <> 'Stop'
-       and not coalesce(e.summary, '') ~* 'all active policies passed'
-       and (
-         e.decision in ('ask', 'deny')
-         or e.resolution = 'deny'
-         or exists (
-           select 1 from policy_results pr
-           where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question')
-         )
-       )
      order by e.created_at desc
-     limit 30`,
-    [organizationId, userId]
+     limit 120`,
+    [organizationId, userId],
   );
 }
 
@@ -7166,36 +9820,59 @@ function browserBlockedNotifications(organizationId: string, userId: string) {
        and ce.event_name <> 'Stop'
      order by e.created_at desc
      limit 10`,
-    [organizationId, userId]
+    [organizationId, userId],
   );
 }
 
-async function notifyMobileApprovers(userId: string, decisionId: string, summary: string, question?: string, purposeSummary?: string) {
+async function notifyMobileApprovers(
+  userId: string,
+  decisionId: string,
+  summary: string,
+  question?: string,
+  purposeSummary?: string,
+) {
   await notifyMobileEvent(userId, {
     title: summary || "OpenLeash approval needed",
-    body: [purposeSummary, question].filter(Boolean).join("\n") || "An AI agent is waiting for your decision.",
+    body:
+      [purposeSummary, question].filter(Boolean).join("\n") ||
+      "An AI agent is waiting for your decision.",
     categoryId: "openleash.approval",
-    data: { decisionId, purposeSummary }
+    data: { decisionId, purposeSummary },
   });
 }
 
-async function notifyMobileEvent(userId: string, notification: { title: string; body: string; categoryId?: string; data?: Record<string, unknown> }) {
+async function notifyMobileEvent(
+  userId: string,
+  notification: {
+    title: string;
+    body: string;
+    categoryId?: string;
+    data?: Record<string, unknown>;
+  },
+) {
   const devices = await mobilePushDevicesForUser(userId);
   const expoMessages = devices
-    .filter((token): token is string => Boolean(token && /^ExponentPushToken\[[^\]]+\]$|^ExpoPushToken\[[^\]]+\]$/.test(token)))
+    .filter((token): token is string =>
+      Boolean(
+        token &&
+        /^ExponentPushToken\[[^\]]+\]$|^ExpoPushToken\[[^\]]+\]$/.test(token),
+      ),
+    )
     .map((token) => ({
       to: token,
       title: notification.title,
       body: notification.body,
       sound: "default",
-      ...(notification.categoryId ? { categoryId: notification.categoryId } : {}),
-      data: notification.data ?? {}
+      ...(notification.categoryId
+        ? { categoryId: notification.categoryId }
+        : {}),
+      data: notification.data ?? {},
     }));
   if (!expoMessages.length) return;
   await fetch("https://exp.host/--/api/v2/push/send", {
     method: "POST",
     headers: { accept: "application/json", "content-type": "application/json" },
-    body: JSON.stringify(expoMessages)
+    body: JSON.stringify(expoMessages),
   });
 }
 
@@ -7208,12 +9885,20 @@ async function mobilePushDevicesForUser(userId: string) {
        and (md.user_id = $1 or u.organization_id = (select organization_id from users where id = $1))
        and md.last_seen_at > now() - interval '45 days'
      limit 50`,
-    [userId]
+    [userId],
   );
   return devices.rows.map((row) => row.push_token);
 }
 
-function ssoProviderFromIdp(row: { id: string; provider: string; enabled: boolean; config: Record<string, unknown> }, organizationId: string) {
+function ssoProviderFromIdp(
+  row: {
+    id: string;
+    provider: string;
+    enabled: boolean;
+    config: Record<string, unknown>;
+  },
+  organizationId: string,
+) {
   const providerType = ssoProviderType(row.provider);
   return {
     id: row.id,
@@ -7221,7 +9906,7 @@ function ssoProviderFromIdp(row: { id: string; provider: string; enabled: boolea
     providerType,
     providerName: ssoProviderLabel(row.provider),
     enabled: row.enabled,
-    isPrimary: true
+    isPrimary: true,
   };
 }
 
@@ -7232,15 +9917,25 @@ function ssoProviderLabel(provider: string) {
   return provider;
 }
 
-async function buildAuthorizationUrl(providerType: string, config: Record<string, unknown>, redirectUri: string, state: string) {
+async function buildAuthorizationUrl(
+  providerType: string,
+  config: Record<string, unknown>,
+  redirectUri: string,
+  state: string,
+) {
   const clientId = String(config.ClientId ?? config.clientId ?? "");
-  const scope = encodeURIComponent(providerType === "github" ? "read:user user:email" : "openid profile email");
+  const scope = encodeURIComponent(
+    providerType === "github" ? "read:user user:email" : "openid profile email",
+  );
   if (providerType === "github") {
     if (!clientId) return "";
     return `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${scope}&state=${encodeURIComponent(state)}`;
   }
   if (providerType === "okta") {
-    const domain = String(config.Domain ?? config.domain ?? "").replace(/\/+$/, "");
+    const domain = String(config.Domain ?? config.domain ?? "").replace(
+      /\/+$/,
+      "",
+    );
     if (!domain || !clientId) return "";
     return `${domain}/oauth2/v1/authorize?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scope}&state=${encodeURIComponent(state)}`;
   }
@@ -7254,24 +9949,33 @@ async function buildAuthorizationUrl(providerType: string, config: Record<string
     return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scope}&state=${encodeURIComponent(state)}&access_type=offline&prompt=select_account`;
   }
   if (providerType === "oidc") {
-    const authorizationEndpoint = await oidcEndpoint(config, "authorization_endpoint");
+    const authorizationEndpoint = await oidcEndpoint(
+      config,
+      "authorization_endpoint",
+    );
     if (!authorizationEndpoint || !clientId) return "";
     return `${authorizationEndpoint}?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scope}&state=${encodeURIComponent(state)}`;
   }
   return "";
 }
 
-async function exchangeAuthorizationCode(providerType: string, config: Record<string, unknown>, code: string, redirectUri: string) {
+async function exchangeAuthorizationCode(
+  providerType: string,
+  config: Record<string, unknown>,
+  code: string,
+  redirectUri: string,
+) {
   const tokenEndpoint = await oauthTokenEndpoint(providerType, config);
   const clientId = String(config.ClientId ?? config.clientId ?? "");
   const clientSecret = String(config.ClientSecret ?? config.clientSecret ?? "");
-  if (!tokenEndpoint || !clientId) throw new Error(`SSO token exchange is not configured for ${providerType}`);
+  if (!tokenEndpoint || !clientId)
+    throw new Error(`SSO token exchange is not configured for ${providerType}`);
 
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code,
     redirect_uri: redirectUri,
-    client_id: clientId
+    client_id: clientId,
   });
 
   if (clientSecret) {
@@ -7279,57 +9983,93 @@ async function exchangeAuthorizationCode(providerType: string, config: Record<st
   } else {
     const assertion = clientAssertion(providerType, config, tokenEndpoint);
     if (assertion) {
-      body.set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer");
+      body.set(
+        "client_assertion_type",
+        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      );
       body.set("client_assertion", assertion);
     }
   }
 
   const response = await fetch(tokenEndpoint, {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-    body
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      accept: "application/json",
+    },
+    body,
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(String(payload.error_description ?? payload.error ?? "SSO token exchange failed"));
-  return payload as { access_token?: string; id_token?: string; token_type?: string };
+  if (!response.ok)
+    throw new Error(
+      String(
+        payload.error_description ??
+          payload.error ??
+          "SSO token exchange failed",
+      ),
+    );
+  return payload as {
+    access_token?: string;
+    id_token?: string;
+    token_type?: string;
+  };
 }
 
-async function fetchSsoProfile(providerType: string, config: Record<string, unknown>, tokenSet: { access_token?: string; id_token?: string }) {
+async function fetchSsoProfile(
+  providerType: string,
+  config: Record<string, unknown>,
+  tokenSet: { access_token?: string; id_token?: string },
+) {
   if (providerType === "github") return fetchGithubProfile(tokenSet);
   const userinfoEndpoint = await oauthUserinfoEndpoint(providerType, config);
   let raw: Record<string, unknown> = {};
   if (userinfoEndpoint && tokenSet.access_token) {
-    const response = await fetch(userinfoEndpoint, { headers: { authorization: `Bearer ${tokenSet.access_token}`, accept: "application/json" } });
-    if (response.ok) raw = await response.json() as Record<string, unknown>;
+    const response = await fetch(userinfoEndpoint, {
+      headers: {
+        authorization: `Bearer ${tokenSet.access_token}`,
+        accept: "application/json",
+      },
+    });
+    if (response.ok) raw = (await response.json()) as Record<string, unknown>;
   }
-  if (!Object.keys(raw).length && tokenSet.id_token) raw = decodeJwtPayload(tokenSet.id_token);
+  if (!Object.keys(raw).length && tokenSet.id_token)
+    raw = decodeJwtPayload(tokenSet.id_token);
   return {
     subject: String(raw.sub ?? raw.oid ?? raw.id ?? ""),
-    email: String(raw.email ?? raw.preferred_username ?? raw.upn ?? "").toLowerCase(),
+    email: String(
+      raw.email ?? raw.preferred_username ?? raw.upn ?? "",
+    ).toLowerCase(),
     name: normalizedProfileName(raw),
     givenName: nullableString(raw.given_name),
     familyName: nullableString(raw.family_name),
-    raw
+    raw,
   };
 }
 
 async function fetchGithubProfile(tokenSet: { access_token?: string }) {
-  if (!tokenSet.access_token) throw new Error("GitHub token exchange did not return an access token");
+  if (!tokenSet.access_token)
+    throw new Error("GitHub token exchange did not return an access token");
   const headers = {
     authorization: `Bearer ${tokenSet.access_token}`,
     accept: "application/vnd.github+json",
-    "user-agent": "OpenLeash"
+    "user-agent": "OpenLeash",
   };
   const [userResponse, emailResponse] = await Promise.all([
     fetch("https://api.github.com/user", { headers }),
-    fetch("https://api.github.com/user/emails", { headers })
+    fetch("https://api.github.com/user/emails", { headers }),
   ]);
   if (!userResponse.ok) throw new Error("Could not fetch GitHub profile");
-  const raw = await userResponse.json() as Record<string, unknown>;
-  const emails = emailResponse.ok ? await emailResponse.json().catch(() => []) as Array<Record<string, unknown>> : [];
-  const primaryEmail = emails.find((item) => item.primary === true && item.verified !== false)?.email
-    ?? emails.find((item) => item.verified !== false)?.email
-    ?? raw.email;
+  const raw = (await userResponse.json()) as Record<string, unknown>;
+  const emails = emailResponse.ok
+    ? ((await emailResponse.json().catch(() => [])) as Array<
+        Record<string, unknown>
+      >)
+    : [];
+  const primaryEmail =
+    emails.find((item) => item.primary === true && item.verified !== false)
+      ?.email ??
+    emails.find((item) => item.verified !== false)?.email ??
+    raw.email;
   const fullName = normalizedProfileName(raw) || String(raw.login ?? "");
   const split = splitProfileName(fullName);
   return {
@@ -7338,75 +10078,113 @@ async function fetchGithubProfile(tokenSet: { access_token?: string }) {
     name: fullName,
     givenName: split.givenName,
     familyName: split.familyName,
-    raw: { ...raw, emails }
+    raw: { ...raw, emails },
   };
 }
 
 function normalizedProfileName(raw: Record<string, unknown>) {
-  return String(raw.name ?? [raw.given_name, raw.family_name].filter(Boolean).join(" ") ?? "").trim();
+  return String(
+    raw.name ??
+      [raw.given_name, raw.family_name].filter(Boolean).join(" ") ??
+      "",
+  ).trim();
 }
 
 function splitProfileName(name: string) {
-  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  const parts = String(name || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
   if (parts.length === 0) return { givenName: null, familyName: null };
   if (parts.length === 1) return { givenName: parts[0], familyName: null };
   return { givenName: parts[0], familyName: parts.slice(1).join(" ") };
 }
 
-async function oauthTokenEndpoint(providerType: string, config: Record<string, unknown>) {
+async function oauthTokenEndpoint(
+  providerType: string,
+  config: Record<string, unknown>,
+) {
   if (providerType === "okta") {
-    const domain = String(config.Domain ?? config.domain ?? "").replace(/\/+$/, "");
+    const domain = String(config.Domain ?? config.domain ?? "").replace(
+      /\/+$/,
+      "",
+    );
     return domain ? `${domain}/oauth2/v1/token` : "";
   }
   if (providerType === "azure_ad") {
     const tenantId = String(config.TenantId ?? config.tenantId ?? "common");
     return `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
   }
-  if (providerType === "google_workspace") return "https://oauth2.googleapis.com/token";
-  if (providerType === "github") return "https://github.com/login/oauth/access_token";
+  if (providerType === "google_workspace")
+    return "https://oauth2.googleapis.com/token";
+  if (providerType === "github")
+    return "https://github.com/login/oauth/access_token";
   if (providerType === "oidc") return oidcEndpoint(config, "token_endpoint");
   return "";
 }
 
-async function oauthUserinfoEndpoint(providerType: string, config: Record<string, unknown>) {
+async function oauthUserinfoEndpoint(
+  providerType: string,
+  config: Record<string, unknown>,
+) {
   if (providerType === "okta") {
-    const domain = String(config.Domain ?? config.domain ?? "").replace(/\/+$/, "");
+    const domain = String(config.Domain ?? config.domain ?? "").replace(
+      /\/+$/,
+      "",
+    );
     return domain ? `${domain}/oauth2/v1/userinfo` : "";
   }
-  if (providerType === "azure_ad") return "https://graph.microsoft.com/oidc/userinfo";
-  if (providerType === "google_workspace") return "https://openidconnect.googleapis.com/v1/userinfo";
+  if (providerType === "azure_ad")
+    return "https://graph.microsoft.com/oidc/userinfo";
+  if (providerType === "google_workspace")
+    return "https://openidconnect.googleapis.com/v1/userinfo";
   if (providerType === "oidc") return oidcEndpoint(config, "userinfo_endpoint");
   return "";
 }
 
-async function oidcEndpoint(config: Record<string, unknown>, key: "authorization_endpoint" | "token_endpoint" | "userinfo_endpoint") {
+async function oidcEndpoint(
+  config: Record<string, unknown>,
+  key: "authorization_endpoint" | "token_endpoint" | "userinfo_endpoint",
+) {
   const explicit = String(
     config[key] ??
-    config[camelCaseOidcKey(key)] ??
-    config[pascalCaseOidcKey(key)] ??
-    ""
+      config[camelCaseOidcKey(key)] ??
+      config[pascalCaseOidcKey(key)] ??
+      "",
   ).trim();
   if (explicit) return explicit;
   const discovery = await oidcDiscovery(config);
   return typeof discovery[key] === "string" ? discovery[key] : "";
 }
 
-const oidcDiscoveryCache = new Map<string, { expiresAt: number; data: Record<string, unknown> }>();
+const oidcDiscoveryCache = new Map<
+  string,
+  { expiresAt: number; data: Record<string, unknown> }
+>();
 
 async function oidcDiscovery(config: Record<string, unknown>) {
-  const issuer = String(config.IssuerUrl ?? config.issuerUrl ?? config.issuer ?? "").replace(/\/+$/, "");
+  const issuer = String(
+    config.IssuerUrl ?? config.issuerUrl ?? config.issuer ?? "",
+  ).replace(/\/+$/, "");
   if (!issuer) return {};
   const cached = oidcDiscoveryCache.get(issuer);
   if (cached && cached.expiresAt > Date.now()) return cached.data;
-  const response = await fetch(`${issuer}/.well-known/openid-configuration`, { headers: { accept: "application/json" } });
-  if (!response.ok) throw new Error("OIDC discovery failed. Check the issuer URL and network access from the API.");
-  const data = await response.json() as Record<string, unknown>;
+  const response = await fetch(`${issuer}/.well-known/openid-configuration`, {
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok)
+    throw new Error(
+      "OIDC discovery failed. Check the issuer URL and network access from the API.",
+    );
+  const data = (await response.json()) as Record<string, unknown>;
   oidcDiscoveryCache.set(issuer, { expiresAt: Date.now() + 10 * 60_000, data });
   return data;
 }
 
 function camelCaseOidcKey(value: string) {
-  return value.replace(/_([a-z])/g, (_match, char: string) => char.toUpperCase());
+  return value.replace(/_([a-z])/g, (_match, char: string) =>
+    char.toUpperCase(),
+  );
 }
 
 function pascalCaseOidcKey(value: string) {
@@ -7414,23 +10192,35 @@ function pascalCaseOidcKey(value: string) {
   return `${camel[0]?.toUpperCase() ?? ""}${camel.slice(1)}`;
 }
 
-function clientAssertion(providerType: string, config: Record<string, unknown>, audience: string) {
+function clientAssertion(
+  providerType: string,
+  config: Record<string, unknown>,
+  audience: string,
+) {
   if (providerType !== "okta" && providerType !== "azure_ad") return "";
-  const privateKey = String(config.PrivateKey ?? config.privateKey ?? "").trim();
+  const privateKey = String(
+    config.PrivateKey ?? config.privateKey ?? "",
+  ).trim();
   const clientId = String(config.ClientId ?? config.clientId ?? "").trim();
   if (!privateKey || !clientId) return "";
   const now = Math.floor(Date.now() / 1000);
-  const header = { alg: "RS256", typ: "JWT", kid: String(config.KeyId ?? config.kid ?? "") || undefined };
+  const header = {
+    alg: "RS256",
+    typ: "JWT",
+    kid: String(config.KeyId ?? config.kid ?? "") || undefined,
+  };
   const payload = {
     iss: clientId,
     sub: clientId,
     aud: audience,
     jti: crypto.randomBytes(16).toString("hex"),
     iat: now,
-    exp: now + 300
+    exp: now + 300,
   };
   const input = `${base64urlJson(header)}.${base64urlJson(payload)}`;
-  const signature = crypto.sign("RSA-SHA256", Buffer.from(input), privateKey).toString("base64url");
+  const signature = crypto
+    .sign("RSA-SHA256", Buffer.from(input), privateKey)
+    .toString("base64url");
   return `${input}.${signature}`;
 }
 
@@ -7460,27 +10250,43 @@ async function getDashboardSession(authHeader: string) {
      returning u.id as user_id, u.email, u.display_name, u.role, u.metadata as user_metadata,
                o.id as organization_id, o.name as organization_name, o.slug as organization_slug, o.region,
                o.infrastructure_config`,
-    [hashToken(token)]
+    [hashToken(token)],
   );
   const row = result.rows[0];
   if (!row) return null;
   const userMetadata = row.user_metadata ?? {};
   const organizationConfig = row.infrastructure_config ?? {};
-  const accountAudience = userMetadata.accountAudience === "individual" ? "individual" : "organization";
-  const packageId = normalizeAccountPackage(userMetadata.accountPackage ?? organizationConfig.accountPackage);
+  const accountAudience =
+    userMetadata.accountAudience === "individual"
+      ? "individual"
+      : "organization";
+  const packageId = normalizeAccountPackage(
+    userMetadata.accountPackage ?? organizationConfig.accountPackage,
+  );
   return {
-    user: { id: row.user_id, email: row.email, display_name: row.display_name, role: row.role },
-    organization: { id: row.organization_id, name: row.organization_name, slug: row.organization_slug, region: row.region },
+    user: {
+      id: row.user_id,
+      email: row.email,
+      display_name: row.display_name,
+      role: row.role,
+    },
+    organization: {
+      id: row.organization_id,
+      name: row.organization_name,
+      slug: row.organization_slug,
+      region: row.region,
+    },
     account: {
       audience: accountAudience,
-      packageId
-    }
+      packageId,
+    },
   };
 }
 
 async function getClientOrDashboardSession(authHeader: string) {
   const dashboardSession = await getDashboardSession(authHeader);
-  if (dashboardSession) return { ...dashboardSession, source: "dashboard" as const };
+  if (dashboardSession)
+    return { ...dashboardSession, source: "dashboard" as const };
 
   const token = bearerToken(authHeader);
   const user = token ? await getUserByToken(token) : undefined;
@@ -7496,7 +10302,7 @@ async function getClientOrDashboardSession(authHeader: string) {
      from organizations
      where id = $1
      limit 1`,
-    [user.organization_id]
+    [user.organization_id],
   );
   const row = organization.rows[0];
   if (!row) return null;
@@ -7506,14 +10312,14 @@ async function getClientOrDashboardSession(authHeader: string) {
       id: user.id,
       email: user.email,
       display_name: user.display_name,
-      role: "client"
+      role: "client",
     },
     organization: {
       id: row.id,
       name: row.name,
       slug: row.slug,
-      region: row.region
-    }
+      region: row.region,
+    },
   };
 }
 
@@ -7522,7 +10328,9 @@ function bearerToken(authHeader: string) {
 }
 
 function isDashboardAccessRole(role: unknown) {
-  return ["owner", "admin", "ciso", "security_admin"].includes(String(role ?? "").toLowerCase());
+  return ["owner", "admin", "ciso", "security_admin"].includes(
+    String(role ?? "").toLowerCase(),
+  );
 }
 
 function isAllowedCorsOrigin(origin: string | undefined) {
@@ -7540,10 +10348,14 @@ function isAllowedCorsOrigin(origin: string | undefined) {
 
 function configuredCorsOrigins() {
   return new Set(
-    (process.env.OPENLEASH_ALLOWED_ORIGINS ?? process.env.OPENLEASH_DASHBOARD_ORIGINS ?? "")
+    (
+      process.env.OPENLEASH_ALLOWED_ORIGINS ??
+      process.env.OPENLEASH_DASHBOARD_ORIGINS ??
+      ""
+    )
       .split(",")
       .map((origin) => origin.trim())
-      .filter(Boolean)
+      .filter(Boolean),
   );
 }
 
@@ -7565,88 +10377,159 @@ function allowsLocalDashboardWriteBypass(req: express.Request) {
   if (process.env.OPENLEASH_INSECURE_ADMIN_WRITE === "1") return true;
   if (process.env.NODE_ENV === "production") return false;
   const remote = req.socket.remoteAddress ?? "";
-  const forwarded = String(req.header("x-forwarded-for") ?? "").split(",")[0]?.trim();
+  const forwarded = String(req.header("x-forwarded-for") ?? "")
+    .split(",")[0]
+    ?.trim();
   return isLocalAddress(remote) && (!forwarded || isLocalAddress(forwarded));
 }
 
 function isLocalAddress(value: string) {
   const address = value.replace(/^::ffff:/, "");
-  return address === "127.0.0.1" || address === "::1" || address === "localhost";
+  return (
+    address === "127.0.0.1" || address === "::1" || address === "localhost"
+  );
 }
 
 function isLocalHostname(hostname: string) {
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  return (
+    hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1"
+  );
 }
 
-function normalizeSkillReasons(value: unknown): Array<{ reason: string; quote?: string }> {
+function normalizeSkillReasons(
+  value: unknown,
+): Array<{ reason: string; quote?: string }> {
   if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
-    const record = item as Record<string, unknown>;
-    const reason = typeof record.reason === "string" ? truncate(record.reason, 240) : "";
-    const quote = typeof record.quote === "string" ? truncate(record.quote, 320) : undefined;
-    return reason ? [{ reason, ...(quote ? { quote } : {}) }] : [];
-  }).slice(0, 12);
+  return value
+    .flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const record = item as Record<string, unknown>;
+      const reason =
+        typeof record.reason === "string" ? truncate(record.reason, 240) : "";
+      const quote =
+        typeof record.quote === "string"
+          ? truncate(record.quote, 320)
+          : undefined;
+      return reason ? [{ reason, ...(quote ? { quote } : {}) }] : [];
+    })
+    .slice(0, 12);
 }
 
 type SkillObservationEventType = "detected" | "changed" | "seen" | "removed";
 
-function normalizeSkillObservationEventType(value: unknown): SkillObservationEventType | undefined {
-  return value === "detected" || value === "changed" || value === "seen" || value === "removed" ? value : undefined;
+function normalizeSkillObservationEventType(
+  value: unknown,
+): SkillObservationEventType | undefined {
+  return value === "detected" ||
+    value === "changed" ||
+    value === "seen" ||
+    value === "removed"
+    ? value
+    : undefined;
 }
 
 function inferSkillObservationEventType(
   requested: SkillObservationEventType | undefined,
   existing: { status?: string; content_hash?: string } | undefined,
-  contentHash: string
+  contentHash: string,
 ): SkillObservationEventType {
   if (requested === "removed") return "removed";
   if (!existing || existing.status === "deleted") return "detected";
-  if (existing.content_hash && existing.content_hash !== contentHash) return "changed";
+  if (existing.content_hash && existing.content_hash !== contentHash)
+    return "changed";
   return "seen";
 }
 
-function pipelineEventForSkillObservation(eventType: SkillObservationEventType): Extract<PipelineEvent, "skill.detected" | "skill.changed" | "skill.removed"> {
+function pipelineEventForSkillObservation(
+  eventType: SkillObservationEventType,
+): Extract<
+  PipelineEvent,
+  "skill.detected" | "skill.changed" | "skill.removed"
+> {
   if (eventType === "detected") return "skill.detected";
   if (eventType === "removed") return "skill.removed";
   return "skill.changed";
 }
 
-function normalizeSkillStatus(provided: unknown, existing?: string): "observed" | "approved" | "suspicious" {
-  if (provided === "suspicious" || provided === "approved" || provided === "observed") return provided;
-  if (existing === "suspicious" || existing === "approved" || existing === "observed") return existing;
+function normalizeSkillStatus(
+  provided: unknown,
+  existing?: string,
+): "observed" | "approved" | "suspicious" {
+  if (
+    provided === "suspicious" ||
+    provided === "approved" ||
+    provided === "observed"
+  )
+    return provided;
+  if (
+    existing === "suspicious" ||
+    existing === "approved" ||
+    existing === "observed"
+  )
+    return existing;
   return "observed";
 }
 
-function normalizeExistingSkillReasons(existing: unknown, fallback: Array<{ reason: string; quote?: string }>) {
+function normalizeExistingSkillReasons(
+  existing: unknown,
+  fallback: Array<{ reason: string; quote?: string }>,
+) {
   const normalized = normalizeSkillReasons(existing);
   return normalized.length ? normalized : fallback;
 }
 
-async function skillPurposeSummary({ provided, content, skillName }: { provided?: string; content: string; skillName: string; skillPath: string }) {
+async function skillPurposeSummary({
+  provided,
+  content,
+  skillName,
+}: {
+  provided?: string;
+  content: string;
+  skillName: string;
+  skillPath: string;
+}) {
   const normalized = normalizeSkillPurpose(provided ?? "", skillName);
   if (normalized) return normalized;
   return heuristicSkillPurpose(content, skillName);
 }
 
 function heuristicSkillPurpose(content: string, skillName: string) {
-  const heading = content.match(/^#\s+(.+)$/m)?.[1] ?? content.match(/^description:\s*["']?(.+?)["']?\s*$/mi)?.[1];
-  return normalizeSkillPurpose(heading ?? skillName.replace(/[-_]+/g, " "), skillName) ?? titleCaseWords(skillName.replace(/[-_]+/g, " "));
+  const heading =
+    content.match(/^#\s+(.+)$/m)?.[1] ??
+    content.match(/^description:\s*["']?(.+?)["']?\s*$/im)?.[1];
+  return (
+    normalizeSkillPurpose(
+      heading ?? skillName.replace(/[-_]+/g, " "),
+      skillName,
+    ) ?? titleCaseWords(skillName.replace(/[-_]+/g, " "))
+  );
 }
 
 function normalizeSkillPurpose(value: string, fallback: string) {
-  const cleaned = value.replace(/["'`]/g, "").replace(/[.!?]+$/g, "").replace(/\s+/g, " ").trim();
+  const cleaned = value
+    .replace(/["'`]/g, "")
+    .replace(/[.!?]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
   const words = cleaned.split(/\s+/).filter(Boolean).slice(0, 8);
   if (words.length >= 4) return titleCaseWords(words.join(" "));
-  const fallbackWords = fallback.replace(/[-_]+/g, " ").split(/\s+/).filter(Boolean).slice(0, 8);
-  return fallbackWords.length ? titleCaseWords(fallbackWords.join(" ")) : undefined;
+  const fallbackWords = fallback
+    .replace(/[-_]+/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 8);
+  return fallbackWords.length
+    ? titleCaseWords(fallbackWords.join(" "))
+    : undefined;
 }
 
 function titleCaseWords(value: string) {
   return value
     .split(/\s+/)
     .filter(Boolean)
-    .map((word) => word.length <= 3 ? word : word.charAt(0).toUpperCase() + word.slice(1))
+    .map((word) =>
+      word.length <= 3 ? word : word.charAt(0).toUpperCase() + word.slice(1),
+    )
     .join(" ");
 }
 
@@ -7654,7 +10537,9 @@ function decodeJwtPayload(jwt: string) {
   try {
     const [, payload] = jwt.split(".");
     if (!payload) return {};
-    return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+    return JSON.parse(
+      Buffer.from(payload, "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
   } catch {
     return {};
   }
@@ -7670,48 +10555,102 @@ function nullableString(value: unknown) {
 }
 
 function normalizeIdpProvider(provider: unknown) {
-  const value = String(provider ?? "").toLowerCase().replace(/[\s_-]+/g, "");
+  const value = String(provider ?? "")
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
   const providers = [
-    { keys: ["azure", "azuread", "entra", "entraid", "microsoftentra"], idpType: "AzureAD", label: "Microsoft Entra ID" },
-    { keys: ["oidc", "openid", "openidconnect", "genericopenid", "genericoidc"], idpType: "OIDC", label: "Generic OIDC" },
+    {
+      keys: ["azure", "azuread", "entra", "entraid", "microsoftentra"],
+      idpType: "AzureAD",
+      label: "Microsoft Entra ID",
+    },
+    {
+      keys: ["oidc", "openid", "openidconnect", "genericopenid", "genericoidc"],
+      idpType: "OIDC",
+      label: "Generic OIDC",
+    },
     { keys: ["okta"], idpType: "Okta", label: "Okta" },
     { keys: ["ping", "pingone"], idpType: "Ping", label: "Ping Identity" },
-    { keys: ["google", "googleworkspace", "workspace"], idpType: "Google", label: "Google Workspace" },
-    { keys: ["activedirectory", "ad", "ldap"], idpType: "ActiveDirectory", label: "Active Directory / LDAP" }
+    {
+      keys: ["google", "googleworkspace", "workspace"],
+      idpType: "Google",
+      label: "Google Workspace",
+    },
+    {
+      keys: ["activedirectory", "ad", "ldap"],
+      idpType: "ActiveDirectory",
+      label: "Active Directory / LDAP",
+    },
   ];
   return providers.find((item) => item.keys.includes(value));
 }
 
-function providerCredentials(provider: ReturnType<typeof normalizeIdpProvider>, body: Record<string, unknown>) {
+function providerCredentials(
+  provider: ReturnType<typeof normalizeIdpProvider>,
+  body: Record<string, unknown>,
+) {
   if (!provider) return {};
   const value = (key: string) => String(body[key] ?? "").trim();
   switch (provider.idpType) {
     case "AzureAD":
-      return { TenantId: value("tenantId") || value("TenantId"), ClientId: value("clientId") || value("ClientId"), ClientSecret: value("clientSecret") || value("ClientSecret") };
+      return {
+        TenantId: value("tenantId") || value("TenantId"),
+        ClientId: value("clientId") || value("ClientId"),
+        ClientSecret: value("clientSecret") || value("ClientSecret"),
+      };
     case "OIDC":
       return {
         IssuerUrl: value("issuerUrl") || value("issuer") || value("IssuerUrl"),
         ClientId: value("clientId") || value("ClientId"),
         ClientSecret: value("clientSecret") || value("ClientSecret"),
-        AuthorizationEndpoint: value("authorizationEndpoint") || value("AuthorizationEndpoint"),
+        AuthorizationEndpoint:
+          value("authorizationEndpoint") || value("AuthorizationEndpoint"),
         TokenEndpoint: value("tokenEndpoint") || value("TokenEndpoint"),
-        UserinfoEndpoint: value("userinfoEndpoint") || value("UserinfoEndpoint")
+        UserinfoEndpoint:
+          value("userinfoEndpoint") || value("UserinfoEndpoint"),
       };
     case "Okta":
-      return { Domain: value("domain") || value("Domain"), ClientId: value("clientId") || value("oktaClientId") || value("ClientId"), PrivateKey: value("privateKey") || value("oktaPrivateKey") || value("PrivateKey") || value("apiToken") || value("ApiToken") };
+      return {
+        Domain: value("domain") || value("Domain"),
+        ClientId:
+          value("clientId") || value("oktaClientId") || value("ClientId"),
+        PrivateKey:
+          value("privateKey") ||
+          value("oktaPrivateKey") ||
+          value("PrivateKey") ||
+          value("apiToken") ||
+          value("ApiToken"),
+      };
     case "Ping":
-      return { ApiUrl: value("apiUrl") || value("ApiUrl"), AccessToken: value("accessToken") || value("AccessToken"), EnvironmentId: value("environmentId") || value("EnvironmentId") };
+      return {
+        ApiUrl: value("apiUrl") || value("ApiUrl"),
+        AccessToken: value("accessToken") || value("AccessToken"),
+        EnvironmentId: value("environmentId") || value("EnvironmentId"),
+      };
     case "Google":
-      return { ServiceAccountJson: value("serviceAccountJson") || value("ServiceAccountJson"), AdminEmail: value("adminEmail") || value("AdminEmail") };
+      return {
+        ServiceAccountJson:
+          value("serviceAccountJson") || value("ServiceAccountJson"),
+        AdminEmail: value("adminEmail") || value("AdminEmail"),
+      };
     case "ActiveDirectory":
-      return { LdapHost: value("ldapHost") || value("LdapHost"), LdapPort: value("ldapPort") || value("LdapPort"), BindDn: value("bindDn") || value("BindDn"), BindPassword: value("bindPassword") || value("BindPassword"), BaseDn: value("baseDn") || value("BaseDn"), UseSsl: value("useSsl") || value("UseSsl") };
+      return {
+        LdapHost: value("ldapHost") || value("LdapHost"),
+        LdapPort: value("ldapPort") || value("LdapPort"),
+        BindDn: value("bindDn") || value("BindDn"),
+        BindPassword: value("bindPassword") || value("BindPassword"),
+        BaseDn: value("baseDn") || value("BaseDn"),
+        UseSsl: value("useSsl") || value("UseSsl"),
+      };
     default:
       return {};
   }
 }
 
 function hasAnyCredential(credentials: Record<string, unknown>) {
-  return Object.values(credentials).some((value) => String(value ?? "").trim().length > 0);
+  return Object.values(credentials).some(
+    (value) => String(value ?? "").trim().length > 0,
+  );
 }
 
 function enrollmentCommand(tenantUrl: string, token: string) {
@@ -7721,12 +10660,14 @@ function enrollmentCommand(tenantUrl: string, token: string) {
 function tokenFromRequest(req: express.Request) {
   const auth = req.header("authorization") ?? "";
   const bearer = auth.replace(/^Bearer\s+/i, "").trim();
-  const queryToken = firstQuery(req.query.user_token) ?? firstQuery(req.query.token);
+  const queryToken =
+    firstQuery(req.query.user_token) ?? firstQuery(req.query.token);
   return bearer || queryToken || "";
 }
 
 function firstQuery(value: unknown) {
-  if (Array.isArray(value)) return typeof value[0] === "string" ? value[0] : undefined;
+  if (Array.isArray(value))
+    return typeof value[0] === "string" ? value[0] : undefined;
   return typeof value === "string" ? value : undefined;
 }
 
@@ -7734,38 +10675,83 @@ function normalizeHookRequest(
   agent: HookAgentSlug,
   eventName: HookEventName,
   raw: any,
-  query: express.Request["query"]
+  query: express.Request["query"],
 ): EvaluationRequest {
   const metadata = LOCAL_HOOK_AGENT_METADATA[agent];
   const agentKind = metadata.kind as AgentKind;
-  const sessionId = firstString(raw?.session_id, raw?.sessionId, raw?.conversation_id, raw?.conversationId, raw?.thread_id, raw?.threadId, raw?.chat_id, raw?.chatId, raw?.run_id, raw?.runId) ?? stableHookSessionId(agent, raw);
-  const toolName = firstString(raw?.tool_name, raw?.toolName, raw?.tool?.name, raw?.function?.name, raw?.command?.name);
-  const toolInput = firstDefined(raw?.tool_input, raw?.toolInput, raw?.tool?.input, raw?.input, raw?.arguments, raw?.args, raw?.params, raw?.command?.args);
+  const sessionId =
+    firstString(
+      raw?.session_id,
+      raw?.sessionId,
+      raw?.conversation_id,
+      raw?.conversationId,
+      raw?.thread_id,
+      raw?.threadId,
+      raw?.chat_id,
+      raw?.chatId,
+      raw?.run_id,
+      raw?.runId,
+    ) ?? stableHookSessionId(agent, raw);
+  const toolName = firstString(
+    raw?.tool_name,
+    raw?.toolName,
+    raw?.tool?.name,
+    raw?.function?.name,
+    raw?.command?.name,
+  );
+  const toolInput = firstDefined(
+    raw?.tool_input,
+    raw?.toolInput,
+    raw?.tool?.input,
+    raw?.input,
+    raw?.arguments,
+    raw?.args,
+    raw?.params,
+    raw?.command?.args,
+  );
   const prompt = normalizeHookPrompt(raw);
   return {
     computer: {
       hostname: firstQuery(query.hostname) ?? os.hostname(),
       platform: firstQuery(query.platform) ?? "unknown",
-      osRelease: firstQuery(query.os_release)
+      osRelease: firstQuery(query.os_release),
     },
     agent: {
       kind: agentKind,
       displayName: metadata.displayName,
       version: firstQuery(query.agent_version) ?? raw?.version,
-      executablePath: raw?.executable_path
+      executablePath: raw?.executable_path,
     },
     event: {
       eventName,
       agentKind,
       agentVersion: firstQuery(query.agent_version) ?? raw?.version,
       sessionId,
-      projectPath: firstString(raw?.cwd, raw?.workspace, raw?.workspaceDir, raw?.workspace_dir, raw?.project_dir, raw?.projectPath, raw?.project_path, raw?.root, raw?.repo, raw?.repository, raw?.context?.workspaceDir),
+      projectPath: firstString(
+        raw?.cwd,
+        raw?.workspace,
+        raw?.workspaceDir,
+        raw?.workspace_dir,
+        raw?.project_dir,
+        raw?.projectPath,
+        raw?.project_path,
+        raw?.root,
+        raw?.repo,
+        raw?.repository,
+        raw?.context?.workspaceDir,
+      ),
       prompt,
-      tool: toolName ? { name: toolName, input: toolInput, output: raw?.tool_response ?? raw?.output } : undefined,
+      tool: toolName
+        ? {
+            name: toolName,
+            input: toolInput,
+            output: raw?.tool_response ?? raw?.output,
+          }
+        : undefined,
       transcript: normalizeHookTranscript(raw?.transcript),
       raw,
-      occurredAt: new Date().toISOString()
-    }
+      occurredAt: new Date().toISOString(),
+    },
   };
 }
 
@@ -7788,37 +10774,55 @@ function normalizeHookPrompt(raw: any) {
     raw?.text,
     raw?.context?.content,
     raw?.context?.bodyForAgent,
-    raw?.context?.sessionEntry?.content
+    raw?.context?.sessionEntry?.content,
   );
   if (direct) return direct;
   if (Array.isArray(raw?.messages)) {
-    const message = raw.messages.slice().reverse().find((item: any) => typeof item?.content === "string" && item.content.trim());
+    const message = raw.messages
+      .slice()
+      .reverse()
+      .find(
+        (item: any) => typeof item?.content === "string" && item.content.trim(),
+      );
     if (message) return message.content;
   }
   return undefined;
 }
 
 function firstString(...values: unknown[]) {
-  return values.find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  return values.find(
+    (value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+  );
 }
 
 function firstDefined(...values: unknown[]) {
   return values.find((value) => value !== undefined && value !== null);
 }
 
-function normalizeHookTranscript(value: unknown): ConversationTurn[] | undefined {
+function normalizeHookTranscript(
+  value: unknown,
+): ConversationTurn[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const turns = value
     .map((turn) => {
       if (!turn || typeof turn !== "object") return undefined;
-      const record = turn as { role?: unknown; content?: unknown; at?: unknown };
-      const role = typeof record.role === "string" && isConversationRole(record.role) ? record.role : undefined;
-      const content = typeof record.content === "string" ? record.content.trim() : "";
+      const record = turn as {
+        role?: unknown;
+        content?: unknown;
+        at?: unknown;
+      };
+      const role =
+        typeof record.role === "string" && isConversationRole(record.role)
+          ? record.role
+          : undefined;
+      const content =
+        typeof record.content === "string" ? record.content.trim() : "";
       if (!role || !content) return undefined;
       return {
         role,
         content,
-        ...(typeof record.at === "string" ? { at: record.at } : {})
+        ...(typeof record.at === "string" ? { at: record.at } : {}),
       };
     })
     .filter((turn): turn is ConversationTurn => Boolean(turn));
@@ -7826,24 +10830,46 @@ function normalizeHookTranscript(value: unknown): ConversationTurn[] | undefined
 }
 
 function isConversationRole(value: string): value is ConversationTurn["role"] {
-  return value === "user" || value === "assistant" || value === "tool" || value === "system";
+  return (
+    value === "user" ||
+    value === "assistant" ||
+    value === "tool" ||
+    value === "system"
+  );
 }
 
 function isHookEventName(value: string): value is HookEventName {
-  return ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "Notification", "SessionEnd", "Stop"].includes(value);
+  return [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "SubagentStart",
+    "SubagentStop",
+    "Notification",
+    "SessionEnd",
+    "Stop",
+  ].includes(value);
 }
 
-function nativeHookDecision(agent: HookAgentSlug, eventName: HookEventName, decision: EvaluationResponse) {
+function nativeHookDecision(
+  agent: HookAgentSlug,
+  eventName: HookEventName,
+  decision: EvaluationResponse,
+) {
   const reason = humanDecisionReason(decision);
   if (agent === "copilot") {
     if (eventName === "PreToolUse") {
       return {
         permissionDecision: decision.decision,
-        permissionDecisionReason: reason
+        permissionDecisionReason: reason,
       };
     }
     if (eventName === "Stop" || eventName === "SubagentStop") {
-      return { decision: decision.decision === "deny" ? "block" : "allow", reason };
+      return {
+        decision: decision.decision === "deny" ? "block" : "allow",
+        reason,
+      };
     }
     return {};
   }
@@ -7853,22 +10879,34 @@ function nativeHookDecision(agent: HookAgentSlug, eventName: HookEventName, deci
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: decision.decision,
-          permissionDecisionReason: reason
+          permissionDecisionReason: reason,
         },
-        suppressOutput: true
+        suppressOutput: true,
       };
     }
-    return { continue: decision.decision !== "deny", stopReason: reason, suppressOutput: true };
+    return {
+      continue: decision.decision !== "deny",
+      stopReason: reason,
+      suppressOutput: true,
+    };
   }
-  return { decision: decision.decision === "deny" ? "block" : decision.decision, reason };
+  return {
+    decision: decision.decision === "deny" ? "block" : decision.decision,
+    reason,
+  };
 }
 
-function promptTransformHookDecision(agent: HookAgentSlug, eventName: HookEventName, prompt: string, summary: string) {
+function promptTransformHookDecision(
+  agent: HookAgentSlug,
+  eventName: HookEventName,
+  prompt: string,
+  summary: string,
+) {
   const base = nativeHookDecision(agent, eventName, {
     decision: "allow",
     decisionId: "",
     summary,
-    results: []
+    results: [],
   });
   return {
     ...base,
@@ -7881,8 +10919,8 @@ function promptTransformHookDecision(agent: HookAgentSlug, eventName: HookEventN
       hookEventName: eventName,
       prompt,
       transformedPrompt: prompt,
-      replacementPrompt: prompt
-    }
+      replacementPrompt: prompt,
+    },
   };
 }
 
@@ -7891,25 +10929,39 @@ function humanDecisionReason(decision: EvaluationResponse) {
   if (decision.decision === "deny" && decision.resolutionGuidance) {
     return `OpenLeash denied this action. User guidance: ${decision.resolutionGuidance}`;
   }
-  if (decision.decision === "deny") return decision.summary || "OpenLeash denied this action.";
+  if (decision.decision === "deny")
+    return decision.summary || "OpenLeash denied this action.";
   return decision.question ?? decision.summary;
 }
 
 function cleanResolutionGuidance(value?: string) {
-  const cleaned = String(value ?? "").replace(/\s+/g, " ").trim();
+  const cleaned = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
   return cleaned ? cleaned.slice(0, 500) : undefined;
 }
 
 function slug(value: string) {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.+|\.+$/g, "").slice(0, 64) || "user";
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ".")
+      .replace(/^\.+|\.+$/g, "")
+      .slice(0, 64) || "user"
+  );
 }
 
 function apiSurfaceFromEnv(): ApiSurface {
-  const value = String(process.env.OPENLEASH_API_SURFACE ?? "client").toLowerCase();
+  const value = String(
+    process.env.OPENLEASH_API_SURFACE ?? "client",
+  ).toLowerCase();
   return value === "dashboard" || value === "all" ? value : "client";
 }
 
-function surfaceForRequest(method: string, requestPath: string): ApiSurface | undefined {
+function surfaceForRequest(
+  method: string,
+  requestPath: string,
+): ApiSurface | undefined {
   const verb = method.toUpperCase();
   if (requestPath === "/health") return "all";
   if (
@@ -8004,137 +11056,288 @@ function surfaceForRequest(method: string, requestPath: string): ApiSurface | un
   return undefined;
 }
 
-function capabilityForRequest(method: string, requestPath: string): OpenLeashCapability | undefined {
+function capabilityForRequest(
+  method: string,
+  requestPath: string,
+): OpenLeashCapability | undefined {
   const surface = surfaceForRequest(method, requestPath);
   if (surface === "dashboard") return "dashboard";
   if (requestPath === "/v1/enroll") return "deploymentTokens";
-  if (requestPath === "/public/plugins" || /^\/public\/plugins\/[^/]+$/.test(requestPath)) return "publicPluginCatalog";
-  if (requestPath === "/api/updates/check" || requestPath === "/api/updates/latest" || requestPath === "/api/admin/releases") return "desktopUpdates";
+  if (
+    requestPath === "/public/plugins" ||
+    /^\/public\/plugins\/[^/]+$/.test(requestPath)
+  )
+    return "publicPluginCatalog";
+  if (
+    requestPath === "/api/updates/check" ||
+    requestPath === "/api/updates/latest" ||
+    requestPath === "/api/admin/releases"
+  )
+    return "desktopUpdates";
   return undefined;
 }
 
-function apiFunctionForRequest(method: string, requestPath: string): OpenLeashApiFunction | undefined {
+function apiFunctionForRequest(
+  method: string,
+  requestPath: string,
+): OpenLeashApiFunction | undefined {
   const verb = method.toUpperCase();
   if (requestPath === "/health") return "health";
   if (verb === "POST" && requestPath === "/v1/enroll") return "tenantEnroll";
-  if (verb === "POST" && requestPath === "/v1/desktop/enroll") return "desktopEnroll";
-  if (verb === "POST" && requestPath === "/v1/desktop/agents") return "desktopEnroll";
-  if (verb === "POST" && /^\/v1\/agents\/[^/]+\/monitoring$/.test(requestPath)) return "mobileState";
-  if (verb === "GET" && requestPath === "/v1/plugins") return "tenantPluginsRead";
-  if (verb === "GET" && requestPath === "/v1/plugin-marketplace") return "tenantPluginsRead";
-  if (verb === "GET" && requestPath === "/v1/outcomes") return "authAccountOutcomes";
-  if (verb === "GET" && requestPath === "/public/plugins") return "tenantPluginsRead";
-  if (verb === "GET" && /^\/public\/plugins\/[^/]+$/.test(requestPath)) return "tenantPluginsRead";
-  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath)) return "adminPluginsWrite";
-  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/install$/.test(requestPath)) return "adminPluginsWrite";
-  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/update$/.test(requestPath)) return "adminPluginsWrite";
-  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/uninstall$/.test(requestPath)) return "adminPluginsWrite";
-  if (verb === "POST" && requestPath === "/v1/plugin-submissions") return "adminPluginsWrite";
-  if (verb === "POST" && requestPath === "/v1/plugin-releases") return "adminPluginsWrite";
-  if (verb === "POST" && requestPath === "/v1/evaluate") return "tenantEvaluate";
-  if (verb === "POST" && /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath)) return "tenantHookEvaluate";
-  if (verb === "POST" && requestPath === "/v1/skills/observations") return "tenantSkillObservation";
-  if (verb === "GET" && /^\/v1\/decisions\/[^/]+$/.test(requestPath)) return "tenantDecisionPoll";
-  if (verb === "POST" && /^\/admin\/decisions\/[^/]+\/resolve$/.test(requestPath)) return "tenantDecisionResolve";
-  if (verb === "GET" && requestPath === "/admin/tray-status") return "tenantTrayStatus";
-  if (verb === "GET" && requestPath === "/admin/overview") return "adminOverview";
-  if (verb === "GET" && requestPath === "/admin/security") return "adminSecurity";
-  if (verb === "GET" && requestPath === "/admin/outcomes") return "adminOutcomes";
-  if (verb === "GET" && requestPath === "/admin/mcp-servers") return "adminMcpServers";
-  if (verb === "GET" && /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath)) return "adminMcpServerDetail";
+  if (verb === "POST" && requestPath === "/v1/desktop/enroll")
+    return "desktopEnroll";
+  if (verb === "POST" && requestPath === "/v1/desktop/agents")
+    return "desktopEnroll";
+  if (verb === "POST" && /^\/v1\/agents\/[^/]+\/monitoring$/.test(requestPath))
+    return "mobileState";
+  if (verb === "GET" && requestPath === "/v1/plugins")
+    return "tenantPluginsRead";
+  if (verb === "GET" && requestPath === "/v1/plugin-marketplace")
+    return "tenantPluginsRead";
+  if (verb === "GET" && requestPath === "/v1/outcomes")
+    return "authAccountOutcomes";
+  if (verb === "GET" && requestPath === "/public/plugins")
+    return "tenantPluginsRead";
+  if (verb === "GET" && /^\/public\/plugins\/[^/]+$/.test(requestPath))
+    return "tenantPluginsRead";
+  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath))
+    return "adminPluginsWrite";
+  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/install$/.test(requestPath))
+    return "adminPluginsWrite";
+  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/update$/.test(requestPath))
+    return "adminPluginsWrite";
+  if (verb === "POST" && /^\/v1\/plugins\/[^/]+\/uninstall$/.test(requestPath))
+    return "adminPluginsWrite";
+  if (verb === "POST" && requestPath === "/v1/plugin-submissions")
+    return "adminPluginsWrite";
+  if (verb === "POST" && requestPath === "/v1/plugin-releases")
+    return "adminPluginsWrite";
+  if (verb === "POST" && requestPath === "/v1/evaluate")
+    return "tenantEvaluate";
+  if (verb === "POST" && /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(requestPath))
+    return "tenantHookEvaluate";
+  if (verb === "POST" && requestPath === "/v1/skills/observations")
+    return "tenantSkillObservation";
+  if (verb === "GET" && /^\/v1\/decisions\/[^/]+$/.test(requestPath))
+    return "tenantDecisionPoll";
+  if (
+    verb === "POST" &&
+    /^\/admin\/decisions\/[^/]+\/resolve$/.test(requestPath)
+  )
+    return "tenantDecisionResolve";
+  if (verb === "GET" && requestPath === "/admin/tray-status")
+    return "tenantTrayStatus";
+  if (verb === "GET" && requestPath === "/admin/overview")
+    return "adminOverview";
+  if (verb === "GET" && requestPath === "/admin/security")
+    return "adminSecurity";
+  if (verb === "GET" && requestPath === "/admin/outcomes")
+    return "adminOutcomes";
+  if (verb === "GET" && requestPath === "/admin/mcp-servers")
+    return "adminMcpServers";
+  if (verb === "GET" && /^\/admin\/mcp-servers\/[^/]+$/.test(requestPath))
+    return "adminMcpServerDetail";
   if (verb === "GET" && requestPath === "/admin/skills") return "adminSkills";
-  if (verb === "GET" && requestPath === "/admin/plugins") return "adminPluginsRead";
-  if (verb === "GET" && requestPath === "/admin/plugin-marketplace") return "adminPluginsRead";
-  if (verb === "GET" && requestPath === "/admin/plugin-releases") return "adminPluginsRead";
-  if (verb === "POST" && requestPath.startsWith("/admin/plugin-releases/")) return "adminPluginsWrite";
-  if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/settings$/.test(requestPath)) return "adminPluginsWrite";
-  if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/update$/.test(requestPath)) return "adminPluginsWrite";
-  if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/policy$/.test(requestPath)) return "adminPluginsWrite";
-  if (verb === "POST" && requestPath === "/admin/plugin-marketplace/policy") return "adminPluginsWrite";
+  if (verb === "GET" && requestPath === "/admin/plugins")
+    return "adminPluginsRead";
+  if (verb === "GET" && requestPath === "/admin/plugin-marketplace")
+    return "adminPluginsRead";
+  if (verb === "GET" && requestPath === "/admin/plugin-releases")
+    return "adminPluginsRead";
+  if (verb === "POST" && requestPath.startsWith("/admin/plugin-releases/"))
+    return "adminPluginsWrite";
+  if (
+    verb === "POST" &&
+    /^\/admin\/plugins\/[^/]+\/settings$/.test(requestPath)
+  )
+    return "adminPluginsWrite";
+  if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/update$/.test(requestPath))
+    return "adminPluginsWrite";
+  if (verb === "POST" && /^\/admin\/plugins\/[^/]+\/policy$/.test(requestPath))
+    return "adminPluginsWrite";
+  if (verb === "POST" && requestPath === "/admin/plugin-marketplace/policy")
+    return "adminPluginsWrite";
   if (verb === "GET" && requestPath === "/admin/logs") return "adminLogs";
   if (verb === "GET" && requestPath === "/admin/debug") return "adminLogs";
-  if (verb === "GET" && /^\/admin\/logs\/[^/]+$/.test(requestPath)) return "adminLogDetail";
-  if (verb === "GET" && requestPath === "/admin/triggers") return "adminTriggers";
-  if (verb === "GET" && /^\/admin\/triggers\/[^/]+$/.test(requestPath)) return "adminTriggerDetail";
-  if (verb === "GET" && /^\/admin\/events\/[^/]+$/.test(requestPath)) return "adminEventDetail";
-  if (verb === "GET" && requestPath === "/admin/external-agents") return "adminExternalAgents";
-  if (verb === "POST" && requestPath === "/admin/external-agents/sync") return "adminExternalAgentsSync";
-  if (verb === "GET" && (requestPath === "/admin/provider-usage" || requestPath === "/admin/provider-usage/connections")) return "adminProviderUsageRead";
-  if (verb === "POST" && requestPath === "/admin/provider-usage/sync") return "adminProviderUsageSync";
-  if (verb === "POST" && requestPath.startsWith("/admin/provider-usage/")) return "adminProviderUsageWrite";
-  if (verb === "POST" && requestPath === "/admin/evaluation-key") return "adminProviderUsageWrite";
-  if (verb === "GET" && requestPath === "/admin/onboarding") return "adminOnboardingRead";
-  if (verb === "GET" && requestPath === "/admin/identity") return "adminIdentityRead";
-  if (requestPath.startsWith("/admin/onboarding/")) return "adminOnboardingWrite";
-  if (verb === "POST" && requestPath === "/admin/users") return "adminUsersWrite";
-  if (verb === "GET" && requestPath === "/admin/deployment-tokens") return "adminDeploymentTokensRead";
-  if (requestPath.startsWith("/admin/deployment-tokens")) return "adminDeploymentTokensWrite";
-  if (verb === "POST" && requestPath === "/admin/policies") return "adminPoliciesWrite";
-  if (verb === "PUT" && /^\/admin\/policies\/[^/]+$/.test(requestPath)) return "adminPoliciesWrite";
-  if (verb === "GET" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsRead";
-  if (verb === "POST" && requestPath === "/admin/prompt-transforms") return "adminPromptTransformsWrite";
+  if (verb === "GET" && /^\/admin\/logs\/[^/]+$/.test(requestPath))
+    return "adminLogDetail";
+  if (verb === "GET" && requestPath === "/admin/triggers")
+    return "adminTriggers";
+  if (verb === "GET" && /^\/admin\/triggers\/[^/]+$/.test(requestPath))
+    return "adminTriggerDetail";
+  if (verb === "GET" && /^\/admin\/events\/[^/]+$/.test(requestPath))
+    return "adminEventDetail";
+  if (verb === "GET" && requestPath === "/admin/external-agents")
+    return "adminExternalAgents";
+  if (verb === "POST" && requestPath === "/admin/external-agents/sync")
+    return "adminExternalAgentsSync";
+  if (
+    verb === "GET" &&
+    (requestPath === "/admin/provider-usage" ||
+      requestPath === "/admin/provider-usage/connections")
+  )
+    return "adminProviderUsageRead";
+  if (verb === "POST" && requestPath === "/admin/provider-usage/sync")
+    return "adminProviderUsageSync";
+  if (verb === "POST" && requestPath.startsWith("/admin/provider-usage/"))
+    return "adminProviderUsageWrite";
+  if (verb === "POST" && requestPath === "/admin/evaluation-key")
+    return "adminProviderUsageWrite";
+  if (verb === "GET" && requestPath === "/admin/onboarding")
+    return "adminOnboardingRead";
+  if (verb === "GET" && requestPath === "/admin/identity")
+    return "adminIdentityRead";
+  if (requestPath.startsWith("/admin/onboarding/"))
+    return "adminOnboardingWrite";
+  if (verb === "POST" && requestPath === "/admin/users")
+    return "adminUsersWrite";
+  if (verb === "GET" && requestPath === "/admin/deployment-tokens")
+    return "adminDeploymentTokensRead";
+  if (requestPath.startsWith("/admin/deployment-tokens"))
+    return "adminDeploymentTokensWrite";
+  if (verb === "POST" && requestPath === "/admin/policies")
+    return "adminPoliciesWrite";
+  if (verb === "PUT" && /^\/admin\/policies\/[^/]+$/.test(requestPath))
+    return "adminPoliciesWrite";
+  if (verb === "GET" && requestPath === "/admin/prompt-transforms")
+    return "adminPromptTransformsRead";
+  if (verb === "POST" && requestPath === "/admin/prompt-transforms")
+    return "adminPromptTransformsWrite";
   if (verb === "GET" && requestPath === "/auth/session") return "authSession";
-  if (verb === "GET" && requestPath === "/auth/account/outcomes") return "authAccountOutcomes";
+  if (verb === "GET" && requestPath === "/auth/account/outcomes")
+    return "authAccountOutcomes";
   if (verb === "POST" && requestPath === "/auth/logout") return "authLogout";
-  if (verb === "POST" && requestPath === "/auth/sso/authorize") return "authSsoAuthorize";
-  if (verb === "POST" && requestPath === "/auth/sso/callback") return "authSsoCallback";
-  if (verb === "GET" && requestPath === "/v1/auth/google/callback") return "authGoogleCallback";
-  if (verb === "GET" && requestPath === "/v1/auth/microsoft/callback") return "authGoogleCallback";
-  if (verb === "GET" && requestPath === "/v1/auth/github/callback") return "authGoogleCallback";
-  if (verb === "GET" && requestPath === "/auth/microsoft/start") return "authGoogleCallback";
-  if (verb === "GET" && requestPath === "/auth/microsoft/callback") return "authGoogleCallback";
-  if (verb === "GET" && requestPath === "/v1/mobile/bootstrap") return "mobileBootstrap";
-  if (verb === "POST" && requestPath === "/v1/mobile/auth/start") return "mobileAuthStart";
-  if (verb === "POST" && requestPath === "/v1/mobile/auth/exchange") return "mobileAuthExchange";
-  if (verb === "POST" && requestPath === "/v1/mobile/model-key") return "mobileModelKey";
-  if (verb === "POST" && requestPath === "/v1/mobile/devices") return "mobileDeviceRegister";
-  if (verb === "GET" && requestPath === "/v1/mobile/state") return "mobileState";
-  if (verb === "POST" && /^\/v1\/mobile\/decisions\/[^/]+\/resolve$/.test(requestPath)) return "mobileDecisionResolve";
-  if (verb === "GET" && requestPath === "/v1/client/notifications") return "clientNotifications";
-  if (verb === "POST" && /^\/v1\/client\/decisions\/[^/]+\/resolve$/.test(requestPath)) return "clientDecisionResolve";
-  if (verb === "GET" && /^\/organizations\/[^/]+\/sso-providers$/.test(requestPath)) return "organizationSsoProviders";
-  if (verb === "GET" && /^\/organizations\/[^/]+$/.test(requestPath)) return "organizationsRead";
-  if (verb === "POST" && requestPath === "/organizations") return "organizationsWrite";
-  if (verb === "POST" && requestPath === "/api/updates/check") return "clientUpdateCheck";
-  if (verb === "GET" && requestPath === "/api/updates/latest") return "clientUpdateLatest";
-  if (verb === "POST" && requestPath === "/api/admin/releases") return "clientReleasePublish";
+  if (verb === "POST" && requestPath === "/auth/sso/authorize")
+    return "authSsoAuthorize";
+  if (verb === "POST" && requestPath === "/auth/sso/callback")
+    return "authSsoCallback";
+  if (verb === "GET" && requestPath === "/v1/auth/google/callback")
+    return "authGoogleCallback";
+  if (verb === "GET" && requestPath === "/v1/auth/microsoft/callback")
+    return "authGoogleCallback";
+  if (verb === "GET" && requestPath === "/v1/auth/github/callback")
+    return "authGoogleCallback";
+  if (verb === "GET" && requestPath === "/auth/microsoft/start")
+    return "authGoogleCallback";
+  if (verb === "GET" && requestPath === "/auth/microsoft/callback")
+    return "authGoogleCallback";
+  if (verb === "GET" && requestPath === "/v1/mobile/bootstrap")
+    return "mobileBootstrap";
+  if (verb === "POST" && requestPath === "/v1/mobile/auth/start")
+    return "mobileAuthStart";
+  if (verb === "POST" && requestPath === "/v1/mobile/auth/exchange")
+    return "mobileAuthExchange";
+  if (verb === "POST" && requestPath === "/v1/mobile/model-key")
+    return "mobileModelKey";
+  if (verb === "POST" && requestPath === "/v1/mobile/devices")
+    return "mobileDeviceRegister";
+  if (verb === "GET" && requestPath === "/v1/mobile/state")
+    return "mobileState";
+  if (
+    verb === "POST" &&
+    /^\/v1\/mobile\/decisions\/[^/]+\/resolve$/.test(requestPath)
+  )
+    return "mobileDecisionResolve";
+  if (verb === "GET" && requestPath === "/v1/client/notifications")
+    return "clientNotifications";
+  if (
+    verb === "POST" &&
+    /^\/v1\/client\/decisions\/[^/]+\/resolve$/.test(requestPath)
+  )
+    return "clientDecisionResolve";
+  if (
+    verb === "GET" &&
+    /^\/organizations\/[^/]+\/sso-providers$/.test(requestPath)
+  )
+    return "organizationSsoProviders";
+  if (verb === "GET" && /^\/organizations\/[^/]+$/.test(requestPath))
+    return "organizationsRead";
+  if (verb === "POST" && requestPath === "/organizations")
+    return "organizationsWrite";
+  if (verb === "POST" && requestPath === "/api/updates/check")
+    return "clientUpdateCheck";
+  if (verb === "GET" && requestPath === "/api/updates/latest")
+    return "clientUpdateLatest";
+  if (verb === "POST" && requestPath === "/api/admin/releases")
+    return "clientReleasePublish";
   return undefined;
 }
 
-function summarizeBlockedAction(request: EvaluationRequest, policyName: string) {
+function summarizeBlockedAction(
+  request: EvaluationRequest,
+  policyName: string,
+) {
   const agent = request.agent.displayName;
   const tool = request.event.tool?.name;
   const input = request.event.tool?.input;
   const inputText = JSON.stringify(input ?? {}).toLowerCase();
   const policy = policyName.toLowerCase();
-  if (policy.includes("credential") || policy.includes("secret") || /(\.env|credential|secret|token|private key|id_rsa|kubeconfig)/.test(inputText)) {
+  if (
+    policy.includes("credential") ||
+    policy.includes("secret") ||
+    /(\.env|credential|secret|token|private key|id_rsa|kubeconfig)/.test(
+      inputText,
+    )
+  ) {
     return `${agent} is trying to access or create sensitive file content.`;
   }
-  if (policy.includes("destructive") || /(rm\s+-rf|delete|destroy|git reset|chmod|chown)/.test(inputText)) {
+  if (
+    policy.includes("destructive") ||
+    /(rm\s+-rf|delete|destroy|git reset|chmod|chown)/.test(inputText)
+  ) {
     return `${agent} is trying to run a potentially destructive command.`;
   }
-  if (policy.includes("git repo") || /(git init|new git repo|create .*repo)/.test(inputText)) {
+  if (
+    policy.includes("git repo") ||
+    /(git init|new git repo|create .*repo)/.test(inputText)
+  ) {
     return `${agent} is trying to create a new Git repository.`;
   }
-  if (policy.includes("external") || policy.includes("sharing") || /(http|curl|upload|send)/.test(inputText)) {
+  if (
+    policy.includes("external") ||
+    policy.includes("sharing") ||
+    /(http|curl|upload|send)/.test(inputText)
+  ) {
     return `${agent} is trying to share code or data outside this workspace.`;
   }
-  if (tool) return `${agent} is trying to use ${tool} in a way OpenLeash paused.`;
-  if (request.event.eventName === "UserPromptSubmit") return `${agent} is trying to answer a prompt OpenLeash paused.`;
+  if (tool)
+    return `${agent} is trying to use ${tool} in a way OpenLeash paused.`;
+  if (request.event.eventName === "UserPromptSubmit")
+    return `${agent} is trying to answer a prompt OpenLeash paused.`;
   return `${agent} is trying to continue with an action OpenLeash paused.`;
 }
 
 function summarizePolicyTitle(rule: string) {
   const lower = rule.toLowerCase();
-  if (/(credential files|local files|\.env|kubeconfig|npm token|password vault|cloud credentials|api key stores)/.test(lower)) return "Credential files access";
-  if (/(delete files|destructive|irreversible|rewrite history|terraform destroy|git reset|change permissions)/.test(lower)) return "Destructive commands";
-  if (/(personal data|pii|reveal secrets|tokens|private keys|credentials)/.test(lower)) return "Secret and personal data";
+  if (
+    /(credential files|local files|\.env|kubeconfig|npm token|password vault|cloud credentials|api key stores)/.test(
+      lower,
+    )
+  )
+    return "Credential files access";
+  if (
+    /(delete files|destructive|irreversible|rewrite history|terraform destroy|git reset|change permissions)/.test(
+      lower,
+    )
+  )
+    return "Destructive commands";
+  if (
+    /(personal data|pii|reveal secrets|tokens|private keys|credentials)/.test(
+      lower,
+    )
+  )
+    return "Secret and personal data";
   if (/5\s*(\+|plus|add|added to)\s*4/.test(lower)) return "5 plus 4 answers";
-  if (/(new git repo|create .*git repo|git init|repository)/.test(lower)) return "Git repo creation";
-  if (/(source code|external domains|unknown external|exfiltrat)/.test(lower)) return "External code sharing";
+  if (/(new git repo|create .*git repo|git init|repository)/.test(lower))
+    return "Git repo creation";
+  if (/(source code|external domains|unknown external|exfiltrat)/.test(lower))
+    return "External code sharing";
   const cleaned = rule
     .replace(/[^\w\s.+/#-]/g, " ")
-    .replace(/\b(do not|don't|never|disallow|prevent|block|deny|allow|agents?|the|a|an|to|from|that|which|any|before)\b/gi, " ")
+    .replace(
+      /\b(do not|don't|never|disallow|prevent|block|deny|allow|agents?|the|a|an|to|from|that|which|any|before)\b/gi,
+      " ",
+    )
     .replace(/\s+/g, " ")
     .trim();
   const words = (cleaned || "New policy").split(/\s+/).slice(0, 7);
@@ -8146,18 +11349,53 @@ function policyCategory(input: string, name: string, rule: string) {
   const provided = input.trim();
   if (provided) return provided;
   const text = `${name} ${rule}`.toLowerCase();
-  if (/credential|secret|token|private key|api key|\.env|kubeconfig|password|cookie|npmrc/.test(text)) return "Secrets and credentials";
-  if (/personal|pii|customer|employee|passport|ssn|credit card|regulated|external|upload|source code|exfiltrat|unknown url|third-party/.test(text)) return "Data protection";
-  if (/git|branch|commit|push|rebase|repository|repo|history|worktree/.test(text)) return "Source control";
-  if (/database|drop table|drop database|truncate|delete from|update statement|sql/.test(text)) return "Databases";
-  if (/terraform|kubernetes|kubectl|cloud|s3|gcp|aws|azure|namespace|vm|dns|helm|infrastructure/.test(text)) return "Infrastructure";
-  if (/package|dependency|lockfile|npm|pnpm|yarn|pip|gem|cargo|go install|supply-chain/.test(text)) return "Supply chain";
-  if (/rm -rf|delete|destructive|format|chmod|chown|filesystem|disk|volume/.test(text)) return "System safety";
+  if (
+    /credential|secret|token|private key|api key|\.env|kubeconfig|password|cookie|npmrc/.test(
+      text,
+    )
+  )
+    return "Secrets and credentials";
+  if (
+    /personal|pii|customer|employee|passport|ssn|credit card|regulated|external|upload|source code|exfiltrat|unknown url|third-party/.test(
+      text,
+    )
+  )
+    return "Data protection";
+  if (
+    /git|branch|commit|push|rebase|repository|repo|history|worktree/.test(text)
+  )
+    return "Source control";
+  if (
+    /database|drop table|drop database|truncate|delete from|update statement|sql/.test(
+      text,
+    )
+  )
+    return "Databases";
+  if (
+    /terraform|kubernetes|kubectl|cloud|s3|gcp|aws|azure|namespace|vm|dns|helm|infrastructure/.test(
+      text,
+    )
+  )
+    return "Infrastructure";
+  if (
+    /package|dependency|lockfile|npm|pnpm|yarn|pip|gem|cargo|go install|supply-chain/.test(
+      text,
+    )
+  )
+    return "Supply chain";
+  if (
+    /rm -rf|delete|destructive|format|chmod|chown|filesystem|disk|volume/.test(
+      text,
+    )
+  )
+    return "System safety";
   return "General";
 }
 
 function policyInventorySql(organizationWhere = "") {
-  const organizationFilter = organizationWhere ? `and ${organizationWhere}` : "";
+  const organizationFilter = organizationWhere
+    ? `and ${organizationWhere}`
+    : "";
   return `
     select p.*,
            coalesce(stats.trigger_count, 0)::int as trigger_count,
@@ -8185,14 +11423,24 @@ function policyInventorySql(organizationWhere = "") {
     order by p.category asc, p.created_at asc`;
 }
 
-app.use((error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
-  if (res.headersSent) return next(error);
-  const statusCode = error instanceof HttpError ? error.statusCode : 500;
-  const message = error instanceof Error ? error.message : "OpenLeash API error";
-  res.status(statusCode).json({ success: false, error: message, message });
-});
+app.use(
+  (
+    error: unknown,
+    _req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ) => {
+    if (res.headersSent) return next(error);
+    const statusCode = error instanceof HttpError ? error.statusCode : 500;
+    const message =
+      error instanceof Error ? error.message : "OpenLeash API error";
+    res.status(statusCode).json({ success: false, error: message, message });
+  },
+);
 
-export async function prepareOpenLeashApi(options: PrepareOpenLeashApiOptions = {}) {
+export async function prepareOpenLeashApi(
+  options: PrepareOpenLeashApiOptions = {},
+) {
   const runningApp = options.app ?? app;
   const surface = options.surface ?? apiSurface;
   await ensureDevToken();
@@ -8202,21 +11450,30 @@ export async function prepareOpenLeashApi(options: PrepareOpenLeashApiOptions = 
   return runningApp;
 }
 
-export async function startOpenLeashApi(options: StartOpenLeashApiOptions = {}) {
+export async function startOpenLeashApi(
+  options: StartOpenLeashApiOptions = {},
+) {
   const runningApp = await prepareOpenLeashApi(options);
   const surface = options.surface ?? apiSurface;
   const port = Number(
     options.port ??
-    process.env.OPENLEASH_API_PORT ??
-    (surface === "dashboard" ? process.env.OPENLEASH_DASHBOARD_API_PORT ?? 9319 : 9318)
+      process.env.OPENLEASH_API_PORT ??
+      (surface === "dashboard"
+        ? (process.env.OPENLEASH_DASHBOARD_API_PORT ?? 9319)
+        : 9318),
   );
   return runningApp.listen(port, () => {
-    const label = surface === "dashboard" ? "OpenLeash dashboard API" : "OpenLeash client API";
+    const label =
+      surface === "dashboard"
+        ? "OpenLeash dashboard API"
+        : "OpenLeash client API";
     console.log(`${label} listening on http://localhost:${port}`);
   });
 }
 
-const isEntrypoint = process.argv[1] ? import.meta.url === pathToFileURL(process.argv[1]).href : false;
+const isEntrypoint = process.argv[1]
+  ? import.meta.url === pathToFileURL(process.argv[1]).href
+  : false;
 if (isEntrypoint) {
   await startOpenLeashApi();
 }

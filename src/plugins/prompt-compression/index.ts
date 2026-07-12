@@ -13,12 +13,14 @@ export async function runPromptCompression({
   prompt,
   config,
   capabilities,
-  startedAt
+  startedAt,
+  supportsPromptReplacement = true
 }: {
   prompt: string;
   config: PluginPromptCompressionConfig;
   capabilities: PluginCapabilities;
   startedAt: number;
+  supportsPromptReplacement?: boolean;
 }) {
   if (!config.enabled) {
     return {
@@ -28,8 +30,30 @@ export async function runPromptCompression({
         pluginId: manifest.id,
         event: "prompt.beforeSubmit",
         status: "skipped",
-        summary: "Token saver is disabled.",
+        summary: "token-saver is disabled.",
         startedAt
+      })
+    };
+  }
+
+  if (!supportsPromptReplacement) {
+    return {
+      prompt,
+      result: undefined,
+      run: pluginRun({
+        pluginId: manifest.id,
+        event: "prompt.beforeSubmit",
+        status: "skipped",
+        summary: "token-saver skipped: this agent hook cannot replace submitted prompts.",
+        startedAt,
+        metadata: {
+          deliveryStatus: "unsupported",
+          inputCharacters: prompt.length,
+          outputCharacters: prompt.length,
+          savedCharacters: 0,
+          savedPercent: 0,
+          triggeredAt: new Date(startedAt).toISOString()
+        }
       })
     };
   }
@@ -59,6 +83,7 @@ export async function runPromptCompression({
   if (config.conciseResponse) {
     finalPrompt = `${finalPrompt.trim()}\n\nRespond concisely. Be short, direct, and avoid filler.`;
   }
+  if (finalPrompt.length >= prompt.length) finalPrompt = prompt;
   const model = llm?.model ?? "token-saver-heuristic";
   const compression: NonNullable<PromptPipelineResult["compression"]> = {
     enabled: true,
@@ -102,7 +127,15 @@ export async function runPromptCompression({
       metadata: {
         model,
         source: llm?.source ?? "heuristic",
-        compression
+        compression,
+        input: prompt,
+        output: finalPrompt,
+        inputCharacters: prompt.length,
+        outputCharacters: finalPrompt.length,
+        savedCharacters: Math.max(0, prompt.length - finalPrompt.length),
+        savedPercent: prompt.length > 0 ? Math.round((1 - finalPrompt.length / prompt.length) * 1000) / 10 : 0,
+        triggeredAt: new Date(startedAt).toISOString(),
+        deliveryStatus: finalPrompt !== prompt ? "returned-to-agent-adapter" : "unchanged"
       }
     })
   };
@@ -147,6 +180,6 @@ function compressionSummary(
   finalPrompt: string,
   compression: NonNullable<PromptPipelineResult["compression"]>
 ) {
-  if (finalPrompt === originalPrompt) return "Token saver checked with no changes.";
-  return `Token saver reduced prompt from ${compression.originalLength} to ${compression.compressedLength} chars.`;
+  if (finalPrompt === originalPrompt) return "token-saver checked with no changes.";
+  return `token-saver reduced prompt from ${compression.originalLength} to ${compression.compressedLength} chars.`;
 }

@@ -201,9 +201,17 @@ create table if not exists conversation_events (
   prompt text,
   tool_name text,
   payload jsonb not null,
+  source text not null default 'api_hook',
+  provider text,
+  idempotency_key text,
+  correlation_id text,
+  source_capabilities jsonb not null default '{"observe":true,"block":true,"rewritePrompt":false,"rewriteToolInput":true,"rewriteResponse":false}'::jsonb,
   occurred_at timestamptz not null,
   created_at timestamptz not null default now()
 );
+
+create unique index if not exists conversation_events_user_idempotency_key_uidx
+  on conversation_events (user_id, idempotency_key) where idempotency_key is not null;
 
 create table if not exists evaluations (
   id uuid primary key default gen_random_uuid(),
