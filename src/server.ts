@@ -43,6 +43,7 @@ import { z } from "zod";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
 import { summarizeActionPurpose } from "./evaluator.js";
 import { pluginIconText } from "./plugin-icons.js";
+import { normalizePluginIconInput } from "./plugin-icon-input.js";
 import {
   defaultPromptTransformConfig,
   normalizePromptTransformConfig,
@@ -6240,6 +6241,19 @@ async function createPluginSubmission(
     !Array.isArray(body.manifest)
       ? body.manifest
       : {};
+  const icon = normalizePluginIconInput({
+    iconText:
+      optionalString(body.iconText) ??
+      optionalString((manifest as Record<string, unknown>).iconText),
+    visualPng:
+      optionalString(body.visualPng) ??
+      optionalString((manifest as Record<string, unknown>).visualPng),
+  });
+  const submissionManifest = {
+    ...(manifest as Record<string, unknown>),
+    iconText: icon.iconText || undefined,
+    visualPng: icon.visualPng || undefined,
+  };
   const result = await pool.query(
     `insert into plugin_submissions (organization_id, submitted_by, plugin_id, slug, name, developer_name, package_url, repository_url, manifest)
      values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
@@ -6253,7 +6267,7 @@ async function createPluginSubmission(
       developerName,
       optionalString(body.packageUrl),
       repositoryUrl,
-      JSON.stringify(manifest),
+      JSON.stringify(submissionManifest),
     ],
   );
   return { submission: result.rows[0] };

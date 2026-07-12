@@ -22,7 +22,7 @@
     "prestart": "npm run build -w @openleash/shared",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test src/agent-events.test.ts src/plugin-icons.test.ts",
+    "test": "tsx --test src/agent-events.test.ts src/plugin-icon-input.test.ts src/plugin-icons.test.ts",
     "db:migrate": "tsx src/migrate.ts",
     "db:load-plugins": "tsx src/load-plugins.ts"
   },
