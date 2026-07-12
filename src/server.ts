@@ -42,6 +42,7 @@ import {
 import { z } from "zod";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
 import { summarizeActionPurpose } from "./evaluator.js";
+import { pluginIconText } from "./plugin-icons.js";
 import {
   defaultPromptTransformConfig,
   normalizePromptTransformConfig,
@@ -6632,7 +6633,7 @@ function pluginReleaseFieldsFromManifest(
     ) as OpenLeashPluginManifest["configSchema"],
     defaultConfig: objectValue(manifest.defaultConfig) ?? {},
     tags: pluginStringArray(manifest.tags),
-    iconText: optionalString(manifest.iconText) ?? iconText(slug),
+    iconText: optionalString(manifest.iconText) ?? pluginIconText(slug),
     visualPng: optionalString(manifest.visualPng),
     gitRef: source.gitRef,
     commitSha: source.commitSha,
@@ -6763,15 +6764,6 @@ function titleize(value: string) {
       .replace(/\b\w/g, (letter) => letter.toUpperCase())
       .trim() || "Community"
   );
-}
-
-function iconText(value: string) {
-  const letters = value
-    .split(/[-_\s.]+/)
-    .map((part) => part[0])
-    .join("")
-    .toUpperCase();
-  return (letters || value.slice(0, 2).toUpperCase() || "OL").slice(0, 2);
 }
 
 async function readPluginSettings(organizationId: string) {
