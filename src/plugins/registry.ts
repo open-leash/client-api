@@ -1,9 +1,31 @@
-import { FIRST_PARTY_PLUGIN_MANIFESTS, type OpenLeashPluginManifest, type PipelineEvent } from "@openleash/shared";
+import {
+  FIRST_PARTY_PLUGIN_MANIFESTS,
+  type OpenLeashPluginManifest,
+  type PipelineEvent,
+} from "@openleash/shared";
+import { dangerousCodeManifest } from "./dangerous-code/manifest.js";
 
-export const firstPartyPluginManifests = orderPlugins([...FIRST_PARTY_PLUGIN_MANIFESTS]);
+export const firstPartyPluginManifests = orderPlugins([
+  ...FIRST_PARTY_PLUGIN_MANIFESTS,
+  dangerousCodeManifest,
+]);
 
 export function pluginsForEvent(event: PipelineEvent) {
-  return firstPartyPluginManifests.filter((plugin) => plugin.events.includes(event));
+  return firstPartyPluginManifests.filter((plugin) =>
+    plugin.events.includes(event),
+  );
+}
+
+export function pluginSupportsAgent(
+  plugin: OpenLeashPluginManifest,
+  agentKind?: string,
+) {
+  const agentKinds = (
+    plugin as OpenLeashPluginManifest & { agentKinds?: string[] }
+  ).agentKinds;
+  return (
+    !agentKinds?.length || Boolean(agentKind && agentKinds.includes(agentKind))
+  );
 }
 
 export function orderPlugins(plugins: OpenLeashPluginManifest[]) {
@@ -23,7 +45,8 @@ export function orderPlugins(plugins: OpenLeashPluginManifest[]) {
   const incoming = new Map<string, number>();
   for (const plugin of plugins) incoming.set(plugin.id, 0);
   for (const nextIds of edges.values()) {
-    for (const nextId of nextIds) incoming.set(nextId, (incoming.get(nextId) ?? 0) + 1);
+    for (const nextId of nextIds)
+      incoming.set(nextId, (incoming.get(nextId) ?? 0) + 1);
   }
 
   const queue = plugins
@@ -50,6 +73,12 @@ export function orderPlugins(plugins: OpenLeashPluginManifest[]) {
   return ordered;
 }
 
-function comparePriority(a: OpenLeashPluginManifest, b: OpenLeashPluginManifest) {
-  return (a.ordering?.priority ?? 1000) - (b.ordering?.priority ?? 1000) || a.id.localeCompare(b.id);
+function comparePriority(
+  a: OpenLeashPluginManifest,
+  b: OpenLeashPluginManifest,
+) {
+  return (
+    (a.ordering?.priority ?? 1000) - (b.ordering?.priority ?? 1000) ||
+    a.id.localeCompare(b.id)
+  );
 }

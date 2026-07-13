@@ -1,9 +1,14 @@
 import { createPluginCapabilities } from "./capabilities.js";
 import { runBlastRadius } from "./blast-radius/index.js";
 import { runDlp } from "./dlp/index.js";
+import { runDangerousCode } from "./dangerous-code/index.js";
 import { runMcpScanner } from "./mcp-scanner/index.js";
 import { runPromptCompression } from "./prompt-compression/index.js";
-import { pluginsForEvent, orderPlugins } from "./registry.js";
+import {
+  pluginSupportsAgent,
+  pluginsForEvent,
+  orderPlugins,
+} from "./registry.js";
 import { runSecurityEvaluator } from "./security-evaluator/index.js";
 import { runSensitiveAccess } from "./sensitive-access/index.js";
 import { eventForHookEvent } from "./events.js";
@@ -31,6 +36,7 @@ export async function runPromptPipeline(
   for (const plugin of enabledPluginsForEvent(
     "prompt.beforeSubmit",
     input.plugins,
+    input.request.agent.kind,
   )) {
     const capabilities = createPluginCapabilities({
       tenantModelKey: input.tenantModelKey,
@@ -124,55 +130,71 @@ export async function runEvaluationPipeline(
 ): Promise<EvaluationPipelineResult> {
   const event = eventForHookEvent(input.request.event.eventName);
   const steps = await Promise.all(
-    enabledPluginsForEvent(event, input.plugins).map(async (plugin) => {
-      const capabilities = createPluginCapabilities({
-        tenantModelKey: input.tenantModelKey,
-        organizationId: input.organizationId,
-        pluginId: plugin.id,
-        request: input.request,
-        conversationEventId: input.conversationEventId,
-        userId: input.userId,
-        computerId: input.computerId,
-        runtimeId: input.runtimeId,
-      });
-      if (plugin.id === "openleash.sensitive-access") {
-        const sensitive = await runSensitiveAccess(input, capabilities);
-        return {
-          results: sensitive.results,
-          runs: [sensitive.run],
-          model: "none",
-        };
-      }
+    enabledPluginsForEvent(event, input.plugins, input.request.agent.kind).map(
+      async (plugin) => {
+        const capabilities = createPluginCapabilities({
+          tenantModelKey: input.tenantModelKey,
+          organizationId: input.organizationId,
+          pluginId: plugin.id,
+          request: input.request,
+          conversationEventId: input.conversationEventId,
+          userId: input.userId,
+          computerId: input.computerId,
+          runtimeId: input.runtimeId,
+        });
+        if (plugin.id === "openleash.sensitive-access") {
+          const sensitive = await runSensitiveAccess(input, capabilities);
+          return {
+            results: sensitive.results,
+            runs: [sensitive.run],
+            model: "none",
+          };
+        }
 
-      if (plugin.id === "openleash.blast-radius") {
-        const blastRadius = await runBlastRadius(input, capabilities);
-        return {
-          results: blastRadius.results,
-          runs: [blastRadius.run],
-          model: "none",
-        };
-      }
+        if (plugin.id === "openleash.dangerous-code") {
+          const run = await runDangerousCode(
+            input.request,
+            event,
+            capabilities,
+            input.plugins?.get(plugin.id)?.config,
+          );
+          return {
+            results: [],
+            runs: [run],
+            model: String(run.metadata?.evaluatedBy ?? "none"),
+          };
+        }
 
-      if (plugin.id === "openleash.rules-enforcer") {
-        const security = await runSecurityEvaluator(input, capabilities);
-        return {
-          results: security.results,
-          runs: [security.run],
-          model: security.model,
-        };
-      }
+        if (plugin.id === "openleash.blast-radius") {
+          const blastRadius = await runBlastRadius(input, capabilities);
+          return {
+            results: blastRadius.results,
+            runs: [blastRadius.run],
+            model: "none",
+          };
+        }
 
-      if (plugin.id === "openleash.mcp-scanner") {
-        const mcp = await runMcpScanner(input, capabilities);
-        return {
-          results: [],
-          runs: [mcp.run],
-          model: "none",
-          mcpCall: mcp.call,
-        };
-      }
-      return { results: [], runs: [], model: "none" };
-    }),
+        if (plugin.id === "openleash.rules-enforcer") {
+          const security = await runSecurityEvaluator(input, capabilities);
+          return {
+            results: security.results,
+            runs: [security.run],
+            model: security.model,
+          };
+        }
+
+        if (plugin.id === "openleash.mcp-scanner") {
+          const mcp = await runMcpScanner(input, capabilities);
+          return {
+            results: [],
+            runs: [mcp.run],
+            model: "none",
+            mcpCall: mcp.call,
+          };
+        }
+        return { results: [], runs: [], model: "none" };
+      },
+    ),
   );
 
   return {
@@ -188,6 +210,7 @@ export async function runEvaluationPipeline(
 function enabledPluginsForEvent(
   event: PipelineEvent,
   settings?: Map<string, PluginSettingState>,
+  agentKind?: string,
 ) {
   const plugins = pluginsForEvent(event)
     .filter(
@@ -196,6 +219,7 @@ function enabledPluginsForEvent(
         isOpenLeashCloudRuntime(),
     )
     .filter((plugin) => settings?.get(plugin.id)?.enabled ?? true)
+    .filter((plugin) => pluginSupportsAgent(plugin, agentKind))
     .map((plugin) => {
       const priority = settings?.get(plugin.id)?.orderingPriority;
       if (priority === undefined || priority === null) return plugin;

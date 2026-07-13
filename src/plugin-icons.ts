@@ -7,6 +7,7 @@ export const FIRST_PARTY_PLUGIN_ICONS: Readonly<Record<string, string>> = {
   "sensitive-access": "🔐",
   "siem-exporter": "📤",
   "skill-scanner": "🕵️",
+  "dangerous-code": "☣️",
 };
 
 export function pluginIconText(slug: string) {
