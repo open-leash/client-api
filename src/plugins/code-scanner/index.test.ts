@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { EvaluationRequest, PluginCapabilities } from "@openleash/shared";
-import { generatedCodeCandidate, runDangerousCode } from "./index.js";
-import { dangerousCodeManifest } from "./manifest.js";
+import { generatedCodeCandidate, runCodeScanner } from "./index.js";
+import { codeScannerManifest } from "./manifest.js";
 import { pluginSupportsAgent } from "../registry.js";
 
 function request(
@@ -56,13 +56,13 @@ function capabilities(assessment: unknown) {
 }
 
 test("manifest limits execution to vibe-coding agents", () => {
-  assert.equal(pluginSupportsAgent(dangerousCodeManifest, "claude-code"), true);
-  assert.equal(pluginSupportsAgent(dangerousCodeManifest, "cursor"), true);
+  assert.equal(pluginSupportsAgent(codeScannerManifest, "claude-code"), true);
+  assert.equal(pluginSupportsAgent(codeScannerManifest, "cursor"), true);
   assert.equal(
-    pluginSupportsAgent(dangerousCodeManifest, "salesforce-agentforce"),
+    pluginSupportsAgent(codeScannerManifest, "salesforce-agentforce"),
     false,
   );
-  assert.equal(pluginSupportsAgent(dangerousCodeManifest, "openclaw"), false);
+  assert.equal(pluginSupportsAgent(codeScannerManifest, "openclaw"), false);
 });
 
 test("extracts code from coding-agent file tools and ignores prose", () => {
@@ -96,7 +96,7 @@ test("risky assessment logs, signals, and notifies without blocking", async () =
       },
     ],
   });
-  const result = await runDangerousCode(
+  const result = await runCodeScanner(
     request("claude-code", {
       content:
         "import os\n\ndef run(user):\n    command = 'echo ' + user\n    return os.system(command)\n",
@@ -119,7 +119,7 @@ test("clean assessment is logged without notifying", async () => {
     summary: "No concrete vulnerability.",
     vulnerabilities: [],
   });
-  const result = await runDangerousCode(
+  const result = await runCodeScanner(
     request("github-copilot", {
       content:
         "export function add(left: number, right: number) {\n  if (!Number.isFinite(left) || !Number.isFinite(right)) throw new Error('invalid');\n  return left + right;\n}\n",

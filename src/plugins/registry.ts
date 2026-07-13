@@ -3,11 +3,11 @@ import {
   type OpenLeashPluginManifest,
   type PipelineEvent,
 } from "@openleash/shared";
-import { dangerousCodeManifest } from "./dangerous-code/manifest.js";
+import { codeScannerManifest } from "./code-scanner/manifest.js";
 
 export const firstPartyPluginManifests = orderPlugins([
   ...FIRST_PARTY_PLUGIN_MANIFESTS,
-  dangerousCodeManifest,
+  codeScannerManifest,
 ]);
 
 export function pluginsForEvent(event: PipelineEvent) {

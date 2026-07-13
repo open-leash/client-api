@@ -1,7 +1,7 @@
 import { createPluginCapabilities } from "./capabilities.js";
 import { runBlastRadius } from "./blast-radius/index.js";
 import { runDlp } from "./dlp/index.js";
-import { runDangerousCode } from "./dangerous-code/index.js";
+import { runCodeScanner } from "./code-scanner/index.js";
 import { runMcpScanner } from "./mcp-scanner/index.js";
 import { runPromptCompression } from "./prompt-compression/index.js";
 import {
@@ -151,8 +151,8 @@ export async function runEvaluationPipeline(
           };
         }
 
-        if (plugin.id === "openleash.dangerous-code") {
-          const run = await runDangerousCode(
+        if (plugin.id === "openleash.code-scanner") {
+          const run = await runCodeScanner(
             input.request,
             event,
             capabilities,

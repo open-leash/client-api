@@ -1,6 +1,6 @@
 import type { AgentKind, OpenLeashPluginManifest } from "@openleash/shared";
 
-export const DANGEROUS_CODE_AGENT_KINDS: AgentKind[] = [
+export const CODE_SCANNER_AGENT_KINDS: AgentKind[] = [
   "claude-code",
   "codex",
   "openai-codex-cloud",
@@ -16,21 +16,21 @@ export const DANGEROUS_CODE_AGENT_KINDS: AgentKind[] = [
   "zed",
 ];
 
-export const dangerousCodeManifest: OpenLeashPluginManifest & {
+export const codeScannerManifest: OpenLeashPluginManifest & {
   agentKinds: AgentKind[];
 } = {
-  id: "openleash.dangerous-code",
-  slug: "dangerous-code",
-  name: "dangerous-code",
+  id: "openleash.code-scanner",
+  slug: "code-scanner",
+  name: "code-scanner",
   description:
     "Review AI-generated code for exploitable vulnerabilities and notify the developer.",
-  repositoryUrl: "https://github.com/open-leash/plugin-dangerous-code",
+  repositoryUrl: "https://github.com/open-leash/plugin-code-scanner",
   version: "1.0.0",
   publisher: "openleash",
   runtime: "openleash-core",
-  entrypoint: "plugins/dangerous-code",
+  entrypoint: "plugins/code-scanner",
   events: ["agent.response", "tool.beforeUse"],
-  agentKinds: DANGEROUS_CODE_AGENT_KINDS,
+  agentKinds: CODE_SCANNER_AGENT_KINDS,
   permissions: [
     "event:read",
     "tool:read",
