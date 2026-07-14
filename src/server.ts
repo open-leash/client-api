@@ -32,10 +32,13 @@ import {
   type OpenLeashOutcomeStatus,
   type PluginCatalogItem,
   type PluginLogRecord,
+  type PluginLogRequest,
   type PluginMarketplaceListing,
   type PipelineEvent,
   type PluginRunRecord,
+  type PluginSignalRequest,
   type PluginSettingState,
+  type PluginUsageRecordRequest,
   type Policy,
   type PolicyDecision,
 } from "@openleash/shared";
@@ -54,6 +57,7 @@ import { firstPartyPluginManifests } from "./plugins/registry.js";
 import { eventForHookEvent } from "./plugins/events.js";
 import { runEvaluationPipeline, runPromptPipeline } from "./plugins/runtime.js";
 import { createPluginCapabilities } from "./plugins/capabilities.js";
+import { executeContainerPluginTool, transformWithContainerPlugins } from "./plugins/container-runtime.js";
 import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
 import { runSkillScanner } from "./plugins/skill-scanner/index.js";
 import type { PromptPipelineResult } from "./plugins/types.js";
@@ -170,7 +174,7 @@ app.use(
     ],
   }),
 );
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: process.env.OPENLEASH_API_JSON_LIMIT ?? "20mb" }));
 app.use((req, res, next) => {
   const routeSurface = surfaceForRequest(req.method, req.path);
   if (
@@ -631,6 +635,76 @@ app.post("/v1/agent-events", async (req, res, next) => {
       if (inflightNormalizedEvents.get(inflightKey) === evaluation)
         inflightNormalizedEvents.delete(inflightKey);
     }
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
+  try {
+    const token = tokenFromRequest(req);
+    const user = token ? await getUserByToken(token) : undefined;
+    if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
+    if (!user.organization_id) {
+      return res.status(409).json({
+        error: "container plugins require an organization-scoped runtime",
+      });
+    }
+    const requestBody = req.body?.requestBody;
+    if (!requestBody || typeof requestBody !== "object" || Array.isArray(requestBody)) {
+      return res.status(400).json({ error: "requestBody must be a JSON object" });
+    }
+    const provider = String(req.body?.provider ?? "unknown").trim() || "unknown";
+    const agentKind = String(req.body?.agentKind ?? "unknown").trim() || "unknown";
+    const sessionId = String(req.body?.sessionId ?? "proxy").trim() || "proxy";
+    const catalog = await pluginCatalogForOrganization(
+      user.organization_id,
+      user.id,
+    );
+    const result = await transformWithContainerPlugins({
+      plugins: catalog.plugins,
+      organizationId: user.organization_id,
+      userId: user.id,
+      provider,
+      agentKind,
+      sessionId,
+      payload: requestBody,
+    });
+    res.json({
+      protocol: "openleash-container-plugin.v1",
+      requestBody: result.payload,
+      appliedPluginIds: result.appliedPluginIds,
+      runs: result.runs,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/plugin-runtime/tools/execute", async (req, res, next) => {
+  try {
+    const token = tokenFromRequest(req);
+    const user = token ? await getUserByToken(token) : undefined;
+    if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
+    if (!user.organization_id) return res.status(409).json({ error: "container plugins require an organization-scoped runtime" });
+    const pluginId = String(req.body?.pluginId ?? "").trim();
+    const tool = String(req.body?.tool ?? "").trim();
+    const args = req.body?.arguments;
+    if (!pluginId || !tool || !args || typeof args !== "object" || Array.isArray(args)) {
+      return res.status(400).json({ error: "pluginId, tool, and object arguments are required" });
+    }
+    const catalog = await pluginCatalogForOrganization(user.organization_id, user.id);
+    const plugin = catalog.plugins.find((candidate) => candidate.id === pluginId);
+    if (!plugin) return res.status(404).json({ error: "enabled plugin not found" });
+    const result = await executeContainerPluginTool({
+      plugin,
+      organizationId: user.organization_id,
+      userId: user.id,
+      sessionId: String(req.body?.sessionId ?? "proxy"),
+      tool,
+      arguments: args as Record<string, unknown>,
+    });
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -5174,6 +5248,7 @@ async function handlePromptOnlyHook(
   const intentKey = triggerIntentKey(request);
   const { conversationEventId, computerId, runtimeId, organizationId } =
     await recordConversationEvent(request, user, intentKey);
+  const containerRuns = await recordContainerRuntimeRuns({ request, organizationId, conversationEventId, userId: user.id, computerId, runtimeId });
   const [config, runtimePlugins, tenantModelKey, policies] = await Promise.all([
     readPromptTransformConfig(organizationId, user.id),
     pluginSettingsForRuntime(organizationId, user.id),
@@ -5277,6 +5352,7 @@ async function handlePromptOnlyHook(
     );
   }
   await recordPluginRuns(conversationEventId, [
+    ...containerRuns,
     ...(promptResult?.runs ?? []),
     ...pipeline.runs,
   ]);
@@ -5787,6 +5863,7 @@ function marketplaceListingFromRow(
     ),
     documentationUrl: optionalString(row.documentation_url),
     runtime: String(row.runtime) as PluginMarketplaceListing["runtime"],
+    execution: objectValue(row.execution) as PluginMarketplaceListing["execution"],
     entrypoint: String(row.entrypoint),
     events: arrayValue(row.events) as PluginMarketplaceListing["events"],
     permissions: arrayValue(
@@ -5947,6 +6024,7 @@ function marketplaceListingFromInput(
     packageUrl: optionalString(value.packageUrl),
     documentationUrl: optionalString(value.documentationUrl),
     runtime,
+    execution: objectValue(value.execution) as PluginMarketplaceListing["execution"],
     entrypoint,
     events: arrayValue(value.events) as PluginMarketplaceListing["events"],
     permissions: arrayValue(
@@ -5978,16 +6056,16 @@ async function upsertLocalMarketplaceListing(plugin: PluginMarketplaceListing) {
     `insert into plugin_marketplace (
        plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
-       repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
+       repository_url, documentation_url, runtime, execution, entrypoint, events, permissions, effects,
        ordering, config_schema, default_config, tags, icon_text, visual_png,
        featured_rank, seo_title, seo_description, updated_at
      )
      values (
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, 'approved', $10, $11, $12, $13,
-       $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20::jsonb,
-       $21::jsonb, $22::jsonb, $23::jsonb, $24::jsonb, $25, $26,
-       $27, $28, $29, now()
+       $14, $15, $16, $17::jsonb, $18, $19::jsonb, $20::jsonb, $21::jsonb,
+       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
+       $28, $29, $30, now()
      )
      on conflict (plugin_id) do update set
        slug = excluded.slug,
@@ -6006,6 +6084,7 @@ async function upsertLocalMarketplaceListing(plugin: PluginMarketplaceListing) {
        repository_url = excluded.repository_url,
        documentation_url = excluded.documentation_url,
        runtime = excluded.runtime,
+       execution = excluded.execution,
        entrypoint = excluded.entrypoint,
        events = excluded.events,
        permissions = excluded.permissions,
@@ -6037,6 +6116,7 @@ async function upsertLocalMarketplaceListing(plugin: PluginMarketplaceListing) {
       plugin.repositoryUrl ?? null,
       plugin.documentationUrl ?? null,
       plugin.runtime,
+      JSON.stringify(plugin.execution ?? null),
       plugin.entrypoint,
       JSON.stringify(plugin.events),
       JSON.stringify(plugin.permissions),
@@ -6307,16 +6387,16 @@ async function createPluginReleaseSubmission(
     `insert into plugin_releases (
        plugin_id, version, slug, name, description, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
-       repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
+       repository_url, documentation_url, runtime, execution, entrypoint, events, permissions, effects,
        ordering, config_schema, default_config, tags, icon_text, visual_png,
        git_ref, commit_sha, manifest_path, manifest, submitted_by, updated_at
      )
      values (
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, 'pending_review', $10, $11, $12, $13,
-       $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20::jsonb,
-       $21::jsonb, $22::jsonb, $23::jsonb, $24::jsonb, $25, $26,
-       $27, $28, $29, $30::jsonb, $31, now()
+       $14, $15, $16, $17::jsonb, $18, $19::jsonb, $20::jsonb, $21::jsonb,
+       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
+       $28, $29, $30, $31::jsonb, $32, now()
      )
      on conflict (plugin_id, version) do update set
        slug = excluded.slug,
@@ -6334,6 +6414,7 @@ async function createPluginReleaseSubmission(
        repository_url = excluded.repository_url,
        documentation_url = excluded.documentation_url,
        runtime = excluded.runtime,
+       execution = excluded.execution,
        entrypoint = excluded.entrypoint,
        events = excluded.events,
        permissions = excluded.permissions,
@@ -6371,6 +6452,7 @@ async function createPluginReleaseSubmission(
       release.repositoryUrl,
       release.documentationUrl ?? null,
       release.runtime,
+      JSON.stringify(release.execution ?? null),
       release.entrypoint,
       JSON.stringify(release.events),
       JSON.stringify(release.permissions),
@@ -6446,16 +6528,16 @@ async function approvePluginRelease(
     `insert into plugin_marketplace (
        plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
-       repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
+       repository_url, documentation_url, runtime, execution, entrypoint, events, permissions, effects,
        ordering, config_schema, default_config, tags, icon_text, visual_png,
        featured_rank, seo_title, seo_description, updated_at
      )
      values (
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, 'approved', $10, $11, $12, $13,
-       $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20::jsonb,
-       $21::jsonb, $22::jsonb, $23::jsonb, $24::jsonb, $25, $26,
-       null, $27, $28, now()
+       $14, $15, $16, $17::jsonb, $18, $19::jsonb, $20::jsonb, $21::jsonb,
+       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
+       null, $28, $29, now()
      )
      on conflict (plugin_id) do update set
        slug = excluded.slug,
@@ -6474,6 +6556,7 @@ async function approvePluginRelease(
        repository_url = excluded.repository_url,
        documentation_url = excluded.documentation_url,
        runtime = excluded.runtime,
+       execution = excluded.execution,
        entrypoint = excluded.entrypoint,
        events = excluded.events,
        permissions = excluded.permissions,
@@ -6504,6 +6587,7 @@ async function approvePluginRelease(
       release.repositoryUrl,
       release.documentationUrl ?? null,
       release.runtime,
+      JSON.stringify(release.execution ?? null),
       release.entrypoint,
       JSON.stringify(release.events),
       JSON.stringify(release.permissions),
@@ -6564,6 +6648,7 @@ type PluginReleaseFields = {
   repositoryUrl: string;
   documentationUrl?: string;
   runtime: OpenLeashPluginManifest["runtime"];
+  execution?: OpenLeashPluginManifest["execution"];
   entrypoint: string;
   events: OpenLeashPluginManifest["events"];
   permissions: OpenLeashPluginManifest["permissions"];
@@ -6603,7 +6688,23 @@ function pluginReleaseFieldsFromManifest(
       "Plugin manifest requires id, version, name or slug, and description.",
     );
   }
-  const runtime = manifest.runtime === "node" ? "node" : "openleash-core";
+  const runtime = (["node", "container"] as const).includes(manifest.runtime as "node" | "container")
+    ? (manifest.runtime as "node" | "container")
+    : "openleash-core";
+  const execution = objectValue(manifest.execution) as OpenLeashPluginManifest["execution"];
+  if (runtime === "container") {
+    if (
+      execution?.type !== "container" ||
+      execution.protocol !== "openleash-container-plugin.v1" ||
+      !optionalString(execution.image) ||
+      !optionalString(execution.digest)
+    ) {
+      throw new HttpError(
+        400,
+        "Community container plugins require a container execution block with an immutable image digest.",
+      );
+    }
+  }
   const entrypoint = optionalString(manifest.entrypoint) ?? "";
   if (!entrypoint)
     throw new HttpError(400, "Plugin manifest requires entrypoint.");
@@ -6635,6 +6736,7 @@ function pluginReleaseFieldsFromManifest(
     repositoryUrl: source.repositoryUrl,
     documentationUrl: optionalString(manifest.documentationUrl),
     runtime,
+    execution,
     entrypoint,
     events: events as OpenLeashPluginManifest["events"],
     permissions: permissions as OpenLeashPluginManifest["permissions"],
@@ -6730,6 +6832,7 @@ function pluginReleaseFromRow(row: Record<string, unknown>) {
     repositoryUrl: String(row.repository_url),
     documentationUrl: optionalString(row.documentation_url),
     runtime: String(row.runtime),
+    execution: objectValue(row.execution),
     entrypoint: String(row.entrypoint),
     events: arrayValue(row.events),
     permissions: arrayValue(row.permissions),
@@ -6979,6 +7082,109 @@ async function recordPluginRuns(
   );
 }
 
+async function recordContainerRuntimeRuns(input: {
+  request: EvaluationRequest;
+  organizationId: string;
+  conversationEventId: string;
+  userId: string;
+  computerId: string;
+  runtimeId: string;
+}): Promise<PluginRunRecord[]> {
+  const raw = input.request.event.raw && typeof input.request.event.raw === "object"
+    ? input.request.event.raw as Record<string, unknown>
+    : {};
+  const sourceRuns = Array.isArray(raw.containerPluginRuns) ? raw.containerPluginRuns : [];
+  const runtimeSettings = await pluginSettingsForRuntime(input.organizationId, input.userId);
+  const runs: PluginRunRecord[] = [];
+  for (const value of sourceRuns.slice(0, 32)) {
+    if (!value || typeof value !== "object") continue;
+    const run = value as Record<string, unknown>;
+    const pluginId = String(run.pluginId ?? "").trim();
+    if (!pluginId) continue;
+    const manifest = await manifestForPluginId(pluginId);
+    if (
+      !manifest ||
+      manifest.execution?.type !== "container" ||
+      runtimeSettings.get(pluginId)?.enabled !== true
+    ) continue;
+    const sourceStatus = String(run.status ?? "failed");
+    const status: PluginRunRecord["status"] = sourceStatus === "modified"
+      ? "modified"
+      : sourceStatus === "failed"
+        ? "failed"
+        : sourceStatus === "skipped"
+          ? "skipped"
+          : "passed";
+    const summary = String(run.summary ?? `Container plugin ${sourceStatus}.`).slice(0, 2_000);
+    const metadata = {
+      runtime: "container",
+      metrics: run.metrics && typeof run.metrics === "object" ? run.metrics : undefined,
+      ccrHashes: Array.isArray(run.ccrHashes) ? run.ccrHashes.slice(0, 32) : undefined,
+    };
+    runs.push({
+      pluginId,
+      event: "provider.request.beforeSend",
+      status,
+      summary,
+      durationMs: Number.isFinite(Number(run.durationMs)) ? Number(run.durationMs) : undefined,
+      metadata,
+    });
+    await pool.query(
+      `insert into plugin_log_events
+       (organization_id, plugin_id, conversation_event_id, user_id, computer_id, agent_runtime_id, level, category, code, message, data)
+       values ($1, $2, $3, $4, $5, $6, $7, 'plugin', 'container-runtime', $8, $9::jsonb)`,
+      [
+        input.organizationId,
+        pluginId,
+        input.conversationEventId,
+        input.userId,
+        input.computerId,
+        input.runtimeId,
+        status === "failed" ? "error" : "info",
+        summary,
+        JSON.stringify({ status, durationMs: run.durationMs, ...metadata }),
+      ],
+    );
+    const emissions = run.emissions && typeof run.emissions === "object"
+      ? run.emissions as Record<string, unknown>
+      : {};
+    const capabilities = createPluginCapabilities({
+      organizationId: input.organizationId,
+      pluginId,
+      request: input.request,
+      conversationEventId: input.conversationEventId,
+      userId: input.userId,
+      computerId: input.computerId,
+      runtimeId: input.runtimeId,
+    });
+    if (manifest.permissions.includes("log:write")) {
+      const logs = Array.isArray(emissions.logs) ? emissions.logs.slice(0, 16) : [];
+      for (const log of logs) {
+        if (log && typeof log === "object") {
+          await capabilities.log.emit(log as PluginLogRequest);
+        }
+      }
+    }
+    if (manifest.permissions.includes("signal:write")) {
+      const signals = Array.isArray(emissions.signals) ? emissions.signals.slice(0, 16) : [];
+      for (const signal of signals) {
+        if (signal && typeof signal === "object") {
+          await capabilities.signals.emit(signal as PluginSignalRequest);
+        }
+      }
+    }
+    if (manifest.permissions.includes("usage:write")) {
+      const usageRecords = Array.isArray(emissions.usage) ? emissions.usage.slice(0, 16) : [];
+      for (const usage of usageRecords) {
+        if (usage && typeof usage === "object") {
+          await capabilities.usage.record(usage as PluginUsageRecordRequest);
+        }
+      }
+    }
+  }
+  return runs;
+}
+
 async function writePipelineTrace(
   stage: string,
   details: Record<string, unknown>,
@@ -7129,6 +7335,7 @@ async function evaluateAndRecord(
   const intentKey = triggerIntentKey(request);
   const { conversationEventId, computerId, runtimeId, organizationId } =
     await recordConversationEvent(request, user, intentKey);
+  const containerRuns = await recordContainerRuntimeRuns({ request, organizationId, conversationEventId, userId: user.id, computerId, runtimeId });
   const handledIntent = intentKey
     ? await findRecentHandledIntent(user.id, request, intentKey)
     : undefined;
@@ -7289,6 +7496,7 @@ async function evaluateAndRecord(
     plugins: runtimePlugins,
   });
   await recordPluginRuns(conversationEventId, [
+    ...containerRuns,
     ...pipeline.runs,
     ...logExportRuns,
     ...exportRuns,

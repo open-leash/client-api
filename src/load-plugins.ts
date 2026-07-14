@@ -156,16 +156,16 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
     `insert into plugin_marketplace (
        plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
-       repository_url, documentation_url, runtime, entrypoint, events, permissions, effects,
+       repository_url, documentation_url, runtime, execution, entrypoint, events, permissions, effects,
        ordering, config_schema, default_config, tags, icon_text, visual_png,
        featured_rank, seo_title, seo_description, updated_at
      )
      values (
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, $10, $11, $12, $13, $14,
-       $15, $16, $17, $18, $19::jsonb, $20::jsonb, $21::jsonb,
-       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
-       $28, $29, $30, now()
+       $15, $16, $17, $18::jsonb, $19, $20::jsonb, $21::jsonb, $22::jsonb,
+       $23::jsonb, $24::jsonb, $25::jsonb, $26::jsonb, $27, $28,
+       $29, $30, $31, now()
      )
      on conflict (plugin_id) do update set
        slug = excluded.slug,
@@ -184,6 +184,7 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
        repository_url = excluded.repository_url,
        documentation_url = excluded.documentation_url,
        runtime = excluded.runtime,
+       execution = excluded.execution,
        entrypoint = excluded.entrypoint,
        events = excluded.events,
        permissions = excluded.permissions,
@@ -216,6 +217,7 @@ async function upsertListing(plugin: PluginMarketplaceListing) {
       plugin.repositoryUrl ?? null,
       plugin.documentationUrl ?? null,
       plugin.runtime,
+      JSON.stringify(plugin.execution ?? null),
       plugin.entrypoint,
       JSON.stringify(plugin.events),
       JSON.stringify(plugin.permissions),

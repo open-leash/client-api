@@ -38,6 +38,7 @@ export async function runPromptPipeline(
     input.plugins,
     input.request.agent.kind,
   )) {
+    if (containerPluginAlreadyApplied(input.request, plugin.id)) continue;
     const capabilities = createPluginCapabilities({
       tenantModelKey: input.tenantModelKey,
       organizationId: input.organizationId,
@@ -102,6 +103,18 @@ export async function runPromptPipeline(
     dlp,
     runs,
   };
+}
+
+function containerPluginAlreadyApplied(
+  request: PromptPipelineInput["request"],
+  pluginId: string,
+) {
+  const raw =
+    request.event.raw && typeof request.event.raw === "object"
+      ? (request.event.raw as Record<string, unknown>)
+      : undefined;
+  return Array.isArray(raw?.containerPluginApplied) &&
+    raw.containerPluginApplied.includes(pluginId);
 }
 
 function sourceAllowsPromptReplacement(

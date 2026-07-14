@@ -1,13 +1,13 @@
 # OpenLeash Pipeline Plugins
 
-OpenLeash features run as ordered pipeline plugins. A plugin is a folder with:
+OpenLeash features run as ordered pipeline plugins. Plugins can use the trusted in-process core runtime or the language-independent container runtime. A plugin is described by a versioned manifest; in-process plugins also contain an `index.ts` implementation, while container plugins publish an OCI image.
 
 - `manifest.ts` - metadata, events, permissions, effects, ordering, and config schema.
 - `index.ts` - the implementation used by the runtime.
 
 Current first-party plugins:
 
-- `token-saver` runs on `prompt.beforeSubmit` and may modify the prompt.
+- `token-saver` runs as a Headroom-powered container on `provider.request.beforeSend` and may safely patch provider messages or input before the request leaves the machine.
 - `data-leakage-prevention` runs after token-saver on `prompt.beforeSubmit` and may mask or block.
 - `sensitive-access` reviews env-file reads, secret exposure, env dumps, and exfiltration attempts.
 - `blast-radius` guards destructive tools and broad data operations.
@@ -63,7 +63,21 @@ Permissions are declarative and should match what the implementation actually ne
 - `usage:write`
 - `notification:send`
 
-The current runtime uses these for catalog and UI clarity. External plugin isolation should enforce them before third-party plugins are supported.
+The container runtime validates the declared event, limits mutation to approved provider-payload roots, signs every invocation, and applies the manifest failure mode. Permissions still remain part of review and policy; they are not a substitute for the container sandbox.
+
+## Container Runtime v1
+
+Container plugins use `openleash-container-plugin.v1`. The local proxy never calls a plugin container. It sends the structured provider request to the local `client-api` edge, which invokes enabled containers over loopback. Hosted `client-api` instances invoke an already-warm service pool through the same envelope.
+
+The required endpoints are:
+
+- `GET /healthz`
+- `POST /v1/transform`
+- `POST /v1/tools/execute` when the manifest advertises tool execution
+
+Requests carry a correlation ID, exact plugin ID/version, tenant/user/session scope, config, and payload. They are HMAC-signed with a short-lived runtime secret. Responses must echo the protocol and correlation ID. Transform responses return constrained JSON Patch operations; containers never receive database credentials, provider credentials, a Docker socket, or direct OpenLeash internals. Desktop containers have networking disabled unless a reviewed manifest explicitly declares `network:access`; the desktop edge tunnels signed HTTP to the container's own loopback API with `docker exec`. The first-party Token Saver therefore has no runtime network route at all.
+
+Desktop lifecycle is desired-state reconciliation: login/catalog sync installs enabled edge images, health-checks a candidate, switches versions with a rollback container retained until success, and removes disabled containers. Published community images require an immutable digest. Cloud runs reviewed shared plugins in a warm autoscaled pool; plugins that need stronger isolation declare `tenant-dedicated` or `customer-hosted` placement instead.
 
 ## Capability Boundary
 
