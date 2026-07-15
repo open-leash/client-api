@@ -24,7 +24,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test src/agent-events.test.ts src/plugin-icon-input.test.ts src/plugin-icons.test.ts src/plugins/code-scanner/index.test.ts src/plugins/container-runtime.test.ts",
     "db:migrate": "tsx src/migrate.ts",
-    "db:load-plugins": "tsx src/load-plugins.ts"
+    "db:load-plugins": "tsx src/load-plugins.ts",
+    "db:create-org": "tsx src/create-organization.ts"
   },
   "dependencies": {
     "@openleash/shared": "0.1.0",

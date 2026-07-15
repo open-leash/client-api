@@ -1,37 +1,32 @@
-FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS deps
+FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS builder
 WORKDIR /app
-COPY package.json package-lock.json ./
-COPY apps/client-api/package.json apps/client-api/package.json
-COPY apps/dashboard-web/package.json apps/dashboard-web/package.json
-COPY apps/dashboard-api/package.json apps/dashboard-api/package.json
-COPY apps/desktop-client/package.json apps/desktop-client/package.json
-COPY packages/shared/package.json packages/shared/package.json
-RUN npm ci --workspace @openleash/client-api --workspace @openleash/shared
-
-FROM deps AS build
-COPY packages/shared packages/shared
-COPY apps/client-api apps/client-api
-COPY infra infra
+RUN apk add --no-cache git
+ARG OPENLEASH_SHARED_REF=29cc636f8b75ee9e58ff52ed66d08f3787faf1ec
+RUN git clone https://github.com/open-leash/shared.git packages/shared \
+    && git -C packages/shared checkout --detach "$OPENLEASH_SHARED_REF"
+COPY . apps/client-api
+RUN printf '%s\n' \
+  '{"private":true,"type":"module","workspaces":["packages/*","apps/*"]}' \
+  > package.json
+RUN npm install --workspace @openleash/shared --workspace @openleash/client-api
 RUN npm run build -w @openleash/shared && npm run build -w @openleash/client-api
+RUN npm prune --omit=dev && npm cache clean --force
 
 FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS runner
+LABEL org.opencontainers.image.source="https://github.com/open-leash/client-api" \
+      org.opencontainers.image.title="OpenLeash client-api" \
+      org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /app
 ENV NODE_ENV=production
-COPY package.json package-lock.json ./
-COPY apps/client-api/package.json apps/client-api/package.json
-COPY apps/dashboard-web/package.json apps/dashboard-web/package.json
-COPY apps/dashboard-api/package.json apps/dashboard-api/package.json
-COPY apps/desktop-client/package.json apps/desktop-client/package.json
-COPY packages/shared/package.json packages/shared/package.json
-RUN npm ci --omit=dev --workspace @openleash/client-api --workspace @openleash/shared \
-    && npm cache clean --force \
-    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
-COPY --from=build /app/packages/shared/dist packages/shared/dist
-COPY --from=build /app/apps/client-api/dist apps/client-api/dist
-COPY --from=build /app/apps/client-api/infra apps/client-api/infra
-COPY infra infra
-COPY scripts/db-create-organization.mjs scripts/db-create-organization.mjs
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+COPY --chown=node:node --from=builder /app/node_modules ./node_modules
+COPY --chown=node:node --from=builder /app/packages/shared/package.json ./packages/shared/package.json
+COPY --chown=node:node --from=builder /app/packages/shared/dist ./packages/shared/dist
+COPY --chown=node:node --from=builder /app/apps/client-api/package.json ./apps/client-api/package.json
+COPY --chown=node:node --from=builder /app/apps/client-api/dist ./apps/client-api/dist
+COPY --chown=node:node --from=builder /app/apps/client-api/infra ./apps/client-api/infra
+USER node
 EXPOSE 9318 9319
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:9318/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.OPENLEASH_API_PORT||9318)+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 CMD ["node", "apps/client-api/dist/server.js"]
