@@ -1,7 +1,7 @@
 FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS builder
 WORKDIR /app
 RUN apk add --no-cache git
-ARG OPENLEASH_SHARED_REF=29cc636f8b75ee9e58ff52ed66d08f3787faf1ec
+ARG OPENLEASH_SHARED_REF=e50b233c25e600aac99488d9a7103063f7d99553
 RUN git clone https://github.com/open-leash/shared.git packages/shared \
     && git -C packages/shared checkout --detach "$OPENLEASH_SHARED_REF"
 COPY . apps/client-api

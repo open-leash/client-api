@@ -245,12 +245,14 @@ create table if not exists plugin_settings (
   plugin_id text not null,
   enabled boolean not null default true,
   config jsonb not null default '{}'::jsonb,
+  profiles jsonb not null default '[]'::jsonb,
   ordering_priority integer,
   installed_version text,
   update_policy text not null default 'manual',
   updated_at timestamptz not null default now(),
   primary key (organization_id, plugin_id),
-  constraint plugin_settings_update_policy_check check (update_policy in ('manual', 'patch', 'minor', 'locked'))
+  constraint plugin_settings_update_policy_check check (update_policy in ('manual', 'patch', 'minor', 'locked')),
+  constraint plugin_settings_profiles_array_check check (jsonb_typeof(profiles) = 'array')
 );
 
 create index if not exists plugin_settings_org_idx on plugin_settings(organization_id, plugin_id);
@@ -261,12 +263,14 @@ create table if not exists user_plugin_settings (
   plugin_id text not null,
   enabled boolean not null default true,
   config jsonb not null default '{}'::jsonb,
+  profiles jsonb not null default '[]'::jsonb,
   ordering_priority integer,
   installed_version text,
   update_policy text not null default 'manual',
   updated_at timestamptz not null default now(),
   primary key (user_id, plugin_id),
-  constraint user_plugin_settings_update_policy_check check (update_policy in ('manual', 'patch', 'minor', 'locked'))
+  constraint user_plugin_settings_update_policy_check check (update_policy in ('manual', 'patch', 'minor', 'locked')),
+  constraint user_plugin_settings_profiles_array_check check (jsonb_typeof(profiles) = 'array')
 );
 
 create index if not exists user_plugin_settings_org_idx on user_plugin_settings(organization_id, plugin_id);

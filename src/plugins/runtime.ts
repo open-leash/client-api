@@ -231,7 +231,10 @@ function enabledPluginsForEvent(
         plugin.executionEnvironment !== "cloud-only" ||
         isOpenLeashCloudRuntime(),
     )
-    .filter((plugin) => settings?.get(plugin.id)?.enabled ?? true)
+    .filter((plugin) => {
+      const state = settings?.get(plugin.id);
+      return (state?.enabled ?? true) && state?.runtimeAvailable !== false;
+    })
     .filter((plugin) => pluginSupportsAgent(plugin, agentKind))
     .map((plugin) => {
       const priority = settings?.get(plugin.id)?.orderingPriority;

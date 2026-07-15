@@ -37,6 +37,7 @@ import {
   type PipelineEvent,
   type PluginRunRecord,
   type PluginSignalRequest,
+  type PluginSettingProfile,
   type PluginSettingState,
   type PluginUsageRecordRequest,
   type Policy,
@@ -60,6 +61,7 @@ import { createPluginCapabilities } from "./plugins/capabilities.js";
 import { executeContainerPluginTool, transformWithContainerPlugins } from "./plugins/container-runtime.js";
 import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
 import { runSkillScanner } from "./plugins/skill-scanner/index.js";
+import { normalizePluginSettingProfiles, resolvePluginSettingProfiles } from "./plugins/settings-profiles.js";
 import type { PromptPipelineResult } from "./plugins/types.js";
 import {
   EXTERNAL_PROVIDER_IDS,
@@ -656,10 +658,12 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
     }
     const provider = String(req.body?.provider ?? "unknown").trim() || "unknown";
     const agentKind = String(req.body?.agentKind ?? "unknown").trim() || "unknown";
+    const agentId = optionalString(req.body?.agentId);
     const sessionId = String(req.body?.sessionId ?? "proxy").trim() || "proxy";
     const catalog = await pluginCatalogForOrganization(
       user.organization_id,
       user.id,
+      { agentKind, agentId },
     );
     const result = await transformWithContainerPlugins({
       plugins: catalog.plugins,
@@ -4285,6 +4289,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
     const runtimePlugins = await pluginSettingsForRuntime(
       organizationId,
       user.id,
+      String(body.agentKind ?? "unknown"),
     );
     const reasons = normalizeSkillReasons(body.reasons);
     const content =
@@ -5250,8 +5255,8 @@ async function handlePromptOnlyHook(
     await recordConversationEvent(request, user, intentKey);
   const containerRuns = await recordContainerRuntimeRuns({ request, organizationId, conversationEventId, userId: user.id, computerId, runtimeId });
   const [config, runtimePlugins, tenantModelKey, policies] = await Promise.all([
-    readPromptTransformConfig(organizationId, user.id),
-    pluginSettingsForRuntime(organizationId, user.id),
+    readPromptTransformConfig(organizationId, user.id, request.agent.kind, request.agent.instanceId ?? runtimeId),
+    pluginSettingsForRuntime(organizationId, user.id, request.agent.kind, request.agent.instanceId ?? runtimeId),
     tenantModelKeyForEvaluation(organizationId),
     pool.query<Policy>(
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
@@ -5404,6 +5409,8 @@ async function handlePromptOnlyHook(
 async function readPromptTransformConfig(
   organizationId: string,
   userId?: string,
+  agentKind?: string,
+  agentId?: string,
 ): Promise<PromptTransformConfig> {
   const row = await pool.query<{ config: unknown }>(
     "select config from prompt_transform_settings where organization_id = $1",
@@ -5425,7 +5432,7 @@ async function readPromptTransformConfig(
     const pluginPolicy = policy.get(pluginId);
     const configLocked = Boolean(pluginPolicy?.configLocked);
     if (!organizationStored && !userStored && !pluginPolicy) return undefined;
-    return {
+    return resolvePluginSettingProfiles({
       enabled: pluginPolicy?.mandatory
         ? true
         : (userStored?.enabled ??
@@ -5436,7 +5443,12 @@ async function readPromptTransformConfig(
         ...(organizationStored?.config ?? {}),
         ...(configLocked ? {} : (userStored?.config ?? {})),
       },
-    };
+      organizationProfiles: organizationStored?.profiles,
+      userProfiles: userStored?.profiles,
+      agentKind,
+      agentId,
+      configLocked,
+    });
   };
   const compression = effectiveTransformPlugin("openleash.prompt-compression");
   if (compression) {
@@ -5465,6 +5477,7 @@ type PluginSettingRecord = {
   pluginId: string;
   enabled: boolean;
   config: Record<string, unknown>;
+  profiles: PluginSettingProfile[];
   orderingPriority: number | null;
   installedVersion?: string;
   updatePolicy?: "manual" | "patch" | "minor" | "locked";
@@ -5487,11 +5500,12 @@ type MarketplacePolicyRecord = {
 async function pluginCatalogForOrganization(
   organizationId: string,
   userId?: string,
+  options: { agentKind?: string; agentId?: string } = {},
 ): Promise<{
   plugins: PluginCatalogItem[];
   marketplacePolicy: MarketplacePolicyRecord;
 }> {
-  const [settings, userSettings, policyRows] = await Promise.all([
+  const [settings, userSettings, policyRows, approvedReleaseRows] = await Promise.all([
     readPluginSettings(organizationId),
     userId
       ? readUserPluginSettings(organizationId, userId)
@@ -5502,7 +5516,16 @@ async function pluginCatalogForOrganization(
        where enabled = true
        order by created_at asc`,
     ),
+    pool.query(
+      `select * from plugin_releases where review_status = 'approved'`,
+    ),
   ]);
+  const approvedReleases = new Map<string, OpenLeashPluginManifest>(
+    approvedReleaseRows.rows.map((row) => {
+      const release = pluginReleaseFromRow(row);
+      return [`${release.pluginId}@${release.version}`, pluginManifestFromRelease(release)];
+    }),
+  );
   const policy = await readOrganizationPluginPolicy(organizationId);
   const marketplacePolicy =
     await readOrganizationMarketplacePolicy(organizationId);
@@ -5527,6 +5550,10 @@ async function pluginCatalogForOrganization(
           policy.get(pluginId),
           marketplacePolicy,
           policyRows.rows,
+          approvedReleases,
+          options.agentKind,
+          options.agentId,
+          Boolean(userId),
         );
       })
       .filter((item): item is PluginCatalogItem => Boolean(item)),
@@ -5541,8 +5568,12 @@ function pluginCatalogItem(
   policy?: PluginPolicyRecord,
   marketplacePolicy?: MarketplacePolicyRecord,
   fallbackPolicies: Policy[] = [],
+  approvedReleases: Map<string, OpenLeashPluginManifest> = new Map(),
+  agentKind?: string,
+  agentId?: string,
+  userScoped = false,
 ): PluginCatalogItem {
-  const enabled = policy?.mandatory
+  const baseEnabled = policy?.mandatory
     ? true
     : (userSettings?.enabled ??
       organizationSettings?.enabled ??
@@ -5552,27 +5583,54 @@ function pluginCatalogItem(
   const availableVersion = marketplace?.version ?? manifest.version;
   const installedVersion =
     userSettings?.installedVersion ??
-    organizationSettings?.installedVersion ??
-    (enabled ? availableVersion : undefined);
-  const effectiveConfig = {
+      organizationSettings?.installedVersion ??
+    (baseEnabled ? availableVersion : undefined);
+  const selectedRelease = installedVersion && installedVersion !== manifest.version
+    ? approvedReleases.get(`${manifest.id}@${installedVersion}`)
+    : undefined;
+  // In-process code only exists at the server's own version. Historical versions
+  // are executable only when their approved release points at an immutable image.
+  const executableRelease = selectedRelease?.runtime === "container" &&
+    selectedRelease.execution?.type === "container"
+    ? selectedRelease
+    : undefined;
+  const selectedManifest = executableRelease ?? manifest;
+  const runtimeAvailable = !installedVersion || installedVersion === manifest.version || Boolean(executableRelease);
+  const baseConfig = {
     ...(manifest.defaultConfig ?? {}),
     ...(organizationSettings?.config ?? {}),
     ...(configLocked ? {} : (userSettings?.config ?? {})),
   };
+  const organizationProfiles = organizationSettings?.profiles ?? [];
+  const userProfiles = configLocked ? [] : (userSettings?.profiles ?? []);
+  const resolved = resolvePluginSettingProfiles({
+    enabled: baseEnabled,
+    config: baseConfig,
+    organizationProfiles,
+    userProfiles,
+    agentKind,
+    agentId,
+    configLocked,
+  });
   if (
     manifest.id === "openleash.rules-enforcer" &&
-    normalizeRuleConfigs(effectiveConfig.rules).length === 0
+    normalizeRuleConfigs(resolved.config.rules).length === 0
   ) {
-    effectiveConfig.rules = policyRulesForConfig(fallbackPolicies);
+    resolved.config.rules = policyRulesForConfig(fallbackPolicies);
   }
   return {
-    ...manifest,
+    ...selectedManifest,
     slug: manifest.slug ?? marketplace?.slug,
     repositoryUrl: manifest.repositoryUrl ?? marketplace?.repositoryUrl,
     marketplace,
     settings: {
-      enabled,
-      config: effectiveConfig,
+      enabled: resolved.enabled,
+      config: resolved.config,
+      profiles: userScoped ? userProfiles : organizationProfiles,
+      inheritedProfiles: userScoped ? organizationProfiles : [],
+      effectiveProfileIds: resolved.effectiveProfileIds,
+      runtimeAvailable,
+      ...(runtimeAvailable ? {} : { runtimeError: `Installed plugin version ${installedVersion} has no approved executable release.` }),
       orderingPriority:
         userSettings?.orderingPriority ??
         organizationSettings?.orderingPriority ??
@@ -5581,7 +5639,7 @@ function pluginCatalogItem(
       installedVersion,
       availableVersion,
       updateAvailable: Boolean(
-        enabled && installedVersion && installedVersion !== availableVersion,
+        baseEnabled && installedVersion && installedVersion !== availableVersion,
       ),
       updatePolicy:
         userSettings?.updatePolicy ??
@@ -5602,6 +5660,28 @@ function pluginCatalogItem(
   };
 }
 
+function pluginManifestFromRelease(release: ReturnType<typeof pluginReleaseFromRow>): OpenLeashPluginManifest {
+  return {
+    id: release.pluginId,
+    slug: release.slug,
+    name: release.name,
+    description: release.description,
+    repositoryUrl: release.repositoryUrl,
+    version: release.version,
+    publisher: release.publisher,
+    runtime: release.runtime as OpenLeashPluginManifest["runtime"],
+    execution: release.execution as OpenLeashPluginManifest["execution"],
+    entrypoint: release.entrypoint,
+    events: release.events as OpenLeashPluginManifest["events"],
+    permissions: release.permissions as OpenLeashPluginManifest["permissions"],
+    effects: release.effects as OpenLeashPluginManifest["effects"],
+    ordering: release.ordering as OpenLeashPluginManifest["ordering"],
+    configSchema: release.configSchema as OpenLeashPluginManifest["configSchema"],
+    defaultConfig: release.defaultConfig,
+    tags: release.tags,
+  };
+}
+
 async function savePluginSettingsForOrganization(
   organizationId: string,
   pluginId: string,
@@ -5612,6 +5692,7 @@ async function savePluginSettingsForOrganization(
   const policy = (await readOrganizationPluginPolicy(organizationId)).get(
     pluginId,
   );
+  const currentSettings = (await readPluginSettings(organizationId)).get(pluginId);
   const enabled = policy?.mandatory
     ? true
     : typeof body.enabled === "boolean"
@@ -5629,23 +5710,28 @@ async function savePluginSettingsForOrganization(
   const requestedInstalledVersion = optionalString(body.installedVersion);
   const availableVersion = manifest.version;
   const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
+  const profiles = Array.isArray(body.profiles)
+    ? normalizePluginSettingProfiles(body.profiles)
+    : (currentSettings?.profiles ?? []);
   const result = await pool.query(
-    `insert into plugin_settings (organization_id, plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at)
-     values ($1, $2, $3, $4::jsonb, $5, coalesce($6, $8), coalesce($7, 'manual'), now())
+    `insert into plugin_settings (organization_id, plugin_id, enabled, config, profiles, ordering_priority, installed_version, update_policy, updated_at)
+     values ($1, $2, $3, $4::jsonb, $5::jsonb, $6, coalesce($7, $9), coalesce($8, 'manual'), now())
      on conflict (organization_id, plugin_id) do update set
        enabled = excluded.enabled,
        config = excluded.config,
+       profiles = excluded.profiles,
        ordering_priority = excluded.ordering_priority,
-       installed_version = coalesce($6, plugin_settings.installed_version, excluded.installed_version),
-       update_policy = coalesce($7, plugin_settings.update_policy, 'manual'),
+       installed_version = coalesce($7, plugin_settings.installed_version, excluded.installed_version),
+       update_policy = coalesce($8, plugin_settings.update_policy, 'manual'),
        updated_at = now()
-     returning plugin_id, enabled, config, ordering_priority as "orderingPriority",
+     returning plugin_id, enabled, config, profiles, ordering_priority as "orderingPriority",
                installed_version as "installedVersion", update_policy as "updatePolicy", updated_at`,
     [
       organizationId,
       manifest.id,
       enabled,
       JSON.stringify(config),
+      JSON.stringify(profiles),
       orderingPriority,
       requestedInstalledVersion,
       updatePolicy,
@@ -5663,10 +5749,11 @@ async function savePluginSettingsForUser(
 ) {
   const manifest = await manifestForPluginId(pluginId, body.marketplace);
   if (!manifest) return undefined;
-  const [policy, marketplacePolicy, organizationSettings] = await Promise.all([
+  const [policy, marketplacePolicy, organizationSettings, currentUserSettings] = await Promise.all([
     readOrganizationPluginPolicy(organizationId),
     readOrganizationMarketplacePolicy(organizationId),
     readPluginSettings(organizationId),
+    readUserPluginSettings(organizationId, userId),
   ]);
   const pluginPolicy = policy.get(manifest.id);
   if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false)
@@ -5701,26 +5788,31 @@ async function savePluginSettingsForUser(
   const requestedInstalledVersion = optionalString(body.installedVersion);
   const availableVersion = manifest.version;
   const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
+  const profiles = Array.isArray(body.profiles)
+    ? normalizePluginSettingProfiles(body.profiles)
+    : (currentUserSettings.get(manifest.id)?.profiles ?? []);
   const result = await pool.query<{
     plugin_id: string;
     enabled: boolean;
     config: Record<string, unknown>;
+    profiles: PluginSettingProfile[];
     orderingPriority: number | null;
     installedVersion: string | null;
     updatePolicy: "manual" | "patch" | "minor" | "locked";
     updated_at: string;
   }>(
-    `insert into user_plugin_settings (user_id, organization_id, plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at)
-     values ($1, $2, $3, $4, $5::jsonb, $6, coalesce($7, $9), coalesce($8, 'manual'), now())
+    `insert into user_plugin_settings (user_id, organization_id, plugin_id, enabled, config, profiles, ordering_priority, installed_version, update_policy, updated_at)
+     values ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, coalesce($8, $10), coalesce($9, 'manual'), now())
      on conflict (user_id, plugin_id) do update set
        organization_id = excluded.organization_id,
        enabled = excluded.enabled,
        config = excluded.config,
+       profiles = excluded.profiles,
        ordering_priority = excluded.ordering_priority,
-       installed_version = coalesce($7, user_plugin_settings.installed_version, excluded.installed_version),
-       update_policy = coalesce($8, user_plugin_settings.update_policy, 'manual'),
+       installed_version = coalesce($8, user_plugin_settings.installed_version, excluded.installed_version),
+       update_policy = coalesce($9, user_plugin_settings.update_policy, 'manual'),
        updated_at = now()
-     returning plugin_id, enabled, config, ordering_priority as "orderingPriority",
+     returning plugin_id, enabled, config, profiles, ordering_priority as "orderingPriority",
                installed_version as "installedVersion", update_policy as "updatePolicy", updated_at`,
     [
       userId,
@@ -5728,6 +5820,7 @@ async function savePluginSettingsForUser(
       manifest.id,
       enabled,
       JSON.stringify(config),
+      JSON.stringify(profiles),
       orderingPriority,
       requestedInstalledVersion,
       updatePolicy,
@@ -5744,6 +5837,7 @@ async function savePluginSettingsForUser(
         pluginId: manifest.id,
         enabled: stored.enabled,
         config: stored.config ?? {},
+        profiles: normalizePluginSettingProfiles(stored.profiles),
         orderingPriority: stored.orderingPriority,
         installedVersion: stored.installedVersion ?? undefined,
         updatePolicy: stored.updatePolicy,
@@ -5752,6 +5846,11 @@ async function savePluginSettingsForUser(
       undefined,
       pluginPolicy,
       marketplacePolicy,
+      [],
+      new Map(),
+      undefined,
+      undefined,
+      true,
     ).settings,
   };
 }
@@ -6888,12 +6987,13 @@ async function readPluginSettings(organizationId: string) {
     plugin_id: string;
     enabled: boolean;
     config: Record<string, unknown>;
+    profiles: PluginSettingProfile[];
     ordering_priority: number | null;
     installed_version: string | null;
     update_policy: "manual" | "patch" | "minor" | "locked";
     updated_at: string;
   }>(
-    `select plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at
+    `select plugin_id, enabled, config, profiles, ordering_priority, installed_version, update_policy, updated_at
      from plugin_settings
      where organization_id = $1`,
     [organizationId],
@@ -6906,6 +7006,7 @@ async function readPluginSettings(organizationId: string) {
           pluginId: row.plugin_id,
           enabled: row.enabled,
           config: row.config ?? {},
+          profiles: normalizePluginSettingProfiles(row.profiles),
           orderingPriority: row.ordering_priority,
           installedVersion: row.installed_version ?? undefined,
           updatePolicy: row.update_policy ?? "manual",
@@ -6921,12 +7022,13 @@ async function readUserPluginSettings(organizationId: string, userId: string) {
     plugin_id: string;
     enabled: boolean;
     config: Record<string, unknown>;
+    profiles: PluginSettingProfile[];
     ordering_priority: number | null;
     installed_version: string | null;
     update_policy: "manual" | "patch" | "minor" | "locked";
     updated_at: string;
   }>(
-    `select plugin_id, enabled, config, ordering_priority, installed_version, update_policy, updated_at
+    `select plugin_id, enabled, config, profiles, ordering_priority, installed_version, update_policy, updated_at
      from user_plugin_settings
      where organization_id = $1 and user_id = $2`,
     [organizationId, userId],
@@ -6939,6 +7041,7 @@ async function readUserPluginSettings(organizationId: string, userId: string) {
           pluginId: row.plugin_id,
           enabled: row.enabled,
           config: row.config ?? {},
+          profiles: normalizePluginSettingProfiles(row.profiles),
           orderingPriority: row.ordering_priority,
           installedVersion: row.installed_version ?? undefined,
           updatePolicy: row.update_policy ?? "manual",
@@ -6967,43 +7070,16 @@ function withLegacyRulesEnforcerSetting(
 async function pluginSettingsForRuntime(
   organizationId: string,
   userId?: string,
+  agentKind?: string,
+  agentId?: string,
 ) {
-  const [settings, userSettings, policy] = await Promise.all([
-    readPluginSettings(organizationId),
-    userId
-      ? readUserPluginSettings(organizationId, userId)
-      : Promise.resolve(new Map<string, PluginSettingRecord>()),
-    readOrganizationPluginPolicy(organizationId),
-  ]);
-  return new Map(
-    firstPartyPluginManifests.map((manifest) => {
-      const organizationStored = settings.get(manifest.id);
-      const userStored = userSettings.get(manifest.id);
-      const pluginPolicy = policy.get(manifest.id);
-      const configLocked = Boolean(pluginPolicy?.configLocked);
-      return [
-        manifest.id,
-        {
-          enabled: pluginPolicy?.mandatory
-            ? true
-            : (userStored?.enabled ??
-              organizationStored?.enabled ??
-              pluginPolicy?.defaultEnabled ??
-              false),
-          config: {
-            ...(manifest.defaultConfig ?? {}),
-            ...(organizationStored?.config ?? {}),
-            ...(configLocked ? {} : (userStored?.config ?? {})),
-          },
-          orderingPriority:
-            userStored?.orderingPriority ??
-            organizationStored?.orderingPriority ??
-            manifest.ordering?.priority ??
-            null,
-          updatedAt: userStored?.updatedAt ?? organizationStored?.updatedAt,
-        },
-      ];
-    }),
+  const { plugins } = await pluginCatalogForOrganization(
+    organizationId,
+    userId,
+    { agentKind, agentId },
+  );
+  return new Map<string, PluginSettingState>(
+    plugins.map((plugin) => [plugin.id, plugin.settings]),
   );
 }
 
@@ -7094,7 +7170,7 @@ async function recordContainerRuntimeRuns(input: {
     ? input.request.event.raw as Record<string, unknown>
     : {};
   const sourceRuns = Array.isArray(raw.containerPluginRuns) ? raw.containerPluginRuns : [];
-  const runtimeSettings = await pluginSettingsForRuntime(input.organizationId, input.userId);
+  const runtimeSettings = await pluginSettingsForRuntime(input.organizationId, input.userId, input.request.agent.kind, input.request.agent.instanceId ?? input.runtimeId);
   const runs: PluginRunRecord[] = [];
   for (const value of sourceRuns.slice(0, 32)) {
     if (!value || typeof value !== "object") continue;
@@ -7354,6 +7430,8 @@ async function evaluateAndRecord(
   const runtimePlugins = await pluginSettingsForRuntime(
     organizationId,
     user.id,
+    request.agent.kind,
+    request.agent.instanceId ?? runtimeId,
   );
   const policies = await pool.query<Policy>(
     `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked

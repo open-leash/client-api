@@ -27,6 +27,10 @@ export type ContainerTransformRequest = {
     agentKind: string;
     sessionId: string;
   };
+  settings: {
+    profileIds: string[];
+    configHash: string;
+  };
   config: Record<string, unknown>;
   payload: unknown;
 };
@@ -83,6 +87,7 @@ export async function executeContainerPluginTool(input: {
     tenant: { organizationId: input.organizationId, userId: input.userId },
     event: "plugin.tool.execute",
     context: { sessionId: input.sessionId },
+    settings: settingsContext(input.plugin.settings),
     config: input.plugin.settings.config,
     tool: input.tool,
     arguments: input.arguments,
@@ -161,6 +166,7 @@ export async function transformWithContainerPlugins(input: {
           agentKind: input.agentKind,
           sessionId: input.sessionId,
         },
+        settings: settingsContext(plugin.settings),
         config: plugin.settings.config,
         payload,
       };
@@ -219,9 +225,17 @@ export function applyValidatedProviderPatches(
 function isEnabledContainerPlugin(plugin: PluginCatalogItem) {
   return Boolean(
     plugin.settings.enabled &&
+      plugin.settings.runtimeAvailable !== false &&
       plugin.execution?.type === "container" &&
       plugin.events.includes("provider.request.beforeSend"),
   );
+}
+
+function settingsContext(settings: PluginCatalogItem["settings"]) {
+  return {
+    profileIds: settings.effectiveProfileIds ?? [],
+    configHash: crypto.createHash("sha256").update(JSON.stringify(settings.config)).digest("hex"),
+  };
 }
 
 async function invokeContainerPlugin(input: {
