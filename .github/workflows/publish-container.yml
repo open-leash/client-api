@@ -56,7 +56,7 @@ jobs:
           load: true
           tags: openleash/client-api:scan
       - name: Scan release image
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: openleash/client-api:scan
           scanners: vuln
@@ -72,4 +72,3 @@ jobs:
           provenance: mode=max
           sbom: true
           tags: ghcr.io/open-leash/client-api:${{ steps.version.outputs.value }}
-
