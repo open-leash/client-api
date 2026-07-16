@@ -593,7 +593,10 @@ app.post("/v1/agent-events", async (req, res, next) => {
       envelope.request.event.raw,
       envelope,
     );
-    const evaluation = (async (): Promise<NormalizedEventDecision> => {
+    const evaluation = deduplicateConcurrentNormalizedEvent(
+      user.id,
+      envelope.idempotencyKey,
+      async (): Promise<NormalizedEventDecision> => {
       if (source === "local_proxy" && isPromptOnlyHook(envelope.request)) {
         return handlePromptOnlyHook(
           request.agent.kind as HookAgentSlug,
@@ -608,7 +611,8 @@ app.post("/v1/agent-events", async (req, res, next) => {
         source === "local_proxy" &&
         Boolean((request.event.raw as { gated?: unknown } | undefined)?.gated);
       return gatedResponse ? waitForHookDecision(user, decision) : decision;
-    })();
+      },
+    );
     inflightNormalizedEvents.set(inflightKey, evaluation);
     try {
       const result = await evaluation;
@@ -790,11 +794,10 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
     }
     request.event.raw = attachEventEnvelope(request.event.raw, hookEnvelope);
     if (isPromptOnlyHook(request)) {
-      const transformed = await handlePromptOnlyHook(
-        agent,
-        eventName,
-        request,
-        user,
+      const transformed = await deduplicateConcurrentNormalizedEvent(
+        user.id,
+        hookEnvelope.idempotencyKey,
+        () => handlePromptOnlyHook(agent, eventName, request, user),
       );
       await writePipelineTrace("pipeline.final_hook", {
         traceId: hookEnvelope.idempotencyKey,
@@ -806,7 +809,11 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
       });
       return res.json(transformed);
     }
-    const decision = await evaluateAndRecord(request, user);
+    const decision = await deduplicateConcurrentNormalizedEvent(
+      user.id,
+      hookEnvelope.idempotencyKey,
+      () => evaluateAndRecord(request, user),
+    );
     const resolvedDecision = await waitForHookDecision(user, decision);
     await writePipelineTrace("pipeline.final_hook", {
       traceId: hookEnvelope.idempotencyKey,
@@ -7912,6 +7919,31 @@ async function existingNormalizedEvent(userId: string, key: string) {
     [userId, key],
   );
   return row.rows[0] as EvaluationResponse | undefined;
+}
+
+async function deduplicateConcurrentNormalizedEvent<T extends NormalizedEventDecision>(
+  userId: string,
+  idempotencyKey: string,
+  evaluate: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await evaluate();
+  } catch (error) {
+    if (!isConversationEventIdempotencyConflict(error)) throw error;
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const existing = await existingNormalizedEvent(userId, idempotencyKey);
+      if (existing) return existing as T;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw error;
+  }
+}
+
+function isConversationEventIdempotencyConflict(error: unknown) {
+  const postgresError = error as { code?: string; constraint?: string };
+  return postgresError?.code === "23505" &&
+    postgresError.constraint === "conversation_events_user_idempotency_key_uidx";
 }
 
 async function recordMcpToolCall({
