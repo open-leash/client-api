@@ -115,6 +115,13 @@ python3 migrate.py --target custom --database-url 'postgres://...' --scope core 
 
 Operators should run migrations as a one-shot deployment job, not as API startup logic. Migrations are tracked in `schema_migrations` with checksums and timestamps. Never edit an applied migration; add a new forward migration that performs all needed schema and data changes.
 
+For production, use separate database roles:
+
+- `openleash_ops` is the schema owner and migration/admin login. Operators may use it from tools such as DBeaver.
+- `openleash` is the API runtime login. It receives table, sequence, and routine privileges, but normal API processes do not need schema ownership.
+
+Run production migrations with the `openleash_ops` connection string. Migration `0032_database_role_contract` establishes default privileges so objects created by later migrations are immediately usable by `openleash` without one-off grants. Keep the runtime and operations connection strings in separate secrets.
+
 ---
 
 ## 🧠 BYOK and evaluation
