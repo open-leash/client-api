@@ -48,6 +48,7 @@ import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
 import { summarizeActionPurpose } from "./evaluator.js";
 import { pluginIconText } from "./plugin-icons.js";
 import { normalizePluginIconInput } from "./plugin-icon-input.js";
+import { notificationPluginAttribution } from "./notification-plugin-attribution.js";
 import {
   defaultPromptTransformConfig,
   normalizePromptTransformConfig,
@@ -9611,35 +9612,6 @@ async function enrichMobileApproval(row: {
     ),
     recent_context: approvalRecentContext(payloadWithContext),
   };
-}
-
-function notificationPluginAttribution(payload: unknown) {
-  if (!payload || typeof payload !== "object")
-    return { plugin_id: "openleash.core", plugin_name: "OpenLeash core" };
-  const runs = Array.isArray(
-    (payload as { openleashPluginRuns?: unknown }).openleashPluginRuns,
-  )
-    ? (payload as { openleashPluginRuns: Array<Record<string, unknown>> })
-        .openleashPluginRuns
-    : [];
-  const responsible = runs.find((run) =>
-    ["blocked", "needs_question", "failed"].includes(
-      String(run.status ?? "").toLowerCase(),
-    ),
-  );
-  if (!responsible)
-    return { plugin_id: "openleash.core", plugin_name: "OpenLeash core" };
-  const pluginId = String(
-    responsible?.pluginId ?? responsible?.plugin_id ?? "openleash.core",
-  );
-  return { plugin_id: pluginId, plugin_name: pluginPackageSlug(pluginId) };
-}
-
-function pluginPackageSlug(pluginId: string) {
-  const slug = pluginId.replace(/^openleash\./, "");
-  return slug === "prompt-compression"
-    ? "token-saver"
-    : slug || "openleash-core";
 }
 
 async function approvalPurposeSummary(row: {
