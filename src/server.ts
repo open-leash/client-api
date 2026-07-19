@@ -103,6 +103,11 @@ import {
   OBSERVATION_ONLY_CAPABILITIES,
 } from "./agent-events.js";
 import { agentInteractionForRequest } from "./agent-interactions.js";
+import {
+  canonicalIntentKey,
+  handledIntentKeysMatch,
+  isReusableHandledIntent,
+} from "./intent-dedupe.js";
 
 class HttpError extends Error {
   constructor(
@@ -5275,6 +5280,25 @@ async function handlePromptOnlyHook(
   responseFormat: "native" | "proxy" = "native",
 ) {
   const intentKey = triggerIntentKey(request);
+  const handledIntent = intentKey
+    ? await findRecentHandledIntent(user.id, request, intentKey)
+    : undefined;
+  if (handledIntent) {
+    const reused: EvaluationResponse = {
+      decision: handledIntent.resolution ?? handledIntent.decision,
+      decisionId: handledIntent.id,
+      summary: handledIntent.summary,
+      question: handledIntent.resolution
+        ? undefined
+        : (handledIntent.question ?? undefined),
+      results: [],
+    };
+    const resolved = await waitForHookDecision(user, reused);
+    if (responseFormat === "proxy") {
+      return { ...resolved, finalPrompt: request.event.prompt };
+    }
+    return nativeHookDecision(agent, eventName, resolved);
+  }
   const { conversationEventId, computerId, runtimeId, organizationId } =
     await recordConversationEvent(request, user, intentKey);
   const containerRuns = await recordContainerRuntimeRuns({ request, organizationId, conversationEventId, userId: user.id, computerId, runtimeId });
@@ -8152,7 +8176,6 @@ async function findRecentHandledIntent(
   intentKey: string,
 ) {
   const sessionScoped = !isSessionlessIntentKey(intentKey);
-  const canonicalKey = canonicalIntentKey(intentKey);
   const result = await pool.query<{
     id: string;
     decision: "allow" | "ask" | "deny";
@@ -8160,16 +8183,18 @@ async function findRecentHandledIntent(
     summary: string;
     question: string | null;
     intent_key: string | null;
+    event_name: string;
   }>(
-    `select e.id, e.decision, e.resolution, e.summary, e.question, ce.payload->'raw'->>'openleashIntentKey' as intent_key
+    `select e.id, e.decision, e.resolution, e.summary, e.question,
+            ce.event_name, ce.payload->'raw'->>'openleashIntentKey' as intent_key
      from evaluations e
      join conversation_events ce on ce.id = e.conversation_event_id
      join agent_runtimes ar on ar.id = ce.agent_runtime_id
      where e.user_id = $1
        and ar.kind = $2
-       and ce.event_name <> 'UserPromptSubmit'
+       and (ce.event_name <> 'UserPromptSubmit' or e.decision = 'ask')
        and ($6::boolean = false or ce.session_id = $3)
-       and coalesce(ce.project_path, '') = $4
+       and ($6::boolean = false or coalesce(ce.project_path, '') = $4)
        and ($6::boolean = false or ce.payload->'raw'->>'openleashIntentKey' = $5)
        and e.created_at > now() - interval '5 minutes'
      order by e.created_at desc
@@ -8183,9 +8208,16 @@ async function findRecentHandledIntent(
       sessionScoped,
     ],
   );
-  if (sessionScoped) return result.rows[0];
-  return result.rows.find(
-    (row) => canonicalIntentKey(row.intent_key) === canonicalKey,
+  const reusable = result.rows.filter((row) =>
+    isReusableHandledIntent({
+      eventName: row.event_name,
+      decision: row.decision,
+      intentKey: row.intent_key,
+    }),
+  );
+  if (sessionScoped) return reusable[0];
+  return reusable.find(
+    (row) => handledIntentKeysMatch(row.intent_key, intentKey),
   );
 }
 
@@ -8211,18 +8243,6 @@ function triggerIntentKey(request: EvaluationRequest) {
 
 function isSessionlessIntentKey(intentKey: string) {
   return intentKey.includes("|credential-");
-}
-
-function canonicalIntentKey(intentKey?: string | null) {
-  if (!intentKey) return undefined;
-  const parts = intentKey.split("|");
-  if (parts.length === 4 && parts[2]?.startsWith("credential-")) {
-    return [parts[0], parts[1], "credential", parts[3]].join("|");
-  }
-  if (parts.length === 5 && parts[3]?.startsWith("credential-")) {
-    return [parts[0], parts[2], "credential", parts[4]].join("|");
-  }
-  return intentKey;
 }
 
 function intentCategory(request: EvaluationRequest) {
