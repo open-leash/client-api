@@ -58,6 +58,21 @@ mobile-client
 - Apply Postgres migrations safely through `schema_migrations`
 - Provide extension points for hosted/private wrappers
 
+### Attention interaction contract
+
+`GET /v1/client/notifications` includes versioned `attentionEvents` for pending
+approvals, native questions, plan reviews, blocked actions, and completed
+turns. Desktop and mobile resolve the same durable decision through the client
+or mobile decision endpoint. An allow resolution may include a bounded,
+structured `response`; the waiting hook receives that payload and the agent
+adapter translates it into the agent's native answer format.
+
+This path is deliberately backend-owned. Individual Open Source uses its local
+`client-api` and Postgres, Private Cloud uses the customer-hosted service, and
+OpenLeash Cloud uses the same public API through its thin cloud wrapper. The
+desktop local server mirrors the contract only for setup, development, and
+legacy relay behavior; it is not a separate product backend.
+
 ---
 
 ## 🔌 Plugin architecture

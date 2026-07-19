@@ -220,6 +220,7 @@ create table if not exists evaluations (
   decision text not null,
   resolution text,
   resolution_guidance text,
+  resolution_payload jsonb,
   resolved_at timestamptz,
   resolved_by text,
   summary text not null,
@@ -229,6 +230,7 @@ create table if not exists evaluations (
 );
 
 alter table evaluations add column if not exists resolution_guidance text;
+alter table evaluations add column if not exists resolution_payload jsonb;
 
 alter table evaluations add column if not exists resolution text;
 alter table evaluations add column if not exists resolved_at timestamptz;

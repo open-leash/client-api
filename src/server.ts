@@ -102,6 +102,7 @@ import {
   normalizeAgentEvent,
   OBSERVATION_ONLY_CAPABILITIES,
 } from "./agent-events.js";
+import { agentInteractionForRequest } from "./agent-interactions.js";
 
 class HttpError extends Error {
   constructor(
@@ -3397,6 +3398,7 @@ app.post("/v1/mobile/decisions/:id/resolve", async (req, res, next) => {
         userId: session.user.id,
       },
       body.resolutionGuidance,
+      body.response,
     );
     if (!result) return res.status(404).json({ error: "approval not found" });
     res.json(result);
@@ -3425,6 +3427,11 @@ app.get("/v1/client/notifications", async (req, res, next) => {
         ...notificationPluginAttribution(row.payload),
       })),
       recentActivity: activity.rows,
+      attentionEvents: buildAttentionEvents({
+        pending: pending.rows,
+        blocked: blocked.rows,
+        activity: activity.rows,
+      }),
     });
   } catch (error) {
     next(error);
@@ -3448,6 +3455,7 @@ app.post("/v1/client/decisions/:id/resolve", async (req, res, next) => {
         userId: session.user.id,
       },
       body.resolutionGuidance,
+      body.response,
     );
     if (!result) return res.status(404).json({ error: "approval not found" });
     res.json(result);
@@ -3462,6 +3470,7 @@ async function resolveApprovalGroup(
   resolvedBy: string,
   scope: { organizationId?: string; userId?: string } = {},
   resolutionGuidance?: string,
+  responsePayload?: Record<string, unknown>,
 ) {
   const client = await pool.connect();
   try {
@@ -3498,19 +3507,25 @@ async function resolveApprovalGroup(
       resolution === "deny"
         ? cleanResolutionGuidance(resolutionGuidance)
         : undefined;
+    const response =
+      resolution === "allow"
+        ? cleanInteractionResponse(responsePayload)
+        : undefined;
     const result = await client.query(
       `update evaluations
-       set resolution = $2, resolved_at = now(), resolved_by = $3, resolution_guidance = $4
+       set resolution = $2, resolved_at = now(), resolved_by = $3,
+           resolution_guidance = $4, resolution_payload = $5
        where id = $1
          and decision = 'ask'
          and resolution is null
-       returning id, decision, resolution, resolution_guidance, resolved_at`,
-      [id, resolution, resolvedBy, guidance ?? null],
+       returning id, decision, resolution, resolution_guidance, resolution_payload, resolved_at`,
+      [id, resolution, resolvedBy, guidance ?? null, response ?? null],
     );
     if (row.intent_key) {
       await client.query(
         `update evaluations e
-         set resolution = $2, resolved_at = now(), resolved_by = $3, resolution_guidance = $7
+         set resolution = $2, resolved_at = now(), resolved_by = $3,
+             resolution_guidance = $7, resolution_payload = $8
          from conversation_events ce
          where ce.id = e.conversation_event_id
            and e.id <> $1
@@ -3533,6 +3548,7 @@ async function resolveApprovalGroup(
           scope.userId ?? null,
           scope.organizationId ?? null,
           guidance ?? null,
+          response ?? null,
         ],
       );
       const candidates = await client.query<{
@@ -3565,9 +3581,10 @@ async function resolveApprovalGroup(
       if (duplicateIds.length > 0) {
         await client.query(
           `update evaluations
-           set resolution = $2, resolved_at = now(), resolved_by = $3, resolution_guidance = $4
+           set resolution = $2, resolved_at = now(), resolved_by = $3,
+               resolution_guidance = $4, resolution_payload = $5
            where id = any($1::uuid[])`,
-          [duplicateIds, resolution, resolvedBy, guidance ?? null],
+          [duplicateIds, resolution, resolvedBy, guidance ?? null, response ?? null],
         );
       }
     }
@@ -7471,18 +7488,25 @@ async function evaluateAndRecord(
   const results = approvalDeferred
     ? deferPromptOnlyPolicyResults(actionedResults)
     : actionedResults;
+  const nativeInteraction = agentInteractionForRequest(request);
   const decision = results.some((r) => r.status === "failed")
     ? "deny"
+    : nativeInteraction
+      ? "ask"
     : results.some((r) => r.status === "needs_question")
       ? "ask"
       : "allow";
   const blockingResult = results.find((r) => r.status === "failed");
   const approvalSummary = blockingResult
     ? summarizeBlockedAction(request, blockingResult.policyName)
+    : nativeInteraction?.summary
+      ? nativeInteraction.summary
     : (results.find((r) => r.status === "needs_question")?.explanation ??
       "OpenLeash needs a human decision before continuing.");
   const question = blockingResult
     ? `${approvalSummary} Allow this action once?`
+    : nativeInteraction?.question
+      ? nativeInteraction.question
     : (results.find((r) => r.status === "needs_question")?.question ??
       (decision === "ask"
         ? `${request.agent.displayName} needs approval for ${request.event.tool?.name ?? request.event.eventName}. Allow it?`
@@ -7588,7 +7612,9 @@ async function evaluateAndRecord(
   ]);
   let purposeSummary: string | undefined;
   if (decision === "ask") {
-    purposeSummary = await summarizeActionPurpose(request, tenantModelKey);
+    purposeSummary =
+      nativeInteraction?.purpose ??
+      (await summarizeActionPurpose(request, tenantModelKey));
     await pool.query(
       `update conversation_events
        set payload = payload || $2::jsonb
@@ -8051,9 +8077,10 @@ async function waitForHookDecision(
     const result = await pool.query<{
       resolution: "allow" | "deny" | null;
       resolution_guidance: string | null;
+      resolution_payload: Record<string, unknown> | null;
       summary: string | null;
     }>(
-      `select resolution, resolution_guidance, summary
+      `select resolution, resolution_guidance, resolution_payload, summary
        from evaluations
        where id = $1 and user_id = $2`,
       [decision.decisionId, user.id],
@@ -8070,6 +8097,10 @@ async function waitForHookDecision(
         resolutionGuidance:
           row.resolution === "deny"
             ? (row.resolution_guidance ?? undefined)
+            : undefined,
+        resolutionPayload:
+          row.resolution === "allow"
+            ? (row.resolution_payload ?? undefined)
             : undefined,
         question: undefined,
       };
@@ -10148,6 +10179,168 @@ function browserBlockedNotifications(organizationId: string, userId: string) {
   );
 }
 
+function buildAttentionEvents(input: {
+  pending: Array<Record<string, any>>;
+  blocked: Array<Record<string, any>>;
+  activity: Array<Record<string, any>>;
+}) {
+  const pending = input.pending.map((row) => attentionEventForPending(row));
+  const blocked = input.blocked.map((row) => ({
+    schemaVersion: "2026-07-19.v1",
+    id: `blocked:${row.id}`,
+    kind: "blocked",
+    state: "resolved",
+    title: `${row.agent_name ?? "Agent"} was blocked`,
+    body: row.summary ?? "OpenLeash blocked an agent action.",
+    createdAt: isoValue(row.created_at),
+    agent: attentionAgent(row),
+    session: attentionSession(row),
+  }));
+  const completions = input.activity
+    .filter((row) =>
+      ["Stop", "SessionEnd", "SubagentStop"].includes(
+        String(row.event_name ?? ""),
+      ),
+    )
+    .map((row) => ({
+      schemaVersion: "2026-07-19.v1",
+      id: `completed:${row.id}`,
+      kind: row.event_name === "SubagentStop" ? "subagent_completed" : "completed",
+      state: "resolved",
+      title: `${row.agent_name ?? "Agent"} finished`,
+      body:
+        eventPrompt(row.payload) ??
+        row.summary ??
+        "The agent finished its latest turn.",
+      createdAt: isoValue(row.created_at),
+      agent: attentionAgent(row),
+      session: attentionSession(row),
+    }));
+  const seen = new Set<string>();
+  return [...pending, ...blocked, ...completions].filter((event) => {
+    if (seen.has(event.id)) return false;
+    seen.add(event.id);
+    return true;
+  });
+}
+
+function attentionEventForPending(row: Record<string, any>) {
+  const toolName = String(row.tool_name ?? "");
+  const event = eventRecord(row.payload);
+  const toolInput = event?.tool?.input;
+  const kind = /^AskUserQuestion$/i.test(toolName)
+    ? "question"
+    : /^ExitPlanMode$/i.test(toolName)
+      ? "plan_review"
+      : "approval";
+  return {
+    schemaVersion: "2026-07-19.v1",
+    id: `pending:${row.id}`,
+    decisionId: row.id,
+    kind,
+    state: "waiting",
+    title:
+      kind === "question"
+        ? `${row.agent_name ?? "Agent"} asks`
+        : kind === "plan_review"
+          ? `${row.agent_name ?? "Agent"} has a plan`
+          : `Allow ${row.agent_name ?? "agent"}?`,
+    body: row.summary ?? row.question ?? "An agent is waiting for you.",
+    createdAt: isoValue(row.created_at),
+    agent: attentionAgent(row),
+    session: attentionSession(row),
+    interaction:
+      kind === "question"
+        ? { type: "questions", questions: normalizeAttentionQuestions(toolInput) }
+        : kind === "plan_review"
+          ? {
+              type: "plan",
+              markdown: planMarkdown(toolInput, event?.raw),
+              originalInput:
+                toolInput && typeof toolInput === "object" ? toolInput : {},
+            }
+          : { type: "approval" },
+  };
+}
+
+function attentionAgent(row: Record<string, any>) {
+  return {
+    kind: String(row.agent_kind ?? "unknown"),
+    name: String(row.agent_name ?? "AI agent"),
+    hostname: String(row.hostname ?? "cloud"),
+  };
+}
+
+function attentionSession(row: Record<string, any>) {
+  const event = eventRecord(row.payload);
+  return {
+    id: String(event?.sessionId ?? event?.raw?.session_id ?? "unknown"),
+    projectPath: row.project_path ?? event?.projectPath ?? undefined,
+  };
+}
+
+function eventRecord(value: unknown): Record<string, any> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, any>)
+    : undefined;
+}
+
+function eventPrompt(value: unknown) {
+  const event = eventRecord(value);
+  const prompt = firstString(
+    event?.prompt,
+    event?.raw?.last_assistant_message,
+    event?.raw?.prompt_response,
+    event?.raw?.message,
+  );
+  return prompt ? truncate(cleanContextText(prompt), 180) : undefined;
+}
+
+function normalizeAttentionQuestions(input: unknown) {
+  const record = eventRecord(input);
+  const questions = Array.isArray(record?.questions) ? record.questions : [];
+  return questions
+    .filter((item): item is Record<string, any> => Boolean(eventRecord(item)))
+    .slice(0, 4)
+    .map((item) => ({
+      question: String(item.question ?? "").trim(),
+      header: String(item.header ?? "Question").trim().slice(0, 40),
+      multiSelect: Boolean(item.multiSelect ?? item.multiple),
+      options: (Array.isArray(item.options) ? item.options : [])
+        .filter((option): option is Record<string, any> => Boolean(eventRecord(option)))
+        .slice(0, 12)
+        .map((option) => ({
+          label: String(option.label ?? "").trim(),
+          description:
+            typeof option.description === "string"
+              ? option.description.trim()
+              : undefined,
+        }))
+        .filter((option) => option.label),
+    }))
+    .filter((item) => item.question);
+}
+
+function planMarkdown(input: unknown, raw: unknown) {
+  const toolInput = eventRecord(input);
+  const rawInput = eventRecord(raw);
+  return firstString(
+    toolInput?.plan,
+    toolInput?.content,
+    toolInput?.planContent,
+    rawInput?.plan,
+    rawInput?.plan_content,
+    rawInput?.planContent,
+  );
+}
+
+function isoValue(value: unknown) {
+  const date = value instanceof Date ? value : new Date(String(value ?? ""));
+  return Number.isNaN(date.getTime())
+    ? new Date().toISOString()
+    : date.toISOString();
+}
+
 async function notifyMobileApprovers(
   userId: string,
   decisionId: string,
@@ -11204,6 +11397,9 @@ function nativeHookDecision(
           hookEventName: "PreToolUse",
           permissionDecision: decision.decision,
           permissionDecisionReason: reason,
+          ...(decision.resolutionPayload
+            ? { updatedInput: decision.resolutionPayload }
+            : {}),
         },
         suppressOutput: true,
       };
@@ -11217,6 +11413,12 @@ function nativeHookDecision(
   return {
     decision: decision.decision === "deny" ? "block" : decision.decision,
     reason,
+    ...(decision.resolutionPayload
+      ? {
+          response: decision.resolutionPayload,
+          updatedInput: decision.resolutionPayload,
+        }
+      : {}),
   };
 }
 
@@ -11263,6 +11465,20 @@ function cleanResolutionGuidance(value?: string) {
     .replace(/\s+/g, " ")
     .trim();
   return cleaned ? cleaned.slice(0, 500) : undefined;
+}
+
+function cleanInteractionResponse(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const serialized = JSON.stringify(value);
+  if (serialized.length > 32_000) {
+    const error = new Error("interaction response exceeds 32 KB") as Error & {
+      status?: number;
+    };
+    error.status = 400;
+    throw error;
+  }
+  return JSON.parse(serialized) as Record<string, unknown>;
 }
 
 function slug(value: string) {
