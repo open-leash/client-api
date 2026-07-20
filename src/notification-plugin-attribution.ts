@@ -13,6 +13,12 @@ const SEVERITY_PRIORITY: Record<string, number> = {
   low: 1,
 };
 
+const DOMAIN_TIE_PRIORITY: Record<string, number> = {
+  "openleash.blast-radius": 3,
+  "openleash.sensitive-access": 2,
+  "openleash.rules-enforcer": 1,
+};
+
 export function notificationPluginAttribution(payload: unknown) {
   if (!payload || typeof payload !== "object") return coreAttribution();
   const runs = Array.isArray(
@@ -31,7 +37,13 @@ export function notificationPluginAttribution(payload: unknown) {
 }
 
 function responsibilityScore(run: PluginRun) {
-  return STATUS_PRIORITY[normalizedStatus(run)] * 10 + highestFindingSeverity(run);
+  return STATUS_PRIORITY[normalizedStatus(run)] * 100 +
+    highestFindingSeverity(run) * 10 +
+    (DOMAIN_TIE_PRIORITY[pluginId(run)] ?? 0);
+}
+
+function pluginId(run: PluginRun) {
+  return String(run.pluginId ?? run.plugin_id ?? "openleash.core");
 }
 
 function normalizedStatus(run: PluginRun) {

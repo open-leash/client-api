@@ -107,13 +107,13 @@ function detectBlastRadius(text: string, config: ReturnType<typeof pluginConfig>
       action: config.broadFilesystemAction
     });
   }
-  if (/\b(drop|truncate)\s+(database|schema|table)\b|\bdelete\s+from\s+[\w".]+\s*(;|$)|\bupdate\s+[\w".]+\s+set\b(?![\s\S]{0,120}\bwhere\b)/i.test(text)) {
+  if (/\b(drop|truncate)\s+(database|schema|table)\b|\b(?:drops?|truncates?|deletes?|removes?|wipes?)\b[\s\S]{0,50}\b(?:all|every)\b[\s\S]{0,30}\b(?:databases?|schemas?|tables?)\b|\b(?:all|every)\b[\s\S]{0,30}\b(?:databases?|schemas?|tables?)\b[\s\S]{0,50}\b(?:drops?|truncates?|deletes?|removes?|wipes?)\b|\bdelete\s+from\s+[\w".]+\s*(;|$)|\bupdate\s+[\w".]+\s+set\b(?![\s\S]{0,120}\bwhere\b)/i.test(text)) {
     add({
       policyId: "blast-radius.database-mutation",
       policyName: "Broad database mutation",
       severity: "high",
       explanation: "The agent is trying to run a destructive or broad database mutation.",
-      evidence: snippets(text, [/(drop|truncate)\s+(database|schema|table)[^\n;&]*/i, /delete\s+from\s+[^\n;&]*/i, /update\s+[\w".]+\s+set[^\n;&]*/i]),
+      evidence: snippets(text, [/(drop|truncate)\s+(database|schema|table)[^\n;&]*/i, /(?:drops?|truncates?|deletes?|removes?|wipes?)[^\n]{0,80}(?:all|every)[^\n]{0,50}(?:databases?|schemas?|tables?)/i, /delete\s+from\s+[^\n;&]*/i, /update\s+[\w".]+\s+set[^\n;&]*/i]),
       action: config.databaseMutationAction
     });
   }

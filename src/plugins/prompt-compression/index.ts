@@ -115,7 +115,7 @@ export async function runPromptCompression({
       ? `Reduced the latest prompt from ${prompt.length} to ${finalPrompt.length} characters.`
       : "Checked the latest prompt; shortening it would not preserve enough useful context.",
     tone: savedPercent > 0 ? "success" : "neutral",
-    ttlSeconds: 300,
+    ttlSeconds: 3_600,
     action: { id: "open-token-saver", label: "Token saver settings", type: "open-plugin-settings" }
   });
   const summary = compressionSummary(prompt, finalPrompt, compression);

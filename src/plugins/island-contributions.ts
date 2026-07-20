@@ -81,7 +81,7 @@ export async function activeIslandContributions(
   userId: string,
   plugins: PluginCatalogItem[],
 ) {
-  const result = await pool.query<{
+  const [result, latestTokenSavings] = await Promise.all([pool.query<{
     id: string;
     plugin_id: string;
     contribution_key: string;
@@ -102,8 +102,22 @@ export async function activeIslandContributions(
      order by pic.updated_at desc
      limit 100`,
     [organizationId, userId],
-  );
-  return result.rows.map((row): PluginIslandContribution => ({
+  ), pool.query<{
+    input_tokens: number;
+    saved_tokens: number;
+    occurred_at: string;
+  }>(
+    `select input_tokens, saved_tokens, occurred_at
+     from plugin_usage_records
+     where organization_id = $1 and user_id = $2
+       and plugin_id = 'openleash.prompt-compression'
+       and input_tokens > 0 and saved_tokens >= 0
+       and occurred_at >= now() - interval '24 hours'
+     order by occurred_at desc, created_at desc
+     limit 1`,
+    [organizationId, userId],
+  )]);
+  const contributions = result.rows.map((row): PluginIslandContribution => ({
     schemaVersion: "2026-07-20.plugin-island.v1",
     id: row.id,
     pluginId: row.plugin_id,
@@ -115,7 +129,34 @@ export async function activeIslandContributions(
     ...(row.payload as Omit<PluginIslandContribution, "schemaVersion" | "id" | "pluginId" | "kind" | "key" | "sessionId" | "agentKind" | "projectPath" | "updatedAt" | "expiresAt">),
     updatedAt: new Date(row.updated_at).toISOString(),
     expiresAt: new Date(row.expires_at).toISOString(),
-  })).filter((contribution) => isIslandContributionEnabled(contribution, plugins));
+  }));
+  if (!contributions.some((item) => item.pluginId === "openleash.prompt-compression" && item.value)) {
+    const usage = latestTokenSavings.rows[0];
+    if (usage) {
+      const inputTokens = Number(usage.input_tokens);
+      const savedTokens = Math.max(0, Number(usage.saved_tokens));
+      const tokensAfter = Math.max(0, inputTokens - savedTokens);
+      const savedPercent = Math.max(0, Math.min(100, Math.round(savedTokens / inputTokens * 100)));
+      const now = Date.now();
+      contributions.push({
+        schemaVersion: "2026-07-20.plugin-island.v1",
+        id: "openleash.prompt-compression:token-savings:latest",
+        pluginId: "openleash.prompt-compression",
+        kind: "annotation",
+        key: "token-savings",
+        label: "Token saver",
+        value: `${savedPercent}% saved`,
+        detail: savedPercent > 0
+          ? `Reduced the latest model request from ${inputTokens} to ${tokensAfter} estimated tokens.`
+          : "Checked the latest model request; no safe compression opportunity was found.",
+        tone: savedPercent > 0 ? "success" : "neutral",
+        action: { id: "open-token-saver", label: "Token saver settings", type: "open-plugin-settings" },
+        updatedAt: new Date(usage.occurred_at).toISOString(),
+        expiresAt: new Date(now + 60_000).toISOString(),
+      });
+    }
+  }
+  return contributions.filter((contribution) => isIslandContributionEnabled(contribution, plugins));
 }
 
 export function isIslandContributionEnabled(

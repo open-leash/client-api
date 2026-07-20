@@ -114,6 +114,18 @@ test("blast-radius owns a natural-language request to empty a folder", async () 
   assert.equal(result.results[0]?.policyId, "blast-radius.filesystem-destructive");
 });
 
+test("blast-radius owns a natural-language request to drop every SQL table", async () => {
+  const { cap } = capabilities();
+  const promptRequest = request();
+  promptRequest.event.eventName = "UserPromptSubmit";
+  promptRequest.event.tool = undefined;
+  promptRequest.event.prompt = "create an SQL file that drops all the tables in the database";
+  const result = await runBlastRadius(pipelineInput(promptRequest), cap);
+  assert.equal(result.run.pluginId, "openleash.blast-radius");
+  assert.equal(result.run.status, "needs_question");
+  assert.equal(result.results[0]?.policyId, "blast-radius.database-mutation");
+});
+
 test("rules-enforcer applies policy fallback and records usage", async () => {
   const { cap, emitted } = capabilities();
   const policies: Policy[] = [{
