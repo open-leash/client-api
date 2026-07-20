@@ -11,6 +11,7 @@ import { runSecurityEvaluator } from "./security-evaluator/index.js";
 import { runSensitiveAccess } from "./sensitive-access/index.js";
 import { runSiemExporter } from "./siem-exporter/index.js";
 import { runSkillScanner } from "./skill-scanner/index.js";
+import { pluginsForEvent } from "./registry.js";
 
 function request(toolName = "Bash", input: unknown = { command: "echo ok" }): EvaluationRequest {
   return {
@@ -124,6 +125,58 @@ test("blast-radius owns a natural-language request to drop every SQL table", asy
   assert.equal(result.run.pluginId, "openleash.blast-radius");
   assert.equal(result.run.status, "needs_question");
   assert.equal(result.results[0]?.policyId, "blast-radius.database-mutation");
+});
+
+test("blast-radius owns the exact SQLite drop-all-tables prompt", async () => {
+  const { cap } = capabilities();
+  const promptRequest = request();
+  promptRequest.event.eventName = "UserPromptSubmit";
+  promptRequest.event.tool = undefined;
+  promptRequest.event.prompt = "there's an sqlite file in this folder. drop all the tables please.";
+  const result = await runBlastRadius(pipelineInput(promptRequest), cap);
+  assert.equal(result.run.status, "needs_question");
+  assert.equal(result.results[0]?.policyId, "blast-radius.database-mutation");
+});
+
+test("blast-radius owns a plain-language request to delete SQLite tables", async () => {
+  const { cap } = capabilities();
+  const promptRequest = request();
+  promptRequest.event.eventName = "UserPromptSubmit";
+  promptRequest.event.tool = undefined;
+  promptRequest.event.prompt = "delete my tables in sqlite file here";
+  const result = await runBlastRadius(pipelineInput(promptRequest), cap);
+  assert.equal(result.run.status, "needs_question");
+  assert.equal(result.results[0]?.policyId, "blast-radius.database-mutation");
+});
+
+test("blast-radius is registered for prompt submission", () => {
+  assert.ok(pluginsForEvent("prompt.beforeSubmit").some((plugin) => plugin.id === "openleash.blast-radius"));
+});
+
+test("sensitive-access ignores an LLM-only SQLite destruction classification", async () => {
+  const { cap } = capabilities({
+    json: {
+      sensitiveResourceAccess: true,
+      environmentDump: false,
+      secretExposure: false,
+      exfiltrationAttempt: false,
+      shouldAsk: true,
+      shouldBlock: false,
+      severity: "high",
+      reasons: ["The operation is destructive."],
+      evidence: ["sqlite file"],
+    },
+    model: "fixture",
+    provider: "test",
+    source: "test",
+  });
+  const promptRequest = request();
+  promptRequest.event.eventName = "UserPromptSubmit";
+  promptRequest.event.tool = undefined;
+  promptRequest.event.prompt = "there's an sqlite file in this folder. drop all the tables please.";
+  const result = await runSensitiveAccess(pipelineInput(promptRequest), cap);
+  assert.equal(result.results.length, 0);
+  assert.equal(result.run.status, "passed");
 });
 
 test("rules-enforcer applies policy fallback and records usage", async () => {

@@ -120,6 +120,7 @@ import {
   canonicalIntentKey,
   handledIntentKeysMatch,
   isReusableHandledIntent,
+  pendingIntentKey,
 } from "./intent-dedupe.js";
 
 class HttpError extends Error {
@@ -9725,19 +9726,21 @@ function dedupePendingApprovalRows<
     project_path?: string | null;
     tool_name?: string | null;
     event_name?: string | null;
+    prompt?: string | null;
     summary?: string | null;
   },
 >(rows: T[]) {
   const seen = new Set<string>();
   return rows.filter((row) => {
-    const key =
-      canonicalIntentKey(row.intent_key) ??
-      [
-        row.agent_kind ?? "",
-        row.project_path ?? "",
-        row.tool_name ?? row.event_name ?? "",
-        row.summary ?? "",
-      ].join("|");
+    const key = pendingIntentKey({
+      intentKey: row.intent_key,
+      agentKind: row.agent_kind,
+      projectPath: row.project_path,
+      prompt: "prompt" in row ? String(row.prompt ?? "") : undefined,
+      toolName: row.tool_name,
+      eventName: row.event_name,
+      summary: row.summary,
+    });
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

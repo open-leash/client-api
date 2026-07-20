@@ -4,6 +4,40 @@ export type HandledIntentCandidate = {
   intentKey?: string | null;
 };
 
+export type PendingIntentCandidate = {
+  intentKey?: string | null;
+  agentKind?: string | null;
+  projectPath?: string | null;
+  prompt?: string | null;
+  toolName?: string | null;
+  eventName?: string | null;
+  summary?: string | null;
+};
+
+export function pendingIntentKey(candidate: PendingIntentCandidate) {
+  const explicit = canonicalIntentKey(candidate.intentKey);
+  if (explicit) return explicit;
+  const prompt = normalizePendingPrompt(candidate.prompt);
+  return [
+    candidate.agentKind ?? "",
+    candidate.projectPath ?? "",
+    prompt ? `prompt:${prompt}` : candidate.toolName ?? candidate.eventName ?? "",
+    prompt ? "" : candidate.summary ?? "",
+  ].join("|");
+}
+
+function normalizePendingPrompt(value?: string | null) {
+  const normalized = String(value ?? "")
+    .replace(/<\/?session>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (/\b(?:drop|delete|remove)\b[\s\S]{0,80}\b(?:all|every|my)?\s*(?:sqlite\s+)?tables?\b|\b(?:all|every|my)\s+(?:sqlite\s+)?tables?\b[\s\S]{0,80}\b(?:drop|delete|remove)\b/.test(normalized)) {
+    return "database:drop-all-tables";
+  }
+  return normalized.slice(0, 1_000);
+}
+
 export function canonicalIntentKey(intentKey?: string | null) {
   if (!intentKey) return undefined;
   const parts = intentKey.split("|");

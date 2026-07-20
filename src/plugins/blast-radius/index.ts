@@ -107,7 +107,7 @@ function detectBlastRadius(text: string, config: ReturnType<typeof pluginConfig>
       action: config.broadFilesystemAction
     });
   }
-  if (/\b(drop|truncate)\s+(database|schema|table)\b|\b(?:drops?|truncates?|deletes?|removes?|wipes?)\b[\s\S]{0,50}\b(?:all|every)\b[\s\S]{0,30}\b(?:databases?|schemas?|tables?)\b|\b(?:all|every)\b[\s\S]{0,30}\b(?:databases?|schemas?|tables?)\b[\s\S]{0,50}\b(?:drops?|truncates?|deletes?|removes?|wipes?)\b|\bdelete\s+from\s+[\w".]+\s*(;|$)|\bupdate\s+[\w".]+\s+set\b(?![\s\S]{0,120}\bwhere\b)/i.test(text)) {
+  if (/\b(drop|truncate)\s+(database|schema|table)\b|\b(?:drops?|truncates?|deletes?|removes?|wipes?)\b[\s\S]{0,50}\b(?:all|every)\b[\s\S]{0,30}\b(?:databases?|schemas?|tables?)\b|\b(?:all|every)\b[\s\S]{0,30}\b(?:databases?|schemas?|tables?)\b[\s\S]{0,50}\b(?:drops?|truncates?|deletes?|removes?|wipes?)\b|\b(?:delete|remove|wipe)\s+(?:my\s+)?tables?\b[\s\S]{0,60}\b(?:sqlite|database)\b|\bdelete\s+from\s+[\w".]+\s*(;|$)|\bupdate\s+[\w".]+\s+set\b(?![\s\S]{0,120}\bwhere\b)/i.test(text)) {
     add({
       policyId: "blast-radius.database-mutation",
       policyName: "Broad database mutation",

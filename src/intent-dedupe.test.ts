@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   handledIntentKeysMatch,
   isReusableHandledIntent,
+  pendingIntentKey,
 } from "./intent-dedupe.js";
 
 test("credential approval matches hook and proxy copies when proxy lacks project path", () => {
@@ -12,6 +13,29 @@ test("credential approval matches hook and proxy copies when proxy lacks project
       "claude-code||credential-read|.env",
     ),
     true,
+  );
+});
+
+test("pending prompt copies dedupe despite session tags and different summaries", () => {
+  const hook = pendingIntentKey({
+    agentKind: "claude-code",
+    projectPath: "/project",
+    prompt: "<session>there's an sqlite file in this folder. drop all the tables please.</session>",
+    summary: "Sensitive access review",
+  });
+  const proxy = pendingIntentKey({
+    agentKind: "claude-code",
+    projectPath: "/project",
+    prompt: "there's an sqlite file in this folder. drop all the tables please.",
+    summary: "Database mutation",
+  });
+  assert.equal(hook, proxy);
+});
+
+test("database destruction prompt variants share one pending notice", () => {
+  assert.equal(
+    pendingIntentKey({ agentKind: "claude-code", projectPath: "/project", prompt: "delete all tables in my sqlite database" }),
+    pendingIntentKey({ agentKind: "claude-code", projectPath: "/project", prompt: "delete my tables in sqlite file here" }),
   );
 });
 

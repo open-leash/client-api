@@ -166,6 +166,7 @@ function matchesFromLlm(result: SensitiveLlmResult, config: ReturnType<typeof pl
   const hasSecretFile = SECRET_FILE_PATTERN.test(text) || SENSITIVE_RESOURCE_PHRASE_PATTERN.test(text);
   const hasEnvDump = ENV_DUMP_PATTERN.test(text) || SECRET_VALUE_PATTERN.test(text);
   const hasExternalExfiltration = EXFIL_PATTERN.test(text);
+  if (!hasSecretFile && !hasEnvDump && !hasExternalExfiltration) return [];
   const action = result.exfiltrationAttempt && hasExternalExfiltration
     ? config.exfiltrationAction
     : result.environmentDump && hasEnvDump && !hasSecretFile
