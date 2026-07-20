@@ -97,6 +97,16 @@ function detectBlastRadius(text: string, config: ReturnType<typeof pluginConfig>
       action: config.broadFilesystemAction
     });
   }
+  if (/\b(?:completely|entirely|fully|permanently)?\s*(?:delete|remove|erase|wipe|purge)\b[\s\S]{0,80}\b(?:all|every)\b[\s\S]{0,40}\b(?:files?|folders?|directories?|contents?)\b|\b(?:delete|remove|erase|wipe|purge)\b[\s\S]{0,80}\b(?:files?|folders?|directories?|contents?)\b[\s\S]{0,40}\b(?:completely|entirely|fully|permanently|all)\b/i.test(text)) {
+    add({
+      policyId: "blast-radius.filesystem-destructive",
+      policyName: "Destructive filesystem operation",
+      severity: "critical",
+      explanation: "The agent is being asked to delete all files or contents from a folder.",
+      evidence: snippets(text, [/(?:delete|remove|erase|wipe|purge)[^\n]{0,160}(?:files?|folders?|directories?|contents?)/i]),
+      action: config.broadFilesystemAction
+    });
+  }
   if (/\b(drop|truncate)\s+(database|schema|table)\b|\bdelete\s+from\s+[\w".]+\s*(;|$)|\bupdate\s+[\w".]+\s+set\b(?![\s\S]{0,120}\bwhere\b)/i.test(text)) {
     add({
       policyId: "blast-radius.database-mutation",

@@ -1866,7 +1866,7 @@ function dashboardAgentSessions(whereClause = "true", params: unknown[] = []) {
        where ce.agent_runtime_id = sg.agent_runtime_id
          and ce.session_id = sg.session_id
          and coalesce(ce.project_path, '') = sg.project_path_key
-       order by case when ce.prompt is not null and length(ce.prompt) > 0 then 0 else 1 end, ce.created_at asc
+       order by case when ce.prompt is not null and length(ce.prompt) > 0 then 0 else 1 end, ce.created_at desc
        limit 1
      ) title_item on true
      order by sg.last_activity_at desc`,
@@ -1979,7 +1979,7 @@ function usageSessionsSql(
        where ce.agent_runtime_id = sg.agent_runtime_id
          and ce.session_id = sg.session_id
          and coalesce(ce.project_path, '') = sg.project_path_key
-       order by case when ce.prompt is not null and length(ce.prompt) > 0 then 0 else 1 end, ce.created_at asc
+       order by case when ce.prompt is not null and length(ce.prompt) > 0 then 0 else 1 end, ce.created_at desc
        limit 1
      ) title_item on true
      order by sg.last_activity_at desc
@@ -10165,7 +10165,7 @@ async function mobileAgentSessions(organizationId: string, userId: string) {
        where ce.agent_runtime_id = sg.agent_runtime_id
          and ce.session_id = sg.session_id
          and coalesce(ce.project_path, '') = sg.project_path_key
-       order by case when ce.prompt is not null and length(ce.prompt) > 0 then 0 else 1 end, ce.created_at asc
+       order by case when ce.prompt is not null and length(ce.prompt) > 0 then 0 else 1 end, ce.created_at desc
        limit 1
      ) title_item on true
      left join lateral (

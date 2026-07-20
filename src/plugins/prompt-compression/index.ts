@@ -106,6 +106,18 @@ export async function runPromptCompression({
       ratio: compression.ratio
     }
   });
+  const savedPercent = prompt.length > 0 ? Math.max(0, Math.round((1 - finalPrompt.length / prompt.length) * 100)) : 0;
+  await capabilities.island.annotateSession({
+    key: "token-savings",
+    label: "Token saver",
+    value: `${savedPercent}% saved`,
+    detail: savedPercent > 0
+      ? `Reduced the latest prompt from ${prompt.length} to ${finalPrompt.length} characters.`
+      : "Checked the latest prompt; shortening it would not preserve enough useful context.",
+    tone: savedPercent > 0 ? "success" : "neutral",
+    ttlSeconds: 300,
+    action: { id: "open-token-saver", label: "Token saver settings", type: "open-plugin-settings" }
+  });
   const summary = compressionSummary(prompt, finalPrompt, compression);
   const result = {
     finalPrompt,

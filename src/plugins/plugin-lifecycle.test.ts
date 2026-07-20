@@ -6,6 +6,7 @@ import { runBlastRadius } from "./blast-radius/index.js";
 import { runCodeScanner } from "./code-scanner/index.js";
 import { runDlp } from "./dlp/index.js";
 import { runMcpScanner } from "./mcp-scanner/index.js";
+import { runPromptCompression } from "./prompt-compression/index.js";
 import { runSecurityEvaluator } from "./security-evaluator/index.js";
 import { runSensitiveAccess } from "./sensitive-access/index.js";
 import { runSiemExporter } from "./siem-exporter/index.js";
@@ -68,6 +69,24 @@ test("DLP masks credentials and emits an auditable signal", async () => {
   assert.ok(emitted.signals.length > 0);
 });
 
+test("token-saver publishes its latest percentage saving to the island", async () => {
+  const { cap, emitted } = capabilities({
+    json: { compressed: "Keep the acceptance criteria.", reason: "Removed repetition." },
+    model: "test-model",
+    provider: "test",
+    source: "tenant-byok",
+  });
+  const result = await runPromptCompression({
+    prompt: "Please keep every acceptance criterion. Please keep every acceptance criterion. Remove repeated wording only.",
+    config: { enabled: true, level: "standard", conciseResponse: false, model: "test-model" },
+    capabilities: cap,
+    startedAt: Date.now(),
+  });
+  assert.equal(result.run.status, "modified");
+  assert.equal(emitted.island.length, 1);
+  assert.match(String((emitted.island[0] as { value?: unknown }).value), /^\d+% saved$/);
+});
+
 test("sensitive-access asks before reading a private key", async () => {
   const { cap, emitted } = capabilities();
   const result = await runSensitiveAccess(pipelineInput(request("Bash", { command: "cat ~/.ssh/id_rsa" })), cap);
@@ -81,6 +100,18 @@ test("blast-radius blocks recursive filesystem deletion", async () => {
   assert.ok(result.results.some((item) => item.status === "failed"));
   assert.equal(result.run.status, "blocked");
   assert.equal(emitted.island.length, 1);
+});
+
+test("blast-radius owns a natural-language request to empty a folder", async () => {
+  const { cap } = capabilities();
+  const promptRequest = request();
+  promptRequest.event.eventName = "UserPromptSubmit";
+  promptRequest.event.tool = undefined;
+  promptRequest.event.prompt = "ok there's a test123 folder in here please completely delete all its files";
+  const result = await runBlastRadius(pipelineInput(promptRequest), cap);
+  assert.equal(result.run.pluginId, "openleash.blast-radius");
+  assert.equal(result.run.status, "blocked");
+  assert.equal(result.results[0]?.policyId, "blast-radius.filesystem-destructive");
 });
 
 test("rules-enforcer applies policy fallback and records usage", async () => {
