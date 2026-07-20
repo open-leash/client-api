@@ -48,6 +48,7 @@ export async function runPromptPipeline(
       userId: input.userId,
       computerId: input.computerId,
       runtimeId: input.runtimeId,
+      permissions: plugin.permissions,
     });
     if (plugin.id === "openleash.prompt-compression") {
       const step = await runPromptCompression({
@@ -154,6 +155,7 @@ export async function runEvaluationPipeline(
           userId: input.userId,
           computerId: input.computerId,
           runtimeId: input.runtimeId,
+          permissions: plugin.permissions,
         });
         if (plugin.id === "openleash.sensitive-access") {
           const sensitive = await runSensitiveAccess(input, capabilities);

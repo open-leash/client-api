@@ -62,6 +62,7 @@ Permissions are declarative and should match what the implementation actually ne
 - `signal:write`
 - `usage:write`
 - `notification:send`
+- `island:publish`
 
 The container runtime validates the declared event, limits mutation to approved provider-payload roots, signs every invocation, and applies the manifest failure mode. Permissions still remain part of review and policy; they are not a substitute for the container sandbox.
 
@@ -106,9 +107,17 @@ const recent = await capabilities.storage.list({ keyPrefix: "sessions/", limit: 
 await capabilities.log.emit({ level: "security", message: "Custom evaluator flagged a risky action." });
 await capabilities.signals.emit({ kind: "security.finding", severity: "high", title: "Risky action blocked." });
 await capabilities.usage.record({ kind: "llm.tokens", inputTokens: 8000, savedTokens: 2400 });
+await capabilities.island.annotateSession({
+  key: "risk",
+  label: "Destructive operation",
+  value: "critical",
+  tone: "danger"
+});
 ```
 
 If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. Do not add broad domain capabilities such as `dlp.inspect`, `prompt.compress`, or `security.evaluatePolicies`; those make plugins thin wrappers over OpenLeash internals and prevent third-party developers from shipping real plugin logic. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, plugin/system logs, SIEM export, security signals, usage records, or other approved services.
+
+The Live Sessions island follows the same boundary. Plugins publish typed annotations, activity, progress, or ambient status through `capabilities.island`; OpenLeash owns the renderer and only exposes a small allowlist of safe navigation actions. Plugins never send HTML, CSS, JavaScript, arbitrary URLs, or custom IPC. See `docs/PLUGIN_ISLAND.md` for the complete developer contract and container emission shape.
 
 ## Host Context And Instruction Files
 

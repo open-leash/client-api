@@ -4,6 +4,7 @@ import type {
   PluginCatalogItem,
   PluginContainerExecution,
   PluginLogRequest,
+  PluginIslandPublishRequest,
   PluginSignalRequest,
   PluginUsageRecordRequest,
 } from "@openleash/shared";
@@ -48,6 +49,7 @@ export type ContainerTransformResponse = {
     logs?: PluginLogRequest[];
     signals?: PluginSignalRequest[];
     usage?: PluginUsageRecordRequest[];
+    island?: PluginIslandPublishRequest[];
   };
 };
 

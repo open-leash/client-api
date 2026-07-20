@@ -26,7 +26,7 @@ function request(toolName = "Bash", input: unknown = { command: "echo ok" }): Ev
 }
 
 function capabilities(llmResult?: unknown) {
-  const emitted = { logs: [] as unknown[], signals: [] as unknown[], notifications: [] as unknown[], usage: [] as unknown[] };
+  const emitted = { logs: [] as unknown[], signals: [] as unknown[], notifications: [] as unknown[], usage: [] as unknown[], island: [] as unknown[] };
   const cap = {
     context: { instructions: { list: async () => [] } },
     llm: { evaluateJson: async () => llmResult as never },
@@ -37,6 +37,12 @@ function capabilities(llmResult?: unknown) {
       delete: async () => undefined,
     },
     notification: { send: async (value: unknown) => (emitted.notifications.push(value), { sent: true, deduped: false }) },
+    island: {
+      annotateSession: async (value: unknown) => (emitted.island.push(value), { contribution: value } as never),
+      reportActivity: async (value: unknown) => (emitted.island.push(value), { contribution: value } as never),
+      publishStatus: async (value: unknown) => (emitted.island.push(value), { contribution: value } as never),
+      clear: async (value: unknown) => { emitted.island.push(value); },
+    },
     log: { emit: async (value: unknown) => (emitted.logs.push(value), value as never) },
     signals: { emit: async (value: unknown) => (emitted.signals.push(value), value as never) },
     usage: { record: async (value: unknown) => (emitted.usage.push(value), value as never) },
@@ -69,10 +75,11 @@ test("sensitive-access asks before reading a private key", async () => {
 });
 
 test("blast-radius blocks recursive filesystem deletion", async () => {
-  const { cap } = capabilities();
+  const { cap, emitted } = capabilities();
   const result = await runBlastRadius(pipelineInput(request("Bash", { command: "rm -rf /" })), cap);
   assert.ok(result.results.some((item) => item.status === "failed"));
   assert.equal(result.run.status, "blocked");
+  assert.equal(emitted.island.length, 1);
 });
 
 test("rules-enforcer applies policy fallback and records usage", async () => {

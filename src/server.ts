@@ -33,6 +33,7 @@ import {
   type PluginCatalogItem,
   type PluginLogRecord,
   type PluginLogRequest,
+  type PluginIslandPublishRequest,
   type PluginMarketplaceListing,
   type PipelineEvent,
   type PluginRunRecord,
@@ -49,6 +50,7 @@ import { summarizeActionPurpose } from "./evaluator.js";
 import { pluginIconText } from "./plugin-icons.js";
 import { normalizePluginIconInput } from "./plugin-icon-input.js";
 import { notificationPluginAttribution } from "./notification-plugin-attribution.js";
+import { activeIslandContributions } from "./plugins/island-contributions.js";
 import {
   defaultPromptTransformConfig,
   normalizePromptTransformConfig,
@@ -3346,6 +3348,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       policies,
       pluginCatalog,
       pluginOutcomes,
+      islandContributions,
     ] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       mobileAgents(session.organization.id, session.user.id),
@@ -3358,6 +3361,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       userPluginOutcomes(session.organization.id, session.user.id, {
         limit: 40,
       }),
+      activeIslandContributions(session.organization.id, session.user.id),
     ]);
     const summary = outcomeSummary(pluginOutcomes.outcomes);
     res.json({
@@ -3372,6 +3376,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       policies: policies.rows,
       plugins: pluginCatalog.plugins,
       outcomes: pluginOutcomes.outcomes,
+      islandContributions,
       viewModel: buildOpenLeashClientViewModel({
         plugins: pluginCatalog.plugins,
         outcomes: pluginOutcomes.outcomes,
@@ -3420,10 +3425,11 @@ app.get("/v1/client/notifications", async (req, res, next) => {
     );
     if (!session)
       return res.status(401).json({ error: "invalid OpenLeash session" });
-    const [pending, blocked, activity] = await Promise.all([
+    const [pending, blocked, activity, islandContributions] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       browserBlockedNotifications(session.organization.id, session.user.id),
       mobileRecentActivity(session.organization.id, session.user.id),
+      activeIslandContributions(session.organization.id, session.user.id),
     ]);
     res.json({
       serverTime: new Date().toISOString(),
@@ -3433,6 +3439,7 @@ app.get("/v1/client/notifications", async (req, res, next) => {
         ...notificationPluginAttribution(row.payload),
       })),
       recentActivity: activity.rows,
+      islandContributions,
       attentionEvents: buildAttentionEvents({
         pending: pending.rows,
         blocked: blocked.rows,
@@ -7281,6 +7288,7 @@ async function recordContainerRuntimeRuns(input: {
       userId: input.userId,
       computerId: input.computerId,
       runtimeId: input.runtimeId,
+      permissions: manifest.permissions,
     });
     if (manifest.permissions.includes("log:write")) {
       const logs = Array.isArray(emissions.logs) ? emissions.logs.slice(0, 16) : [];
@@ -7304,6 +7312,16 @@ async function recordContainerRuntimeRuns(input: {
         if (usage && typeof usage === "object") {
           await capabilities.usage.record(usage as PluginUsageRecordRequest);
         }
+      }
+    }
+    if (manifest.permissions.includes("island:publish")) {
+      const contributions = Array.isArray(emissions.island) ? emissions.island.slice(0, 16) : [];
+      for (const contribution of contributions) {
+        if (!contribution || typeof contribution !== "object") continue;
+        const request = contribution as PluginIslandPublishRequest;
+        if (request.kind === "annotation") await capabilities.island.annotateSession(request);
+        else if (request.kind === "activity") await capabilities.island.reportActivity(request);
+        else if (request.kind === "status") await capabilities.island.publishStatus(request);
       }
     }
   }

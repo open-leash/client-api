@@ -44,6 +44,16 @@ export async function runBlastRadius(input: EvaluationPipelineInput, capabilitie
     });
   }
   if (results.length > 0) {
+    const primary = results[0];
+    await capabilities.island.annotateSession({
+      key: "destructive-risk",
+      label: primary.policyName,
+      detail: primary.explanation,
+      value: primary.severity,
+      tone: primary.severity === "critical" ? "danger" : "warning",
+      ttlSeconds: 180,
+      action: { id: "open-session", label: "Open session", type: "open-session" },
+    });
     await capabilities.log.emit({
       level: results.some((result) => result.status === "failed") ? "security" : "warn",
       category: "security",
@@ -52,6 +62,7 @@ export async function runBlastRadius(input: EvaluationPipelineInput, capabilitie
       data: { results }
     });
   }
+  else await capabilities.island.clear({ key: "destructive-risk" });
 
   return {
     results,

@@ -11,7 +11,7 @@ export const blastRadiusManifest: OpenLeashPluginManifest = {
   runtime: "openleash-core",
   entrypoint: "plugins/blast-radius",
   events: ["tool.beforeUse"],
-  permissions: ["event:read", "tool:read", "decision:write", "audit:write", "log:write", "signal:write"],
+  permissions: ["event:read", "tool:read", "decision:write", "audit:write", "log:write", "signal:write", "island:publish"],
   effects: ["observe", "ask", "deny"],
   ordering: {
     priority: 220,

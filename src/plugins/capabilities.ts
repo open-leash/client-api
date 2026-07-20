@@ -7,6 +7,7 @@ import type {
   PluginLogRecord,
   PluginLogLevel,
   PluginLogRequest,
+  PluginPermission,
   PluginSignalKind,
   PluginSignalRecord,
   PluginSignalRequest,
@@ -20,6 +21,7 @@ import type {
 import OpenAI from "openai";
 import { pool } from "../db.js";
 import type { TenantModelKey } from "../model-keys.js";
+import { clearIslandContribution, publishIslandContribution } from "./island-contributions.js";
 
 const pluginLlmModel = process.env.OPENLEASH_PLUGIN_LLM_MODEL ?? process.env.OPENAI_EVAL_MODEL ?? "gpt-5.2";
 const pluginAnthropicModel = process.env.ANTHROPIC_EVAL_MODEL ?? "claude-3-5-sonnet-latest";
@@ -33,7 +35,8 @@ export function createPluginCapabilities({
   conversationEventId,
   userId,
   computerId,
-  runtimeId
+  runtimeId,
+  permissions = [],
 }: {
   tenantModelKey?: TenantModelKey;
   organizationId?: string;
@@ -43,6 +46,7 @@ export function createPluginCapabilities({
   userId?: string;
   computerId?: string;
   runtimeId?: string;
+  permissions?: PluginPermission[];
 }): PluginCapabilities {
   const storage: PluginCapabilities["storage"] = {
     async get<T = unknown>({ key, scope }: PluginStorageGetRequest) {
@@ -155,6 +159,36 @@ export function createPluginCapabilities({
         return { sent: true, deduped: false };
       }
     },
+    island: {
+      async annotateSession(annotation) {
+        requirePermission(permissions, "island:publish");
+        return await publishIslandContribution(
+          { organizationId, userId, pluginId, request },
+          { kind: "annotation", ...annotation },
+        );
+      },
+      async reportActivity(activity) {
+        requirePermission(permissions, "island:publish");
+        return await publishIslandContribution(
+          { organizationId, userId, pluginId, request },
+          { kind: "activity", ...activity },
+        );
+      },
+      async publishStatus(status) {
+        requirePermission(permissions, "island:publish");
+        return await publishIslandContribution(
+          { organizationId, userId, pluginId, request },
+          { kind: "status", ...status },
+        );
+      },
+      async clear(clearRequest) {
+        requirePermission(permissions, "island:publish");
+        return await clearIslandContribution(
+          { organizationId, userId, pluginId, request },
+          clearRequest,
+        );
+      },
+    },
     log: {
       async emit(log) {
         return emitPluginLog({
@@ -198,6 +232,12 @@ export function createPluginCapabilities({
       }
     }
   };
+}
+
+function requirePermission(permissions: PluginPermission[], permission: PluginPermission) {
+  if (!permissions.includes(permission)) {
+    throw new Error(`plugin capability requires ${permission}`);
+  }
 }
 
 function normalizeInstructionFile(value: unknown): PluginInstructionFile | undefined {
