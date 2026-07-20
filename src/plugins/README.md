@@ -119,6 +119,24 @@ If a plugin needs a new privileged operation, add a narrow capability to the sha
 
 The Live Sessions island follows the same boundary. Plugins publish typed annotations, activity, progress, or ambient status through `capabilities.island`; OpenLeash owns the renderer and only exposes a small allowlist of safe navigation actions. Plugins never send HTML, CSS, JavaScript, arbitrary URLs, or custom IPC. See `docs/PLUGIN_ISLAND.md` for the complete developer contract and container emission shape.
 
+## Settings And Agent Scope
+
+Plugin authors define one `configSchema` and consume one resolved `input.config`. They do not implement product-mode, organization-role, employee, or profile-merging logic. OpenLeash resolves those concerns before each invocation:
+
+```text
+manifest defaults
+  -> organization base settings
+  -> matching organization profiles by priority
+  -> user base settings, unless locked
+  -> matching user profiles by priority, unless locked
+```
+
+A profile may target agent kinds such as `claude-code` or `codex`, exact authenticated/enrolled runtime IDs, or both. The runtime envelope includes the resolved configuration, its hash, and the matching profile IDs. A container must treat that configuration as request-scoped data; it must not retain one tenant's settings in global mutable state.
+
+Organization policy controls four separate things: mandatory installation, default enablement, permission to add optional plugins, and permission to customize settings. A mandatory plugin can remain configurable. A plugin developer does not need branches for these combinations: OpenLeash prevents forbidden removal/overrides and supplies the already-resolved effective state.
+
+The same contract is used by Individual Open Source, personal OpenLeash Cloud, organization OpenLeash Cloud, and Private Cloud. Use `executionEnvironment: "cloud-only"` only when the implementation truly depends on OpenLeash-operated infrastructure. OpenLeash surfaces that restriction and refuses activation in Individual Open Source and Private Cloud.
+
 ## Host Context And Instruction Files
 
 External plugins do not get general access to the computer running the agent. They should not walk the host filesystem, read arbitrary files, shell out to local tools, or assume they run beside the user's project. OpenLeash owns host discovery and exposes only reviewed context through explicit capabilities or event payloads.

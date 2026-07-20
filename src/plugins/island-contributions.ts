@@ -1,15 +1,18 @@
 import type {
   EvaluationRequest,
+  PluginCatalogItem,
   PluginIslandAction,
   PluginIslandContribution,
   PluginIslandPublishRequest,
 } from "@openleash/shared";
 import { pool } from "../db.js";
+import { resolvePluginSettingProfiles } from "./settings-profiles.js";
 
 export type IslandContributionContext = {
   organizationId?: string;
   userId?: string;
   pluginId: string;
+  agentId?: string;
   request?: EvaluationRequest;
 };
 
@@ -73,7 +76,11 @@ export async function clearIslandContribution(
   );
 }
 
-export async function activeIslandContributions(organizationId: string, userId: string) {
+export async function activeIslandContributions(
+  organizationId: string,
+  userId: string,
+  plugins: PluginCatalogItem[],
+) {
   const result = await pool.query<{
     id: string;
     plugin_id: string;
@@ -92,21 +99,6 @@ export async function activeIslandContributions(organizationId: string, userId: 
      from plugin_island_contributions pic
      where pic.organization_id = $1 and pic.user_id = $2
        and pic.expires_at > now()
-       and (
-         exists (
-           select 1 from user_plugin_settings ups
-           where ups.organization_id = pic.organization_id
-             and ups.user_id = pic.user_id
-             and ups.plugin_id = pic.plugin_id
-             and ups.enabled = true
-         )
-         or exists (
-           select 1 from plugin_settings ps
-           where ps.organization_id = pic.organization_id
-             and ps.plugin_id = pic.plugin_id
-             and ps.enabled = true
-         )
-       )
      order by pic.updated_at desc
      limit 100`,
     [organizationId, userId],
@@ -123,7 +115,25 @@ export async function activeIslandContributions(organizationId: string, userId: 
     ...(row.payload as Omit<PluginIslandContribution, "schemaVersion" | "id" | "pluginId" | "kind" | "key" | "sessionId" | "agentKind" | "projectPath" | "updatedAt" | "expiresAt">),
     updatedAt: new Date(row.updated_at).toISOString(),
     expiresAt: new Date(row.expires_at).toISOString(),
-  }));
+  })).filter((contribution) => isIslandContributionEnabled(contribution, plugins));
+}
+
+export function isIslandContributionEnabled(
+  contribution: PluginIslandContribution,
+  plugins: PluginCatalogItem[],
+) {
+  const plugin = plugins.find((candidate) => candidate.id === contribution.pluginId);
+  if (!plugin) return false;
+  return resolvePluginSettingProfiles({
+    enabled: plugin.settings.enabled,
+    config: plugin.settings.config,
+    organizationProfiles: plugin.settings.inheritedProfiles,
+    userProfiles: plugin.settings.profiles,
+    agentKind: contribution.agentKind,
+    agentId: contribution.agentId,
+    configLocked: plugin.organizationPolicy?.configLocked,
+    mandatory: plugin.organizationPolicy?.mandatory,
+  }).enabled;
 }
 
 export function normalizeIslandContribution(
@@ -150,6 +160,7 @@ export function normalizeIslandContribution(
     key,
     ...(sessionId ? { sessionId } : {}),
     ...(context.request?.agent.kind ? { agentKind: context.request.agent.kind } : {}),
+    ...(context.agentId ? { agentId: context.agentId } : {}),
     ...(context.request?.event.projectPath ? { projectPath: cleanOptional(context.request.event.projectPath, 500) } : {}),
     tone: normalizeTone(input.tone),
     ...(input.action ? { action: normalizeAction(input.action) } : {}),

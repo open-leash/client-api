@@ -49,6 +49,25 @@ test("locked organization settings ignore user profiles", () => {
   assert.deepEqual(resolved.effectiveProfileIds, []);
 });
 
+test("mandatory plugins allow employee config freedom without allowing an agent-level disable", () => {
+  const resolved = resolvePluginSettingProfiles({
+    enabled: true,
+    config: { level: "standard" },
+    userProfiles: [{
+      id: "codex-personal",
+      name: "Codex personal",
+      agentKinds: ["codex"],
+      enabled: false,
+      config: { level: "strict" },
+    }],
+    agentKind: "codex",
+    mandatory: true,
+  });
+  assert.equal(resolved.enabled, true);
+  assert.deepEqual(resolved.config, { level: "strict" });
+  assert.deepEqual(resolved.effectiveProfileIds, ["user:codex-personal"]);
+});
+
 test("targets one enrolled agent without creating another container", () => {
   const profiles = normalizePluginSettingProfiles([{
     id: "codex-laptop",

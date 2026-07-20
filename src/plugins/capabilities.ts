@@ -163,28 +163,28 @@ export function createPluginCapabilities({
       async annotateSession(annotation) {
         requirePermission(permissions, "island:publish");
         return await publishIslandContribution(
-          { organizationId, userId, pluginId, request },
+          { organizationId, userId, pluginId, agentId: runtimeId ?? request?.agent.instanceId, request },
           { kind: "annotation", ...annotation },
         );
       },
       async reportActivity(activity) {
         requirePermission(permissions, "island:publish");
         return await publishIslandContribution(
-          { organizationId, userId, pluginId, request },
+          { organizationId, userId, pluginId, agentId: runtimeId ?? request?.agent.instanceId, request },
           { kind: "activity", ...activity },
         );
       },
       async publishStatus(status) {
         requirePermission(permissions, "island:publish");
         return await publishIslandContribution(
-          { organizationId, userId, pluginId, request },
+          { organizationId, userId, pluginId, agentId: runtimeId ?? request?.agent.instanceId, request },
           { kind: "status", ...status },
         );
       },
       async clear(clearRequest) {
         requirePermission(permissions, "island:publish");
         return await clearIslandContribution(
-          { organizationId, userId, pluginId, request },
+          { organizationId, userId, pluginId, agentId: runtimeId ?? request?.agent.instanceId, request },
           clearRequest,
         );
       },

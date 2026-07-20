@@ -56,14 +56,15 @@ function pipelineInput(value: EvaluationRequest, plugins?: Map<string, PluginSet
 
 test("DLP masks credentials and emits an auditable signal", async () => {
   const { cap, emitted } = capabilities();
+  const credential = `sk-proj-${"abcdefghijklmnopqrstuvwxyz".repeat(2)}`;
   const result = await runDlp({
-    prompt: "Use OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+    prompt: `Use OPENAI_API_KEY=${credential}`,
     config: { enabled: true, action: "mask", categories: ["tokens", "credentials"], model: "" },
     capabilities: cap,
     startedAt: Date.now(),
   });
   assert.equal(result.run.status, "modified");
-  assert.doesNotMatch(result.prompt, /sk-proj-abcdefghijklmnopqrstuvwxyz123456/);
+  assert.ok(!result.prompt.includes(credential));
   assert.ok(emitted.signals.length > 0);
 });
 

@@ -101,6 +101,20 @@ export function publicProductMode(mode: OpenLeashProductMode) {
   };
 }
 
+export function isOrganizationManagedAccount(
+  mode: OpenLeashProductMode,
+  audience: string | undefined,
+) {
+  return mode.id === "private-cloud" || audience === "organization";
+}
+
+export function pluginExecutionAvailable(
+  mode: OpenLeashProductMode,
+  executionEnvironment: "any" | "cloud-only" | undefined,
+) {
+  return executionEnvironment !== "cloud-only" || mode.id === "openleash-cloud";
+}
+
 function capabilities(partial: Partial<Record<OpenLeashCapability, boolean>>): Record<OpenLeashCapability, boolean> {
   return {
     singleUserRuntime: false,

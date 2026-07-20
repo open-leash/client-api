@@ -53,23 +53,28 @@ export function resolvePluginSettingProfiles(input: {
   agentKind?: string;
   agentId?: string;
   configLocked?: boolean;
+  mandatory?: boolean;
 }) {
   let enabled = input.enabled;
   let config = { ...input.config };
   const effectiveProfileIds: string[] = [];
   if (!input.agentKind && !input.agentId) return { enabled, config, effectiveProfileIds };
 
-  const apply = (scope: "organization" | "user", profiles: PluginSettingProfile[]) => {
+  const apply = (
+    scope: "organization" | "user",
+    profiles: PluginSettingProfile[],
+    allowEnabledOverride = true,
+  ) => {
     for (const profile of [...profiles].sort(compareProfiles)) {
       if (profile.agentKinds.length > 0 && (!input.agentKind || !profile.agentKinds.includes(input.agentKind as AgentKind))) continue;
       if ((profile.agentIds?.length ?? 0) > 0 && (!input.agentId || !profile.agentIds!.includes(input.agentId))) continue;
-      if (typeof profile.enabled === "boolean") enabled = profile.enabled;
+      if (allowEnabledOverride && typeof profile.enabled === "boolean") enabled = profile.enabled;
       config = { ...config, ...profile.config };
       effectiveProfileIds.push(`${scope}:${profile.id}`);
     }
   };
   apply("organization", input.organizationProfiles ?? []);
-  if (!input.configLocked) apply("user", input.userProfiles ?? []);
+  if (!input.configLocked) apply("user", input.userProfiles ?? [], !input.mandatory);
   return { enabled, config, effectiveProfileIds };
 }
 

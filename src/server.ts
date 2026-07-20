@@ -65,6 +65,14 @@ import { executeContainerPluginTool, transformWithContainerPlugins } from "./plu
 import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
 import { runSkillScanner } from "./plugins/skill-scanner/index.js";
 import { normalizePluginSettingProfiles, resolvePluginSettingProfiles } from "./plugins/settings-profiles.js";
+import {
+  canUserConfigurePlugin,
+  canUserInstallPlugin,
+  canUserUninstallPlugin,
+  normalizeOrganizationPluginPolicy,
+  pluginEnabledForUser,
+  pluginProvidedByOrganization,
+} from "./plugins/plugin-policy.js";
 import type { PromptPipelineResult } from "./plugins/types.js";
 import {
   EXTERNAL_PROVIDER_IDS,
@@ -91,7 +99,9 @@ import {
 } from "./model-keys.js";
 import {
   hasCapability,
+  isOrganizationManagedAccount,
   openLeashProductModeFromEnv,
+  pluginExecutionAvailable,
   publicProductMode,
   type OpenLeashCapability,
 } from "./product-mode.js";
@@ -119,6 +129,18 @@ class HttpError extends Error {
   ) {
     super(message);
   }
+}
+
+function statusCodeForError(error: unknown) {
+  if (!error || typeof error !== "object") return 500;
+  const candidate = "statusCode" in error
+    ? Number(error.statusCode)
+    : "status" in error
+      ? Number(error.status)
+      : 500;
+  return Number.isInteger(candidate) && candidate >= 400 && candidate <= 599
+    ? candidate
+    : 500;
 }
 
 export type ApiSurface = "client" | "dashboard" | "all";
@@ -671,7 +693,11 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
     }
     const provider = String(req.body?.provider ?? "unknown").trim() || "unknown";
     const agentKind = String(req.body?.agentKind ?? "unknown").trim() || "unknown";
-    const agentId = optionalString(req.body?.agentId);
+    const agentId = await validatedAgentRuntimeId(
+      user.id,
+      agentKind,
+      optionalString(req.body?.agentId),
+    );
     const sessionId = String(req.body?.sessionId ?? "proxy").trim() || "proxy";
     const catalog = await pluginCatalogForOrganization(
       user.organization_id,
@@ -710,7 +736,17 @@ app.post("/v1/plugin-runtime/tools/execute", async (req, res, next) => {
     if (!pluginId || !tool || !args || typeof args !== "object" || Array.isArray(args)) {
       return res.status(400).json({ error: "pluginId, tool, and object arguments are required" });
     }
-    const catalog = await pluginCatalogForOrganization(user.organization_id, user.id);
+    const agentKind = String(req.body?.agentKind ?? "unknown").trim() || "unknown";
+    const agentId = await validatedAgentRuntimeId(
+      user.id,
+      agentKind,
+      optionalString(req.body?.agentId),
+    );
+    const catalog = await pluginCatalogForOrganization(
+      user.organization_id,
+      user.id,
+      { agentKind, agentId },
+    );
     const plugin = catalog.plugins.find((candidate) => candidate.id === pluginId);
     if (!plugin) return res.status(404).json({ error: "enabled plugin not found" });
     const result = await executeContainerPluginTool({
@@ -3348,7 +3384,6 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       policies,
       pluginCatalog,
       pluginOutcomes,
-      islandContributions,
     ] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       mobileAgents(session.organization.id, session.user.id),
@@ -3361,8 +3396,12 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       userPluginOutcomes(session.organization.id, session.user.id, {
         limit: 40,
       }),
-      activeIslandContributions(session.organization.id, session.user.id),
     ]);
+    const islandContributions = await activeIslandContributions(
+      session.organization.id,
+      session.user.id,
+      pluginCatalog.plugins,
+    );
     const summary = outcomeSummary(pluginOutcomes.outcomes);
     res.json({
       user: session.user,
@@ -3384,7 +3423,10 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       }),
       clientConfig: {
         approvalNotifications: true,
-        managedByOrganization: true,
+        managedByOrganization: isOrganizationManagedAccount(
+          productMode,
+          session.account?.audience,
+        ),
       },
     });
   } catch (error) {
@@ -3425,12 +3467,17 @@ app.get("/v1/client/notifications", async (req, res, next) => {
     );
     if (!session)
       return res.status(401).json({ error: "invalid OpenLeash session" });
-    const [pending, blocked, activity, islandContributions] = await Promise.all([
+    const [pending, blocked, activity, pluginCatalog] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       browserBlockedNotifications(session.organization.id, session.user.id),
       mobileRecentActivity(session.organization.id, session.user.id),
-      activeIslandContributions(session.organization.id, session.user.id),
+      pluginCatalogForOrganization(session.organization.id, session.user.id),
     ]);
+    const islandContributions = await activeIslandContributions(
+      session.organization.id,
+      session.user.id,
+      pluginCatalog.plugins,
+    );
     res.json({
       serverTime: new Date().toISOString(),
       pendingApprovals: pending.rows,
@@ -4971,12 +5018,17 @@ app.get("/v1/plugins", async (req, res, next) => {
     );
     if (!session)
       return res.status(401).json({ error: "invalid OpenLeash session" });
-    res.json(
-      await pluginCatalogForOrganization(
-        session.organization.id,
-        session.user.id,
-      ),
+    const agentKind = optionalString(req.query.agentKind);
+    const agentId = await validatedAgentRuntimeId(
+      session.user.id,
+      agentKind,
+      optionalString(req.query.agentId),
     );
+    res.json(await pluginCatalogForOrganization(
+      session.organization.id,
+      session.user.id,
+      { agentKind, agentId },
+    ));
   } catch (error) {
     next(error);
   }
@@ -5311,8 +5363,8 @@ async function handlePromptOnlyHook(
     await recordConversationEvent(request, user, intentKey);
   const containerRuns = await recordContainerRuntimeRuns({ request, organizationId, conversationEventId, userId: user.id, computerId, runtimeId });
   const [config, runtimePlugins, tenantModelKey, policies] = await Promise.all([
-    readPromptTransformConfig(organizationId, user.id, request.agent.kind, request.agent.instanceId ?? runtimeId),
-    pluginSettingsForRuntime(organizationId, user.id, request.agent.kind, request.agent.instanceId ?? runtimeId),
+    readPromptTransformConfig(organizationId, user.id, request.agent.kind, runtimeId || request.agent.instanceId),
+    pluginSettingsForRuntime(organizationId, user.id, request.agent.kind, runtimeId || request.agent.instanceId),
     tenantModelKeyForEvaluation(organizationId),
     pool.query<Policy>(
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
@@ -5629,12 +5681,11 @@ function pluginCatalogItem(
   agentId?: string,
   userScoped = false,
 ): PluginCatalogItem {
-  const baseEnabled = policy?.mandatory
-    ? true
-    : (userSettings?.enabled ??
-      organizationSettings?.enabled ??
-      policy?.defaultEnabled ??
-      false);
+  const baseEnabled = pluginEnabledForUser({
+    policy,
+    organizationSettings,
+    userSettings,
+  });
   const configLocked = Boolean(policy?.configLocked);
   const availableVersion = marketplace?.version ?? manifest.version;
   const installedVersion =
@@ -5651,7 +5702,9 @@ function pluginCatalogItem(
     ? selectedRelease
     : undefined;
   const selectedManifest = executableRelease ?? manifest;
-  const runtimeAvailable = !installedVersion || installedVersion === manifest.version || Boolean(executableRelease);
+  const releaseAvailable = !installedVersion || installedVersion === manifest.version || Boolean(executableRelease);
+  const environmentAvailable = pluginExecutionAvailable(productMode, selectedManifest.executionEnvironment);
+  const runtimeAvailable = releaseAvailable && environmentAvailable;
   const baseConfig = {
     ...(manifest.defaultConfig ?? {}),
     ...(organizationSettings?.config ?? {}),
@@ -5667,6 +5720,7 @@ function pluginCatalogItem(
     agentKind,
     agentId,
     configLocked,
+    mandatory: policy?.mandatory,
   });
   if (
     manifest.id === "openleash.rules-enforcer" &&
@@ -5686,7 +5740,11 @@ function pluginCatalogItem(
       inheritedProfiles: userScoped ? organizationProfiles : [],
       effectiveProfileIds: resolved.effectiveProfileIds,
       runtimeAvailable,
-      ...(runtimeAvailable ? {} : { runtimeError: `Installed plugin version ${installedVersion} has no approved executable release.` }),
+      ...(runtimeAvailable ? {} : {
+        runtimeError: environmentAvailable
+          ? `Installed plugin version ${installedVersion} has no approved executable release.`
+          : `${selectedManifest.name} runs only in OpenLeash Cloud and is unavailable in ${productMode.label}.`,
+      }),
       orderingPriority:
         userSettings?.orderingPriority ??
         organizationSettings?.orderingPriority ??
@@ -5694,9 +5752,7 @@ function pluginCatalogItem(
         null,
       installedVersion,
       availableVersion,
-      updateAvailable: Boolean(
-        baseEnabled && installedVersion && installedVersion !== availableVersion,
-      ),
+      updateAvailable: Boolean(installedVersion && installedVersion !== availableVersion),
       updatePolicy:
         userSettings?.updatePolicy ??
         organizationSettings?.updatePolicy ??
@@ -5707,9 +5763,10 @@ function pluginCatalogItem(
       mandatory: Boolean(policy?.mandatory),
       defaultEnabled: Boolean(policy?.defaultEnabled ?? false),
       userInstallAllowed: Boolean(
-        policy?.userInstallAllowed ??
-        marketplacePolicy?.allowUserMarketplaceInstalls ??
-        true,
+        (manifest.publisher === "openleash" || marketplacePolicy?.allowUserCommunityPlugins !== false) &&
+        (policy?.userInstallAllowed ??
+          marketplacePolicy?.allowUserMarketplaceInstalls ??
+          true),
       ),
       configLocked,
     },
@@ -5727,6 +5784,7 @@ function pluginManifestFromRelease(release: ReturnType<typeof pluginReleaseFromR
     publisher: release.publisher,
     runtime: release.runtime as OpenLeashPluginManifest["runtime"],
     execution: release.execution as OpenLeashPluginManifest["execution"],
+    executionEnvironment: release.executionEnvironment as OpenLeashPluginManifest["executionEnvironment"],
     entrypoint: release.entrypoint,
     events: release.events as OpenLeashPluginManifest["events"],
     permissions: release.permissions as OpenLeashPluginManifest["permissions"],
@@ -5736,6 +5794,14 @@ function pluginManifestFromRelease(release: ReturnType<typeof pluginReleaseFromR
     defaultConfig: release.defaultConfig,
     tags: release.tags,
   };
+}
+
+function assertPluginExecutionAvailable(manifest: OpenLeashPluginManifest) {
+  if (pluginExecutionAvailable(productMode, manifest.executionEnvironment)) return;
+  throw new HttpError(
+    409,
+    `${manifest.name} runs only in OpenLeash Cloud and is unavailable in ${productMode.label}.`,
+  );
 }
 
 async function savePluginSettingsForOrganization(
@@ -5749,25 +5815,34 @@ async function savePluginSettingsForOrganization(
     pluginId,
   );
   const currentSettings = (await readPluginSettings(organizationId)).get(pluginId);
+  const requestedProfiles = Array.isArray(body.profiles)
+    ? normalizePluginSettingProfiles(body.profiles)
+    : undefined;
   const enabled = policy?.mandatory
     ? true
     : typeof body.enabled === "boolean"
       ? body.enabled
-      : true;
+      : (currentSettings?.enabled ?? true);
+  if (
+    (!currentSettings?.enabled && enabled) ||
+    requestedProfiles?.some((profile) => profile.enabled === true)
+  ) {
+    assertPluginExecutionAvailable(manifest);
+  }
   const config =
     body.config &&
     typeof body.config === "object" &&
     !Array.isArray(body.config)
       ? (body.config as Record<string, unknown>)
-      : (manifest.defaultConfig ?? {});
+      : (currentSettings?.config ?? manifest.defaultConfig ?? {});
   const orderingPriority = Number.isFinite(Number(body.orderingPriority))
     ? Number(body.orderingPriority)
-    : (manifest.ordering?.priority ?? null);
+    : (currentSettings?.orderingPriority ?? manifest.ordering?.priority ?? null);
   const requestedInstalledVersion = optionalString(body.installedVersion);
   const availableVersion = manifest.version;
   const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
-  const profiles = Array.isArray(body.profiles)
-    ? normalizePluginSettingProfiles(body.profiles)
+  const profiles = requestedProfiles
+    ? requestedProfiles
     : (currentSettings?.profiles ?? []);
   const result = await pool.query(
     `insert into plugin_settings (organization_id, plugin_id, enabled, config, profiles, ordering_priority, installed_version, update_policy, updated_at)
@@ -5812,41 +5887,73 @@ async function savePluginSettingsForUser(
     readUserPluginSettings(organizationId, userId),
   ]);
   const pluginPolicy = policy.get(manifest.id);
-  if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false)
-    return undefined;
-  if (
-    !pluginPolicy?.mandatory &&
-    !marketplacePolicy.allowUserMarketplaceInstalls
-  )
-    return undefined;
-  if (
-    manifest.publisher !== "openleash" &&
-    !marketplacePolicy.allowUserCommunityPlugins
-  )
-    return undefined;
+  const organizationSetting = organizationSettings.get(manifest.id);
+  const currentUserSetting = currentUserSettings.get(manifest.id);
+  const requestedProfiles = Array.isArray(body.profiles)
+    ? normalizePluginSettingProfiles(body.profiles)
+    : undefined;
+  const currentlyEnabled = pluginEnabledForUser({
+    policy: pluginPolicy,
+    organizationSettings: organizationSetting,
+    userSettings: currentUserSetting,
+  });
   const enabled = pluginPolicy?.mandatory
     ? true
     : typeof body.enabled === "boolean"
       ? body.enabled
-      : true;
+      : currentlyEnabled;
+  const installing = !currentlyEnabled && enabled;
+  const uninstalling = currentlyEnabled && !enabled;
+  const configuring = body.config !== undefined || body.profiles !== undefined || body.orderingPriority !== undefined;
+  if (installing || requestedProfiles?.some((profile) => profile.enabled === true)) {
+    assertPluginExecutionAvailable(manifest);
+  }
+  const providedByOrganization = pluginProvidedByOrganization({
+    policy: pluginPolicy,
+    organizationSettings: organizationSetting,
+  });
+  if (installing && !canUserInstallPlugin({
+    policy: pluginPolicy,
+    allowUserMarketplaceInstalls: marketplacePolicy.allowUserMarketplaceInstalls,
+    allowUserCommunityPlugins: marketplacePolicy.allowUserCommunityPlugins,
+    firstParty: manifest.publisher === "openleash",
+    providedByOrganization,
+  })) {
+    throw new HttpError(403, "Your organization does not allow installing this plugin.");
+  }
+  if (uninstalling && !canUserUninstallPlugin(pluginPolicy)) {
+    throw new HttpError(403, "This plugin is required by your organization.");
+  }
+  if (configuring && !installing && !uninstalling && !canUserConfigurePlugin({ enabled: currentlyEnabled, policy: pluginPolicy })) {
+    throw new HttpError(
+      403,
+      pluginPolicy?.configLocked
+        ? "Plugin settings are managed by your organization."
+        : "Install this plugin before changing its settings.",
+    );
+  }
   const config = pluginPolicy?.configLocked
-    ? {}
+    ? (currentUserSetting?.config ?? {})
     : body.config &&
         typeof body.config === "object" &&
         !Array.isArray(body.config)
       ? (body.config as Record<string, unknown>)
-      : {};
-  const orderingPriority = Number.isFinite(Number(body.orderingPriority))
-    ? Number(body.orderingPriority)
-    : (organizationSettings.get(manifest.id)?.orderingPriority ??
-      manifest.ordering?.priority ??
-      null);
+      : (currentUserSetting?.config ?? {});
+  const orderingPriority = pluginPolicy?.configLocked
+    ? (currentUserSetting?.orderingPriority ?? organizationSetting?.orderingPriority ?? manifest.ordering?.priority ?? null)
+    : Number.isFinite(Number(body.orderingPriority))
+      ? Number(body.orderingPriority)
+      : (currentUserSetting?.orderingPriority ?? organizationSetting?.orderingPriority ??
+        manifest.ordering?.priority ??
+        null);
   const requestedInstalledVersion = optionalString(body.installedVersion);
   const availableVersion = manifest.version;
   const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
-  const profiles = Array.isArray(body.profiles)
-    ? normalizePluginSettingProfiles(body.profiles)
-    : (currentUserSettings.get(manifest.id)?.profiles ?? []);
+  const profiles = pluginPolicy?.configLocked
+    ? (currentUserSetting?.profiles ?? [])
+    : requestedProfiles
+    ? requestedProfiles
+    : (currentUserSetting?.profiles ?? []);
   const result = await pool.query<{
     plugin_id: string;
     enabled: boolean;
@@ -6018,6 +6125,7 @@ function marketplaceListingFromRow(
     ),
     documentationUrl: optionalString(row.documentation_url),
     runtime: String(row.runtime) as PluginMarketplaceListing["runtime"],
+    executionEnvironment: row.execution_environment === "cloud-only" ? "cloud-only" : "any",
     execution: objectValue(row.execution) as PluginMarketplaceListing["execution"],
     entrypoint: String(row.entrypoint),
     events: arrayValue(row.events) as PluginMarketplaceListing["events"],
@@ -6110,18 +6218,26 @@ async function installMarketplacePluginForUser(
   userId: string,
   pluginId: string,
 ) {
-  const policy = await readOrganizationMarketplacePolicy(organizationId);
-  const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(
-    pluginId,
-  );
+  const [policy, organizationPolicies, organizationSettings] = await Promise.all([
+    readOrganizationMarketplacePolicy(organizationId),
+    readOrganizationPluginPolicy(organizationId),
+    readPluginSettings(organizationId),
+  ]);
+  const pluginPolicy = organizationPolicies.get(pluginId);
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
-  if (!pluginPolicy?.mandatory && !policy.allowUserMarketplaceInstalls)
-    return undefined;
-  if (!pluginPolicy?.mandatory && pluginPolicy?.userInstallAllowed === false)
-    return undefined;
-  if (manifest.publisher !== "openleash" && !policy.allowUserCommunityPlugins)
-    return undefined;
+  if (!canUserInstallPlugin({
+    policy: pluginPolicy,
+    allowUserMarketplaceInstalls: policy.allowUserMarketplaceInstalls,
+    allowUserCommunityPlugins: policy.allowUserCommunityPlugins,
+    firstParty: manifest.publisher === "openleash",
+    providedByOrganization: pluginProvidedByOrganization({
+      policy: pluginPolicy,
+      organizationSettings: organizationSettings.get(pluginId),
+    }),
+  })) {
+    throw new HttpError(403, "Your organization manages installs for this plugin.");
+  }
   return savePluginSettingsForUser(organizationId, userId, pluginId, {
     enabled: true,
     config: manifest.defaultConfig ?? {},
@@ -6179,6 +6295,7 @@ function marketplaceListingFromInput(
     packageUrl: optionalString(value.packageUrl),
     documentationUrl: optionalString(value.documentationUrl),
     runtime,
+    executionEnvironment: value.executionEnvironment === "cloud-only" ? "cloud-only" : "any",
     execution: objectValue(value.execution) as PluginMarketplaceListing["execution"],
     entrypoint,
     events: arrayValue(value.events) as PluginMarketplaceListing["events"],
@@ -6211,16 +6328,16 @@ async function upsertLocalMarketplaceListing(plugin: PluginMarketplaceListing) {
     `insert into plugin_marketplace (
        plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
-       repository_url, documentation_url, runtime, execution, entrypoint, events, permissions, effects,
+       repository_url, documentation_url, runtime, execution_environment, execution, entrypoint, events, permissions, effects,
        ordering, config_schema, default_config, tags, icon_text, visual_png,
        featured_rank, seo_title, seo_description, updated_at
      )
      values (
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, 'approved', $10, $11, $12, $13,
-       $14, $15, $16, $17::jsonb, $18, $19::jsonb, $20::jsonb, $21::jsonb,
-       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
-       $28, $29, $30, now()
+       $14, $15, $16, $17, $18::jsonb, $19, $20::jsonb, $21::jsonb, $22::jsonb,
+       $23::jsonb, $24::jsonb, $25::jsonb, $26::jsonb, $27, $28,
+       $29, $30, $31, now()
      )
      on conflict (plugin_id) do update set
        slug = excluded.slug,
@@ -6239,6 +6356,7 @@ async function upsertLocalMarketplaceListing(plugin: PluginMarketplaceListing) {
        repository_url = excluded.repository_url,
        documentation_url = excluded.documentation_url,
        runtime = excluded.runtime,
+       execution_environment = excluded.execution_environment,
        execution = excluded.execution,
        entrypoint = excluded.entrypoint,
        events = excluded.events,
@@ -6271,6 +6389,7 @@ async function upsertLocalMarketplaceListing(plugin: PluginMarketplaceListing) {
       plugin.repositoryUrl ?? null,
       plugin.documentationUrl ?? null,
       plugin.runtime,
+      plugin.executionEnvironment ?? "any",
       JSON.stringify(plugin.execution ?? null),
       plugin.entrypoint,
       JSON.stringify(plugin.events),
@@ -6300,10 +6419,9 @@ async function updateMarketplacePluginForUser(
     manifest.id,
   );
   if (!settings?.enabled) return undefined;
+  if (settings.updatePolicy === "locked") return undefined;
   return savePluginSettingsForUser(organizationId, userId, pluginId, {
     enabled: true,
-    config: settings.config,
-    orderingPriority: settings.orderingPriority,
     installedVersion: manifest.version,
     updatePolicy: settings.updatePolicy,
   });
@@ -6317,8 +6435,8 @@ async function uninstallMarketplacePluginForUser(
   const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(
     pluginId,
   );
-  if (pluginPolicy?.mandatory) return undefined;
-  if (!pluginPolicy?.userInstallAllowed) return undefined;
+  if (pluginPolicy?.mandatory)
+    throw new HttpError(403, "Required organization plugins cannot be removed.");
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
   return savePluginSettingsForUser(organizationId, userId, pluginId, {
@@ -6349,13 +6467,16 @@ async function saveOrganizationPluginPolicy(
   pluginId: string,
   body: Record<string, unknown>,
 ) {
-  if (!(await manifestForPluginId(pluginId))) return undefined;
-  const mandatory = Boolean(body.mandatory);
-  const defaultEnabled = mandatory || Boolean(body.defaultEnabled);
-  const userInstallAllowed = mandatory
-    ? false
-    : body.userInstallAllowed !== false;
-  const configLocked = mandatory || Boolean(body.configLocked);
+  const manifest = await manifestForPluginId(pluginId);
+  if (!manifest) return undefined;
+  const currentPolicy = (await readOrganizationPluginPolicy(organizationId)).get(pluginId);
+  const {
+    mandatory,
+    defaultEnabled,
+    userInstallAllowed,
+    configLocked,
+  } = normalizeOrganizationPluginPolicy(body, currentPolicy);
+  if (mandatory || defaultEnabled) assertPluginExecutionAvailable(manifest);
   const result = await pool.query(
     `insert into organization_plugin_policy (organization_id, plugin_id, mandatory, default_enabled, user_install_allowed, config_locked, updated_at)
      values ($1, $2, $3, $4, $5, $6, now())
@@ -6542,16 +6663,16 @@ async function createPluginReleaseSubmission(
     `insert into plugin_releases (
        plugin_id, version, slug, name, description, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
-       repository_url, documentation_url, runtime, execution, entrypoint, events, permissions, effects,
+       repository_url, documentation_url, runtime, execution_environment, execution, entrypoint, events, permissions, effects,
        ordering, config_schema, default_config, tags, icon_text, visual_png,
        git_ref, commit_sha, manifest_path, manifest, submitted_by, updated_at
      )
      values (
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, 'pending_review', $10, $11, $12, $13,
-       $14, $15, $16, $17::jsonb, $18, $19::jsonb, $20::jsonb, $21::jsonb,
-       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
-       $28, $29, $30, $31::jsonb, $32, now()
+       $14, $15, $16, $17, $18::jsonb, $19, $20::jsonb, $21::jsonb, $22::jsonb,
+       $23::jsonb, $24::jsonb, $25::jsonb, $26::jsonb, $27, $28,
+       $29, $30, $31, $32::jsonb, $33, now()
      )
      on conflict (plugin_id, version) do update set
        slug = excluded.slug,
@@ -6569,6 +6690,7 @@ async function createPluginReleaseSubmission(
        repository_url = excluded.repository_url,
        documentation_url = excluded.documentation_url,
        runtime = excluded.runtime,
+       execution_environment = excluded.execution_environment,
        execution = excluded.execution,
        entrypoint = excluded.entrypoint,
        events = excluded.events,
@@ -6607,6 +6729,7 @@ async function createPluginReleaseSubmission(
       release.repositoryUrl,
       release.documentationUrl ?? null,
       release.runtime,
+      release.executionEnvironment,
       JSON.stringify(release.execution ?? null),
       release.entrypoint,
       JSON.stringify(release.events),
@@ -6683,16 +6806,16 @@ async function approvePluginRelease(
     `insert into plugin_marketplace (
        plugin_id, slug, name, description, version, publisher, developer_name, developer_url,
        source, review_status, short_description, long_description, hero_tagline, package_url,
-       repository_url, documentation_url, runtime, execution, entrypoint, events, permissions, effects,
+       repository_url, documentation_url, runtime, execution_environment, execution, entrypoint, events, permissions, effects,
        ordering, config_schema, default_config, tags, icon_text, visual_png,
        featured_rank, seo_title, seo_description, updated_at
      )
      values (
        $1, $2, $3, $4, $5, $6, $7, $8,
        $9, 'approved', $10, $11, $12, $13,
-       $14, $15, $16, $17::jsonb, $18, $19::jsonb, $20::jsonb, $21::jsonb,
-       $22::jsonb, $23::jsonb, $24::jsonb, $25::jsonb, $26, $27,
-       null, $28, $29, now()
+       $14, $15, $16, $17, $18::jsonb, $19, $20::jsonb, $21::jsonb, $22::jsonb,
+       $23::jsonb, $24::jsonb, $25::jsonb, $26::jsonb, $27, $28,
+       null, $29, $30, now()
      )
      on conflict (plugin_id) do update set
        slug = excluded.slug,
@@ -6711,6 +6834,7 @@ async function approvePluginRelease(
        repository_url = excluded.repository_url,
        documentation_url = excluded.documentation_url,
        runtime = excluded.runtime,
+       execution_environment = excluded.execution_environment,
        execution = excluded.execution,
        entrypoint = excluded.entrypoint,
        events = excluded.events,
@@ -6742,6 +6866,7 @@ async function approvePluginRelease(
       release.repositoryUrl,
       release.documentationUrl ?? null,
       release.runtime,
+      release.executionEnvironment,
       JSON.stringify(release.execution ?? null),
       release.entrypoint,
       JSON.stringify(release.events),
@@ -6803,6 +6928,7 @@ type PluginReleaseFields = {
   repositoryUrl: string;
   documentationUrl?: string;
   runtime: OpenLeashPluginManifest["runtime"];
+  executionEnvironment: NonNullable<OpenLeashPluginManifest["executionEnvironment"]>;
   execution?: OpenLeashPluginManifest["execution"];
   entrypoint: string;
   events: OpenLeashPluginManifest["events"];
@@ -6846,6 +6972,7 @@ function pluginReleaseFieldsFromManifest(
   const runtime = (["node", "container"] as const).includes(manifest.runtime as "node" | "container")
     ? (manifest.runtime as "node" | "container")
     : "openleash-core";
+  const executionEnvironment = manifest.executionEnvironment === "cloud-only" ? "cloud-only" : "any";
   const execution = objectValue(manifest.execution) as OpenLeashPluginManifest["execution"];
   if (runtime === "container") {
     if (
@@ -6891,6 +7018,7 @@ function pluginReleaseFieldsFromManifest(
     repositoryUrl: source.repositoryUrl,
     documentationUrl: optionalString(manifest.documentationUrl),
     runtime,
+    executionEnvironment,
     execution,
     entrypoint,
     events: events as OpenLeashPluginManifest["events"],
@@ -6987,6 +7115,7 @@ function pluginReleaseFromRow(row: Record<string, unknown>) {
     repositoryUrl: String(row.repository_url),
     documentationUrl: optionalString(row.documentation_url),
     runtime: String(row.runtime),
+    executionEnvironment: row.execution_environment === "cloud-only" ? "cloud-only" : "any",
     execution: objectValue(row.execution),
     entrypoint: String(row.entrypoint),
     events: arrayValue(row.events),
@@ -7139,6 +7268,25 @@ async function pluginSettingsForRuntime(
   );
 }
 
+async function validatedAgentRuntimeId(
+  userId: string,
+  agentKind?: string,
+  candidate?: string,
+) {
+  if (!candidate) return undefined;
+  const result = await pool.query<{ id: string }>(
+    `select ar.id::text as id
+     from agent_runtimes ar
+     join computers c on c.id = ar.computer_id
+     where c.user_id = $1
+       and ar.id::text = $2
+       and ($3::text is null or ar.kind = $3)
+     limit 1`,
+    [userId, candidate, agentKind ?? null],
+  );
+  return result.rows[0]?.id;
+}
+
 async function organizationIdForAdminRequest(req: express.Request) {
   const session = await getDashboardSession(req.header("authorization") ?? "");
   if (!session) throw new HttpError(401, "dashboard session required");
@@ -7226,7 +7374,7 @@ async function recordContainerRuntimeRuns(input: {
     ? input.request.event.raw as Record<string, unknown>
     : {};
   const sourceRuns = Array.isArray(raw.containerPluginRuns) ? raw.containerPluginRuns : [];
-  const runtimeSettings = await pluginSettingsForRuntime(input.organizationId, input.userId, input.request.agent.kind, input.request.agent.instanceId ?? input.runtimeId);
+  const runtimeSettings = await pluginSettingsForRuntime(input.organizationId, input.userId, input.request.agent.kind, input.runtimeId || input.request.agent.instanceId);
   const runs: PluginRunRecord[] = [];
   for (const value of sourceRuns.slice(0, 32)) {
     if (!value || typeof value !== "object") continue;
@@ -7498,7 +7646,7 @@ async function evaluateAndRecord(
     organizationId,
     user.id,
     request.agent.kind,
-    request.agent.instanceId ?? runtimeId,
+    runtimeId || request.agent.instanceId,
   );
   const policies = await pool.query<Policy>(
     `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
@@ -8411,11 +8559,8 @@ app.use(
     res: express.Response,
     _next: express.NextFunction,
   ) => {
-    console.error(err);
-    const status =
-      typeof (err as { status?: unknown })?.status === "number"
-        ? (err as { status: number }).status
-        : 500;
+    const status = statusCodeForError(err);
+    if (status >= 500) console.error(err);
     const message = err instanceof Error ? err.message : "unknown error";
     res.status(status).json({ success: false, error: message, message });
   },
@@ -8763,6 +8908,7 @@ async function ensureDefaultOrganization() {
 }
 
 async function resolveOnboardingOrganization(req: express.Request) {
+  const session = await getDashboardSession(req.header("authorization") ?? "");
   const slug = String(
     req.query.organizationSlug ??
       req.body?.organizationSlug ??
@@ -8770,6 +8916,8 @@ async function resolveOnboardingOrganization(req: express.Request) {
       "",
   ).trim();
   if (slug) {
+    if (session && slug !== session.organization.slug)
+      throw new HttpError(403, "cannot access another organization");
     const organization = await getOrganizationBySlug(slug);
     if (!organization) {
       const error = new Error(`Organization ${slug} was not found`);
@@ -8783,6 +8931,11 @@ async function resolveOnboardingOrganization(req: express.Request) {
     return organization as Awaited<
       ReturnType<typeof ensureDefaultOrganization>
     >;
+  }
+  if (session) {
+    const organization = await getOrganizationById(session.organization.id);
+    if (!organization) throw new HttpError(404, "organization not found");
+    return organization as Awaited<ReturnType<typeof ensureDefaultOrganization>>;
   }
   return ensureDefaultOrganization();
 }
@@ -10824,12 +10977,17 @@ async function getClientOrDashboardSession(authHeader: string) {
     name: string;
     slug: string | null;
     region: string | null;
+    user_metadata: Record<string, unknown> | null;
+    infrastructure_config: Record<string, unknown> | null;
   }>(
-    `select id, name, slug, region
-     from organizations
-     where id = $1
+    `select o.id, o.name, o.slug, o.region,
+            u.metadata as user_metadata,
+            o.infrastructure_config
+     from organizations o
+     join users u on u.organization_id = o.id
+     where o.id = $1 and u.id = $2
      limit 1`,
-    [user.organization_id],
+    [user.organization_id, user.id],
   );
   const row = organization.rows[0];
   if (!row) return null;
@@ -10846,6 +11004,14 @@ async function getClientOrDashboardSession(authHeader: string) {
       name: row.name,
       slug: row.slug,
       region: row.region,
+    },
+    account: {
+      audience: row.user_metadata?.accountAudience === "organization"
+        ? "organization" as const
+        : "individual" as const,
+      packageId: normalizeAccountPackage(
+        row.user_metadata?.accountPackage ?? row.infrastructure_config?.accountPackage,
+      ),
     },
   };
 }
@@ -11981,7 +12147,7 @@ app.use(
     next: express.NextFunction,
   ) => {
     if (res.headersSent) return next(error);
-    const statusCode = error instanceof HttpError ? error.statusCode : 500;
+    const statusCode = statusCodeForError(error);
     const message =
       error instanceof Error ? error.message : "OpenLeash API error";
     res.status(statusCode).json({ success: false, error: message, message });

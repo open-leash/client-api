@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { EvaluationRequest } from "@openleash/shared";
+import type { EvaluationRequest, PluginCatalogItem } from "@openleash/shared";
 import { createPluginCapabilities } from "./capabilities.js";
-import { normalizeIslandContribution } from "./island-contributions.js";
+import { isIslandContributionEnabled, normalizeIslandContribution } from "./island-contributions.js";
 
 const request: EvaluationRequest = {
   computer: { hostname: "dev-mac", platform: "darwin" },
@@ -21,6 +21,7 @@ test("plugin island API infers session, agent, project, plugin, and expiry", asy
   const capabilities = createPluginCapabilities({
     pluginId: "community.test-progress",
     request,
+    runtimeId: "agent-runtime-123",
     permissions: ["island:publish"],
   });
   const result = await capabilities.island.reportActivity({
@@ -34,9 +35,49 @@ test("plugin island API infers session, agent, project, plugin, and expiry", asy
   assert.equal(result.contribution.pluginId, "community.test-progress");
   assert.equal(result.contribution.sessionId, "session-123");
   assert.equal(result.contribution.agentKind, "codex");
+  assert.equal(result.contribution.agentId, "agent-runtime-123");
   assert.equal(result.contribution.projectPath, "/code/openleash");
   assert.deepEqual(result.contribution.progress, { current: 18, total: 24, label: "tests" });
   assert.ok(Date.parse(result.contribution.expiresAt) > Date.parse(result.contribution.updatedAt));
+});
+
+test("island visibility follows organization and user agent profile precedence", () => {
+  const contribution = normalizeIslandContribution(
+    { pluginId: "community.scoped", request, agentId: "agent-runtime-123" },
+    { kind: "annotation", key: "scope", label: "Scoped" },
+  );
+  const plugin = {
+    id: "community.scoped",
+    settings: {
+      enabled: true,
+      config: {},
+      inheritedProfiles: [{
+        id: "org-codex",
+        name: "Org Codex",
+        agentKinds: ["codex"],
+        enabled: true,
+        config: {},
+      }],
+      profiles: [{
+        id: "this-agent-off",
+        name: "This agent off",
+        agentKinds: ["codex"],
+        agentIds: ["agent-runtime-123"],
+        enabled: false,
+        config: {},
+      }],
+    },
+    organizationPolicy: { mandatory: false, defaultEnabled: true, userInstallAllowed: true, configLocked: false },
+  } as PluginCatalogItem;
+  assert.equal(isIslandContributionEnabled(contribution, [plugin]), false);
+  assert.equal(isIslandContributionEnabled(
+    { ...contribution, agentId: "agent-runtime-456" },
+    [plugin],
+  ), true);
+  assert.equal(isIslandContributionEnabled(contribution, [{
+    ...plugin,
+    organizationPolicy: { ...plugin.organizationPolicy!, configLocked: true },
+  }]), true);
 });
 
 test("island publishing requires an explicit manifest permission", async () => {
