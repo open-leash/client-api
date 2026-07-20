@@ -22,18 +22,17 @@
 
 ## ✨ What this app is
 
-`client-api` is the managed API that desktop clients, mobile clients, hooks, and enrollment flows talk to in Private Cloud. OpenLeash Cloud wraps the same surface through `cloud-client-api`.
+`client-api` is the single public backend used by Individual Open Source and Private Cloud. OpenLeash Cloud wraps the same surface through `cloud-client-api`; it does not fork the core plugin, policy, or agent-event semantics.
 
 It evaluates agent events, records audit trails, stores pending approvals, serves mobile state, manages update metadata, and exposes the core API that OpenLeash Cloud wraps for hosted customers.
 
 ```text
-desktop-client local API
-        │
-        ▼
-client-api ──► Postgres policies, audit, approvals, org state
-        ▲
-        │
-mobile-client
+installed hooks ───────────────► configured client-api
+provider traffic ─► local proxy ─► desktop edge ─► plugin containers
+                                         │
+                                         └────────► configured client-api
+
+client-api ──► Postgres policy, plugin settings, audit, approvals, account/org state
 ```
 
 ---
@@ -42,6 +41,7 @@ mobile-client
 
 | Mode | Role |
 | --- | --- |
+| 🧑‍💻 Individual Open Source | Runs locally with the real public Postgres schema for one user. |
 | 🏢 Private Cloud | Customer-hosted managed API. |
 | ☁️ OpenLeash Cloud | Wrapped by `cloud-client-api` for hosted tenancy and cloud controls. |
 
@@ -49,7 +49,7 @@ mobile-client
 
 ## 🔥 Responsibilities
 
-- Receive normalized agent events from `desktop-client`
+- Receive normalized events from installed hooks, the desktop provider edge, and retrospective provider connectors
 - Evaluate actions against policy and model providers
 - Store audit, evaluations, MCP calls, skills, triggers, and pending approvals
 - Run the ordered OpenLeash plugin pipeline for prompts, tools, agent responses, startup, sessions, MCP inventory, and skill changes
@@ -77,7 +77,11 @@ legacy relay behavior; it is not a separate product backend.
 
 ## 🔌 Plugin architecture
 
-Core protections are implemented as pipeline plugins. Each plugin declares a manifest with metadata, events, permissions, settings, effects, and ordering. Implementations use stable runtime capabilities instead of importing OpenLeash internals.
+Core protections are implemented as pipeline plugins. Each plugin declares a manifest with metadata, events, permissions, settings, effects, ordering, and execution environment. Implementations use stable runtime capabilities instead of importing OpenLeash internals.
+
+OpenLeash resolves installation and configuration before invoking plugin code. Individual users can configure a plugin globally, for an agent kind, or for an exact authenticated/enrolled agent runtime. Organization admins independently control mandatory installation, default enablement, optional employee installs, and configuration locking; organization profiles apply across employees, followed by permitted user profiles. A mandatory plugin cannot be removed or disabled by an employee, but it remains configurable when the admin leaves settings unlocked.
+
+Plugins may publish typed, expiring annotations, progress, and ambient status through the Island capability. OpenLeash owns rendering and navigation; plugins never send UI code. See [`docs/PLUGIN_ISLAND.md`](docs/PLUGIN_ISLAND.md).
 
 Developer docs live in [`src/plugins/README.md`](src/plugins/README.md). First-party plugin examples live as one public repository per plugin under the `open-leash/plugin-*` pattern.
 
