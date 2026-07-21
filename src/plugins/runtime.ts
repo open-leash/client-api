@@ -114,8 +114,21 @@ function containerPluginAlreadyApplied(
     request.event.raw && typeof request.event.raw === "object"
       ? (request.event.raw as Record<string, unknown>)
       : undefined;
-  return Array.isArray(raw?.containerPluginApplied) &&
-    raw.containerPluginApplied.includes(pluginId);
+  if (
+    Array.isArray(raw?.containerPluginApplied) &&
+    raw.containerPluginApplied.includes(pluginId)
+  ) {
+    return true;
+  }
+  // A container that successfully inspected a request owns that event even when
+  // it returned `unchanged`. Re-running its legacy in-process implementation in
+  // the cloud would duplicate work and can trigger a second model evaluation.
+  return Array.isArray(raw?.containerPluginRuns) &&
+    raw.containerPluginRuns.some((run) => {
+      if (!run || typeof run !== "object") return false;
+      const record = run as { pluginId?: unknown; status?: unknown };
+      return record.pluginId === pluginId && record.status !== "failed";
+    });
 }
 
 function sourceAllowsPromptReplacement(

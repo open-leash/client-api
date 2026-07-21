@@ -23,7 +23,14 @@ import { pool } from "../db.js";
 import type { TenantModelKey } from "../model-keys.js";
 import { clearIslandContribution, publishIslandContribution } from "./island-contributions.js";
 
-const pluginLlmModel = process.env.OPENLEASH_PLUGIN_LLM_MODEL ?? process.env.OPENAI_EVAL_MODEL ?? "gpt-5.2";
+// Request-path plugin classification should use a fast model by default. The
+// heavyweight policy model remains independently configurable via
+// OPENAI_EVAL_MODEL, while operators can explicitly override this value.
+const pluginLlmModel = process.env.OPENLEASH_PLUGIN_LLM_MODEL ?? "gpt-4.1-mini";
+const pluginLlmTimeoutMs = Math.max(
+  1000,
+  Number(process.env.OPENLEASH_PLUGIN_LLM_TIMEOUT_MS ?? 8000),
+);
 const pluginAnthropicModel = process.env.ANTHROPIC_EVAL_MODEL ?? "claude-3-5-sonnet-latest";
 const pluginDeepseekModel = process.env.DEEPSEEK_EVAL_MODEL ?? "deepseek-chat";
 
@@ -276,6 +283,7 @@ async function evaluatePluginJson<T = unknown>(
         "x-api-key": config.apiKey,
         "anthropic-version": "2023-06-01"
       },
+      signal: AbortSignal.timeout(pluginLlmTimeoutMs),
       body: JSON.stringify({
         model: pluginAnthropicModel,
         max_tokens: normalizedMaxTokens(request.maxOutputTokens),
@@ -296,6 +304,7 @@ async function evaluatePluginJson<T = unknown>(
 
   const client = new OpenAI({
     apiKey: config.apiKey,
+    timeout: pluginLlmTimeoutMs,
     ...(config.baseURL ? { baseURL: config.baseURL } : {})
   });
   if (config.provider === "deepseek") {

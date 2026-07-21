@@ -12,6 +12,7 @@ import { runSensitiveAccess } from "./sensitive-access/index.js";
 import { runSiemExporter } from "./siem-exporter/index.js";
 import { runSkillScanner } from "./skill-scanner/index.js";
 import { pluginsForEvent } from "./registry.js";
+import { runPromptPipeline } from "./runtime.js";
 
 function request(toolName = "Bash", input: unknown = { command: "echo ok" }): EvaluationRequest {
   return {
@@ -93,6 +94,47 @@ test("sensitive-access asks before reading a private key", async () => {
   const result = await runSensitiveAccess(pipelineInput(request("Bash", { command: "cat ~/.ssh/id_rsa" })), cap);
   assert.ok(result.results.some((item) => item.status === "needs_question" || item.status === "failed"));
   assert.ok(emitted.signals.length > 0);
+});
+
+test("sensitive-access does not invoke an LLM for a routine coding event", async () => {
+  let llmCalls = 0;
+  const { cap } = capabilities();
+  cap.llm.evaluateJson = async () => {
+    llmCalls += 1;
+    throw new Error("routine events must not reach the evaluator");
+  };
+  const result = await runSensitiveAccess(
+    pipelineInput(request("Write", { file_path: "server.js", content: "console.log('hello')" })),
+    cap,
+  );
+  assert.equal(llmCalls, 0);
+  assert.equal(result.run.status, "passed");
+});
+
+test("prompt pipeline does not rerun a container plugin that returned unchanged", async () => {
+  const promptRequest = request();
+  promptRequest.event.eventName = "UserPromptSubmit";
+  promptRequest.event.tool = undefined;
+  promptRequest.event.prompt = "Build a simple hello world Node.js website.";
+  promptRequest.event.raw = {
+    containerPluginRuns: [
+      { pluginId: "openleash.prompt-compression", status: "unchanged", durationMs: 12 },
+    ],
+  };
+  const result = await runPromptPipeline({
+    request: promptRequest,
+    config: {
+      compression: { enabled: true, level: "standard", conciseResponse: false, model: "" },
+      dlp: { enabled: false, action: "mask", categories: [], model: "" },
+    },
+    plugins: new Map([
+      ["openleash.prompt-compression", { enabled: true, config: {} }],
+    ]),
+  });
+  assert.equal(result.finalPrompt, promptRequest.event.prompt);
+  assert.ok(
+    !result.runs.some((run) => run.pluginId === "openleash.prompt-compression"),
+  );
 });
 
 test("blast-radius blocks recursive filesystem deletion", async () => {

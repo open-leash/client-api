@@ -39,9 +39,14 @@ export async function runSensitiveAccess(input: EvaluationPipelineInput, capabil
   const text = context.searchText;
   const config = pluginConfig(input.plugins?.get(manifest.id)?.config);
   const matches = detectSensitiveAccess(text, config);
-  const llm = await evaluateSensitiveAccess(context, capabilities).catch((error) => ({
-    error: error instanceof Error ? error.message : String(error)
-  }));
+  // The LLM result is deliberately ignored unless the event contains an actual
+  // sensitive-resource, environment-dump, or exfiltration anchor. Avoid paying
+  // for and blocking on a model call when it cannot affect the decision.
+  const llm = shouldUseSensitiveAccessLlm(text)
+    ? await evaluateSensitiveAccess(context, capabilities).catch((error) => ({
+        error: error instanceof Error ? error.message : String(error)
+      }))
+    : undefined;
   if (llm && "decision" in llm) {
     for (const match of matchesFromLlm(llm.decision, config, text)) {
       if (!matches.some((item) => item.policyId === match.policyId)) matches.push(match);
@@ -101,6 +106,14 @@ export async function runSensitiveAccess(input: EvaluationPipelineInput, capabil
       }
     })
   };
+}
+
+export function shouldUseSensitiveAccessLlm(text: string) {
+  return SECRET_FILE_PATTERN.test(text) ||
+    SENSITIVE_RESOURCE_PHRASE_PATTERN.test(text) ||
+    ENV_DUMP_PATTERN.test(text) ||
+    SECRET_VALUE_PATTERN.test(text) ||
+    EXFIL_PATTERN.test(text);
 }
 
 async function evaluateSensitiveAccess(context: ReturnType<typeof eventContext>, capabilities: PluginCapabilities) {
