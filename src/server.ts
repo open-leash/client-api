@@ -7412,6 +7412,7 @@ async function recordContainerRuntimeRuns(input: {
     ? input.request.event.raw as Record<string, unknown>
     : {};
   const sourceRuns = Array.isArray(raw.containerPluginRuns) ? raw.containerPluginRuns : [];
+  if (sourceRuns.length === 0) return [];
   const runtimeSettings = await pluginSettingsForRuntime(input.organizationId, input.userId, input.request.agent.kind, input.runtimeId || input.request.agent.instanceId);
   const runs: PluginRunRecord[] = [];
   for (const value of sourceRuns.slice(0, 32)) {
