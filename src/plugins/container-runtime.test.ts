@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyValidatedProviderPatches, executeContainerPluginTool, transformWithContainerPlugins } from "./container-runtime.js";
-import type { PluginCatalogItem } from "@openleash/shared";
+import { applyValidatedProviderPatches, executeContainerPluginEvent, executeContainerPluginTool, transformWithContainerPlugins } from "./container-runtime.js";
+import type { PluginCapabilities, PluginCatalogItem } from "@openleash/shared";
 
 test("applies only provider-safe JSON patches", () => {
   const result = applyValidatedProviderPatches(
@@ -141,4 +141,67 @@ test("executes a correlated plugin tool through the same signed runtime", async 
     },
   });
   assert.equal(result.content, "original");
+});
+
+test("round-trips privileged capabilities without giving the container credentials", async () => {
+  const plugin = {
+    id: "openleash.review",
+    name: "review",
+    description: "test",
+    version: "1.0.0",
+    publisher: "openleash",
+    runtime: "container",
+    execution: {
+      type: "container",
+      placement: "server",
+      protocol: "openleash-container-plugin.v1",
+      image: "example/review:1.0.0",
+      eventPath: "/v1/events",
+    },
+    entrypoint: "container",
+    events: ["tool.beforeUse"],
+    permissions: ["event:read", "model:invoke", "decision:write"],
+    effects: ["ask"],
+    settings: { enabled: true, config: {}, installedVersion: "1.0.0" },
+  } as PluginCatalogItem;
+  let calls = 0;
+  const capabilities = {
+    llm: {
+      evaluateJson: async () => ({ json: { risky: true }, model: "test", provider: "test", source: "heuristic" }),
+    },
+  } as unknown as PluginCapabilities;
+  const result = await executeContainerPluginEvent<{ decision: string }>({
+    plugin,
+    organizationId: "org",
+    userId: "user",
+    event: "tool.beforeUse",
+    payload: { tool: { name: "Bash" } },
+    capabilities,
+    env: {
+      OPENLEASH_PLUGIN_ENDPOINTS: JSON.stringify({ "openleash.review": "http://worker" }),
+      OPENLEASH_PLUGIN_RUNTIME_SECRET: "secret",
+    },
+    fetchImpl: async (_url, init) => {
+      calls += 1;
+      const request = JSON.parse(String(init?.body));
+      assert.equal(request.tenant.organizationId, "org");
+      assert.equal("providerKey" in request, false);
+      const body = calls === 1
+        ? {
+            protocol: "openleash-container-plugin.v1",
+            requestId: request.requestId,
+            status: "capability_required",
+            capabilityRequests: [{ id: "llm-1", capability: "llm.evaluateJson", request: { prompt: "review" } }],
+          }
+        : {
+            protocol: "openleash-container-plugin.v1",
+            requestId: request.requestId,
+            status: "completed",
+            output: { decision: request.capabilityResults["llm-1"].value.json.risky ? "ask" : "allow" },
+          };
+      return new Response(JSON.stringify(body), { status: 200 });
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.decision, "ask");
 });

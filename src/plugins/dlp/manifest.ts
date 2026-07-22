@@ -1,4 +1,4 @@
-import type { OpenLeashPluginManifest } from "@openleash/shared";
+import { firstPartyEventContainer, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const dlpManifest: OpenLeashPluginManifest = {
   id: "openleash.dlp",
@@ -7,8 +7,9 @@ export const dlpManifest: OpenLeashPluginManifest = {
   repositoryUrl: "https://github.com/open-leash/plugin-data-leakage-prevention",
   version: "1.0.0",
   publisher: "openleash",
-  runtime: "openleash-core",
-  entrypoint: "plugins/dlp",
+  runtime: "container",
+  execution: firstPartyEventContainer("data-leakage-prevention", "1.0.0"),
+  entrypoint: "container",
   events: ["prompt.beforeSubmit"],
   permissions: ["event:read", "prompt:read", "prompt:write", "decision:write", "model:invoke", "audit:write", "signal:write"],
   effects: ["transform", "deny", "observe"],

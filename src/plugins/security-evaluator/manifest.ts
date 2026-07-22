@@ -1,4 +1,4 @@
-import type { OpenLeashPluginManifest } from "@openleash/shared";
+import { firstPartyEventContainer, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const securityEvaluatorManifest: OpenLeashPluginManifest = {
   id: "openleash.rules-enforcer",
@@ -7,8 +7,9 @@ export const securityEvaluatorManifest: OpenLeashPluginManifest = {
   repositoryUrl: "https://github.com/open-leash/plugin-rules-enforcer",
   version: "1.0.0",
   publisher: "openleash",
-  runtime: "openleash-core",
-  entrypoint: "plugins/rules-enforcer",
+  runtime: "container",
+  execution: firstPartyEventContainer("rules-enforcer", "1.0.0"),
+  entrypoint: "container",
   events: ["prompt.beforeSubmit", "agent.response", "tool.beforeUse", "tool.afterUse"],
   permissions: ["event:read", "prompt:read", "tool:read", "decision:write", "model:invoke", "audit:write", "log:write", "signal:write", "usage:write", "notification:send"],
   effects: ["observe", "ask", "deny"],

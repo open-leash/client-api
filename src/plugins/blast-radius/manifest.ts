@@ -1,4 +1,4 @@
-import type { OpenLeashPluginManifest } from "@openleash/shared";
+import { firstPartyEventContainer, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const blastRadiusManifest: OpenLeashPluginManifest = {
   id: "openleash.blast-radius",
@@ -8,8 +8,9 @@ export const blastRadiusManifest: OpenLeashPluginManifest = {
   repositoryUrl: "https://github.com/open-leash/plugin-blast-radius",
   version: "1.0.2",
   publisher: "openleash",
-  runtime: "openleash-core",
-  entrypoint: "plugins/blast-radius",
+  runtime: "container",
+  execution: firstPartyEventContainer("blast-radius", "1.0.2"),
+  entrypoint: "container",
   events: ["prompt.beforeSubmit", "tool.beforeUse"],
   permissions: ["event:read", "prompt:read", "tool:read", "decision:write", "audit:write", "log:write", "signal:write", "island:publish"],
   effects: ["observe", "ask", "deny"],

@@ -1,4 +1,4 @@
-import type { OpenLeashPluginManifest } from "@openleash/shared";
+import { firstPartyEventContainer, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const sensitiveAccessManifest: OpenLeashPluginManifest = {
   id: "openleash.sensitive-access",
@@ -8,8 +8,9 @@ export const sensitiveAccessManifest: OpenLeashPluginManifest = {
   repositoryUrl: "https://github.com/open-leash/plugin-sensitive-access",
   version: "1.0.0",
   publisher: "openleash",
-  runtime: "openleash-core",
-  entrypoint: "plugins/sensitive-access",
+  runtime: "container",
+  execution: firstPartyEventContainer("sensitive-access", "1.0.0"),
+  entrypoint: "container",
   events: ["prompt.beforeSubmit", "agent.response", "tool.beforeUse", "tool.afterUse"],
   permissions: ["event:read", "prompt:read", "tool:read", "model:invoke", "decision:write", "audit:write", "log:write", "signal:write"],
   effects: ["observe", "ask", "deny"],

@@ -3,6 +3,7 @@ import type {
   OpenLeashPluginManifest,
   PluginCatalogItem,
   PluginContainerExecution,
+  PluginCapabilities,
   PluginLogRequest,
   PluginIslandPublishRequest,
   PluginSignalRequest,
@@ -66,6 +67,110 @@ export type ContainerTransformResult = {
     emissions?: ContainerTransformResponse["emissions"];
   }>;
 };
+
+export type ContainerCapabilityRequest = {
+  /** Stable within one event invocation so a retried round can reuse the result. */
+  id: string;
+  capability:
+    | "context.instructions.list"
+    | "llm.evaluateJson"
+    | "storage.get"
+    | "storage.set"
+    | "storage.list"
+    | "storage.delete"
+    | "notification.send"
+    | "island.annotateSession"
+    | "island.reportActivity"
+    | "island.publishStatus"
+    | "island.clear"
+    | "log.emit"
+    | "signals.emit"
+    | "usage.record";
+  request?: unknown;
+};
+
+export type ContainerEventRequest = {
+  protocol: typeof CONTAINER_PLUGIN_PROTOCOL;
+  requestId: string;
+  round: number;
+  plugin: { id: string; version: string };
+  tenant: { organizationId: string; userId: string };
+  event: string;
+  settings: { profileIds: string[]; configHash: string };
+  config: Record<string, unknown>;
+  input: unknown;
+  capabilityResults: Record<string, unknown>;
+};
+
+export type ContainerEventResponse = {
+  protocol: typeof CONTAINER_PLUGIN_PROTOCOL;
+  requestId: string;
+  status: "completed" | "capability_required";
+  output?: unknown;
+  capabilityRequests?: ContainerCapabilityRequest[];
+};
+
+/**
+ * Executes an arbitrary normalized event in an isolated plugin container.
+ * Privileged operations are round-tripped to permission-checked host capabilities;
+ * containers never receive database, model-provider, or OpenLeash credentials.
+ */
+export async function executeContainerPluginEvent<T = unknown>(input: {
+  plugin: PluginCatalogItem;
+  organizationId: string;
+  userId: string;
+  event: string;
+  payload: unknown;
+  capabilities: PluginCapabilities;
+  env?: NodeJS.ProcessEnv;
+  fetchImpl?: typeof fetch;
+}): Promise<T> {
+  const execution = input.plugin.execution;
+  if (!input.plugin.settings.enabled || execution?.type !== "container" || !execution.eventPath) {
+    throw new Error(`plugin ${input.plugin.id} does not expose generic event execution`);
+  }
+  const requestId = crypto.randomUUID();
+  const capabilityResults: Record<string, unknown> = {};
+  const env = input.env ?? process.env;
+  const fetchImpl = input.fetchImpl ?? fetch;
+  for (let round = 0; round < 32; round += 1) {
+    const request: ContainerEventRequest = {
+      protocol: CONTAINER_PLUGIN_PROTOCOL,
+      requestId,
+      round,
+      plugin: {
+        id: input.plugin.id,
+        version: input.plugin.settings.installedVersion ?? input.plugin.version,
+      },
+      tenant: { organizationId: input.organizationId, userId: input.userId },
+      event: input.event,
+      settings: settingsContext(input.plugin.settings),
+      config: input.plugin.settings.config,
+      input: input.payload,
+      capabilityResults,
+    };
+    const response = await invokeContainerEvent({
+      plugin: input.plugin,
+      execution,
+      request,
+      env,
+      fetchImpl,
+    });
+    if (response.status === "completed") return response.output as T;
+    const requests = response.capabilityRequests ?? [];
+    if (requests.length === 0) {
+      throw new Error(`container plugin ${input.plugin.id} requested capabilities without listing any calls`);
+    }
+    for (const call of requests) {
+      if (Object.hasOwn(capabilityResults, call.id)) continue;
+      capabilityResults[call.id] = {
+        ok: true,
+        value: (await executeHostCapability(input.capabilities, call)) ?? null,
+      };
+    }
+  }
+  throw new Error(`container plugin ${input.plugin.id} exceeded the capability round limit`);
+}
 
 export async function executeContainerPluginTool(input: {
   plugin: PluginCatalogItem;
@@ -238,6 +343,94 @@ function settingsContext(settings: PluginCatalogItem["settings"]) {
     profileIds: settings.effectiveProfileIds ?? [],
     configHash: crypto.createHash("sha256").update(JSON.stringify(settings.config)).digest("hex"),
   };
+}
+
+async function invokeContainerEvent(input: {
+  plugin: OpenLeashPluginManifest;
+  execution: PluginContainerExecution;
+  request: ContainerEventRequest;
+  env: NodeJS.ProcessEnv;
+  fetchImpl: typeof fetch;
+}): Promise<ContainerEventResponse> {
+  const endpoint = joinUrl(
+    endpointBaseForPlugin(input.plugin.id, input.env),
+    input.execution.eventPath ?? "/v1/events",
+  );
+  const body = JSON.stringify(input.request);
+  const timestamp = String(Date.now());
+  const secret = String(input.env.OPENLEASH_PLUGIN_RUNTIME_SECRET ?? "");
+  if (input.env.NODE_ENV === "production" && !secret) {
+    throw new Error("OPENLEASH_PLUGIN_RUNTIME_SECRET is required in production");
+  }
+  const signature = secret
+    ? crypto.createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex")
+    : "";
+  const response = await input.fetchImpl(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-openleash-plugin-protocol": CONTAINER_PLUGIN_PROTOCOL,
+      "x-openleash-plugin-id": input.plugin.id,
+      "x-openleash-plugin-version": input.request.plugin.version,
+      "x-openleash-timestamp": timestamp,
+      ...(signature ? { "x-openleash-signature": `sha256=${signature}` } : {}),
+    },
+    body,
+    signal: AbortSignal.timeout(input.execution.timeoutMs ?? 30_000),
+  });
+  if (!response.ok) {
+    throw new Error(`container plugin ${input.plugin.id} event returned HTTP ${response.status}`);
+  }
+  const result = (await response.json()) as Partial<ContainerEventResponse>;
+  if (result.protocol !== CONTAINER_PLUGIN_PROTOCOL || result.requestId !== input.request.requestId) {
+    throw new Error(`container plugin ${input.plugin.id} returned an incompatible event response`);
+  }
+  if (result.status !== "completed" && result.status !== "capability_required") {
+    throw new Error(`container plugin ${input.plugin.id} returned an invalid event status`);
+  }
+  return result as ContainerEventResponse;
+}
+
+async function executeHostCapability(
+  capabilities: PluginCapabilities,
+  call: ContainerCapabilityRequest,
+) {
+  // The manifest permission set was already applied when the host created this
+  // capability object. Calling an undeclared capability therefore fails here.
+  switch (call.capability) {
+    case "context.instructions.list":
+      return capabilities.context.instructions.list(call.request as Parameters<typeof capabilities.context.instructions.list>[0]);
+    case "llm.evaluateJson":
+      return capabilities.llm.evaluateJson(call.request as Parameters<typeof capabilities.llm.evaluateJson>[0]);
+    case "storage.get":
+      return capabilities.storage.get(call.request as Parameters<typeof capabilities.storage.get>[0]);
+    case "storage.set":
+      return capabilities.storage.set(call.request as Parameters<typeof capabilities.storage.set>[0]);
+    case "storage.list":
+      return capabilities.storage.list(call.request as Parameters<typeof capabilities.storage.list>[0]);
+    case "storage.delete":
+      return capabilities.storage.delete(call.request as Parameters<typeof capabilities.storage.delete>[0]);
+    case "notification.send":
+      return capabilities.notification.send(call.request as Parameters<typeof capabilities.notification.send>[0]);
+    case "island.annotateSession":
+      return capabilities.island.annotateSession(call.request as Parameters<typeof capabilities.island.annotateSession>[0]);
+    case "island.reportActivity":
+      return capabilities.island.reportActivity(call.request as Parameters<typeof capabilities.island.reportActivity>[0]);
+    case "island.publishStatus":
+      return capabilities.island.publishStatus(call.request as Parameters<typeof capabilities.island.publishStatus>[0]);
+    case "island.clear":
+      return capabilities.island.clear(call.request as Parameters<typeof capabilities.island.clear>[0]);
+    case "log.emit":
+      return capabilities.log.emit(call.request as Parameters<typeof capabilities.log.emit>[0]);
+    case "signals.emit":
+      return capabilities.signals.emit(call.request as Parameters<typeof capabilities.signals.emit>[0]);
+    case "usage.record":
+      return capabilities.usage.record(call.request as Parameters<typeof capabilities.usage.record>[0]);
+    default: {
+      const exhaustive: never = call.capability;
+      throw new Error(`unsupported plugin capability: ${exhaustive}`);
+    }
+  }
 }
 
 async function invokeContainerPlugin(input: {

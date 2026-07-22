@@ -12,7 +12,7 @@ import { runSensitiveAccess } from "./sensitive-access/index.js";
 import { runSiemExporter } from "./siem-exporter/index.js";
 import { runSkillScanner } from "./skill-scanner/index.js";
 import { pluginsForEvent } from "./registry.js";
-import { runPromptPipeline } from "./runtime.js";
+import { runEvaluationPipeline, runPromptPipeline } from "./runtime.js";
 
 function request(toolName = "Bash", input: unknown = { command: "echo ok" }): EvaluationRequest {
   return {
@@ -135,6 +135,24 @@ test("prompt pipeline does not rerun a container plugin that returned unchanged"
   assert.ok(
     !result.runs.some((run) => run.pluginId === "openleash.prompt-compression"),
   );
+});
+
+test("cloud evaluation records edge work without rerunning the same plugin", async () => {
+  const edgeRequest = request("Bash", { command: "rm -rf build" });
+  edgeRequest.event.raw = {
+    containerPluginRuns: [
+      { pluginId: "openleash.blast-radius", status: "completed", durationMs: 8 },
+    ],
+  };
+  const result = await runEvaluationPipeline({
+    request: edgeRequest,
+    policies: [],
+    plugins: new Map([
+      ["openleash.blast-radius", { enabled: true, config: {} }],
+    ]),
+  });
+  assert.deepEqual(result.results, []);
+  assert.deepEqual(result.runs, []);
 });
 
 test("blast-radius blocks recursive filesystem deletion", async () => {

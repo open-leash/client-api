@@ -1,9 +1,9 @@
 # OpenLeash Pipeline Plugins
 
-OpenLeash features run as ordered pipeline plugins. Plugins can use the trusted in-process core runtime or the language-independent container runtime. A plugin is described by a versioned manifest; in-process plugins also contain an `index.ts` implementation, while container plugins publish an OCI image.
+OpenLeash features run as ordered, isolated container plugins. A plugin is described by a versioned manifest and publishes an OCI image implementing the language-independent container protocol. There is no in-process plugin runtime or fallback.
 
 - `manifest.ts` - metadata, events, permissions, effects, ordering, and config schema.
-- `index.ts` - the implementation used by the runtime.
+- The implementation can use any language or framework as long as its container implements the protocol.
 
 Current first-party plugins:
 
@@ -73,12 +73,30 @@ Container plugins use `openleash-container-plugin.v1`. The local proxy never cal
 The required endpoints are:
 
 - `GET /healthz`
+- `POST /v1/events` for subscribed normalized pipeline events
 - `POST /v1/transform`
 - `POST /v1/tools/execute` when the manifest advertises tool execution
 
-Requests carry a correlation ID, exact plugin ID/version, tenant/user/session scope, config, and payload. They are HMAC-signed with a short-lived runtime secret. Responses must echo the protocol and correlation ID. Transform responses return constrained JSON Patch operations; containers never receive database credentials, provider credentials, a Docker socket, or direct OpenLeash internals. Desktop containers have networking disabled unless a reviewed manifest explicitly declares `network:access`; the desktop edge tunnels signed HTTP to the container's own loopback API with `docker exec`. The first-party Token Saver therefore has no runtime network route at all.
+Requests carry a correlation ID, exact plugin ID/version, tenant/user/session scope, config, and payload. They are HMAC-signed with a runtime secret. Responses must echo the protocol and correlation ID. Transform responses return constrained JSON Patch operations; containers never receive database credentials, provider credentials, a Docker socket, or direct OpenLeash internals. Desktop containers without `network:access` live on an internal Docker network with no default route. A loopback-only allow-list gateway forwards signed requests only to installed plugin IDs, so the plugins remain reachable without receiving general network access.
 
-Desktop lifecycle is desired-state reconciliation: login/catalog sync installs enabled edge images, health-checks a candidate, switches versions with a rollback container retained until success, and removes disabled containers. Published community images require an immutable digest. Cloud runs reviewed shared plugins in a warm autoscaled pool; plugins that need stronger isolation declare `tenant-dedicated` or `customer-hosted` placement instead.
+Every plugin image must declare an OCI `HEALTHCHECK` in addition to serving `GET /healthz`. OpenLeash stages and verifies that check inside the isolated network before replacing a working container.
+
+Generic event execution is a bounded multi-round exchange. A completed response uses:
+
+```json
+{
+  "protocol": "openleash-container-plugin.v1",
+  "requestId": "same-as-request",
+  "status": "completed",
+  "output": { "results": [], "run": {} }
+}
+```
+
+When a plugin needs a privileged primitive, it returns `status: "capability_required"` with one or more stable calls such as `{ "id": "llm.evaluateJson:0", "capability": "llm.evaluateJson", "request": {} }`. The host checks the manifest permission, executes the primitive, and invokes the same event again with results keyed by call ID. Plugins must produce stable call IDs across retries. The host caps the exchange at 32 rounds and applies the manifest failure mode. This allows arbitrary languages to use model evaluation, scoped storage, instructions, notifications, island UI, logs, signals, and usage accounting without receiving the underlying credentials.
+
+See `examples/container-plugin` for a dependency-free implementation.
+
+Desktop lifecycle is desired-state reconciliation: login/catalog sync installs enabled edge images, health-checks a candidate, switches versions with a rollback container retained until success, and removes disabled containers. Published community images require an immutable digest. Cloud runs reviewed shared plugins in a warm autoscaled pool; plugins that need stronger isolation declare `tenant-dedicated` or `customer-hosted` placement instead. An edge-completed event carries correlated container-run evidence to the hosted API, which records that run and does not execute the same plugin again. Events originating in SaaS or provider-hosted agents have no edge evidence, so the hosted API executes the subscribed cloud worker.
 
 ## Capability Boundary
 
@@ -180,8 +198,16 @@ export const manifest = {
   name: "Prompt Labeler",
   version: "1.0.0",
   publisher: "acme",
-  runtime: "node",
-  entrypoint: "src/index.ts",
+  runtime: "container",
+  entrypoint: "container",
+  execution: {
+    type: "container",
+    placement: "server",
+    protocol: "openleash-container-plugin.v1",
+    image: "ghcr.io/acme/prompt-labeler:1.0.0",
+    digest: "sha256:<immutable-image-digest>",
+    eventPath: "/v1/events"
+  },
   events: ["prompt.beforeSubmit"],
   permissions: ["event:read", "prompt:read", "audit:write", "storage:write"],
   effects: ["observe"],

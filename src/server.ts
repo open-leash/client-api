@@ -31,6 +31,7 @@ import {
   type OpenLeashOutcomeRecord,
   type OpenLeashOutcomeStatus,
   type PluginCatalogItem,
+  type PluginFinding,
   type PluginLogRecord,
   type PluginLogRequest,
   type PluginIslandPublishRequest,
@@ -61,9 +62,8 @@ import { firstPartyPluginManifests } from "./plugins/registry.js";
 import { eventForHookEvent } from "./plugins/events.js";
 import { runEvaluationPipeline, runPromptPipeline } from "./plugins/runtime.js";
 import { createPluginCapabilities } from "./plugins/capabilities.js";
-import { executeContainerPluginTool, transformWithContainerPlugins } from "./plugins/container-runtime.js";
+import { executeContainerPluginEvent, executeContainerPluginTool, transformWithContainerPlugins } from "./plugins/container-runtime.js";
 import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
-import { runSkillScanner } from "./plugins/skill-scanner/index.js";
 import { normalizePluginSettingProfiles, resolvePluginSettingProfiles } from "./plugins/settings-profiles.js";
 import {
   canUserConfigurePlugin,
@@ -4450,9 +4450,23 @@ app.post("/v1/skills/observations", async (req, res, next) => {
         },
       },
     };
-    const skillScan = shouldScanSkill
-      ? await runSkillScanner(
-          {
+    const skillScannerManifest = firstPartyPluginManifests.find(
+      (plugin) => plugin.id === "openleash.skill-scanner",
+    );
+    const skillScannerSettings = runtimePlugins.get("openleash.skill-scanner");
+    const skillScan = shouldScanSkill && skillScannerManifest && skillScannerSettings
+      ? await executeContainerPluginEvent<{
+          status: "observed" | "suspicious";
+          riskScore: number;
+          reasons: Array<{ reason: string; quote?: string }>;
+          findings: PluginFinding[];
+          run?: PluginRunRecord;
+        }>({
+          plugin: { ...skillScannerManifest, settings: skillScannerSettings },
+          organizationId,
+          userId: user.id,
+          event: pipelineSkillEvent,
+          payload: {
             event: pipelineSkillEvent,
             agentKind,
             agentName,
@@ -4464,14 +4478,14 @@ app.post("/v1/skills/observations", async (req, res, next) => {
             riskScore: body.riskScore,
             reasons,
           },
-          createPluginCapabilities({
+          capabilities: createPluginCapabilities({
             organizationId,
             pluginId: "openleash.skill-scanner",
             userId: user.id,
             tenantModelKey,
             request: skillScanRequest,
           }),
-        )
+        })
       : {
           status:
             skillEventType === "removed"
@@ -5696,14 +5710,14 @@ function pluginCatalogItem(
   const selectedRelease = installedVersion && installedVersion !== manifest.version
     ? approvedReleases.get(`${manifest.id}@${installedVersion}`)
     : undefined;
-  // In-process code only exists at the server's own version. Historical versions
-  // are executable only when their approved release points at an immutable image.
   const executableRelease = selectedRelease?.runtime === "container" &&
     selectedRelease.execution?.type === "container"
     ? selectedRelease
     : undefined;
   const selectedManifest = executableRelease ?? manifest;
-  const releaseAvailable = !installedVersion || installedVersion === manifest.version || Boolean(executableRelease);
+  const releaseAvailable = (!installedVersion || installedVersion === manifest.version)
+    ? validContainerManifest(manifest, manifest.publisher !== "openleash")
+    : Boolean(executableRelease && validContainerManifest(executableRelease, true));
   const environmentAvailable = pluginExecutionAvailable(productMode, selectedManifest.executionEnvironment);
   const runtimeAvailable = releaseAvailable && environmentAvailable;
   const baseConfig = {
@@ -5798,10 +5812,28 @@ function pluginManifestFromRelease(release: ReturnType<typeof pluginReleaseFromR
 }
 
 function assertPluginExecutionAvailable(manifest: OpenLeashPluginManifest) {
+  if (!validContainerManifest(manifest, manifest.publisher !== "openleash")) {
+    throw new HttpError(409, `${manifest.name} has no approved container runtime.`);
+  }
   if (pluginExecutionAvailable(productMode, manifest.executionEnvironment)) return;
   throw new HttpError(
     409,
     `${manifest.name} runs only in OpenLeash Cloud and is unavailable in ${productMode.label}.`,
+  );
+}
+
+function validContainerManifest(
+  manifest: OpenLeashPluginManifest,
+  requireDigest: boolean,
+) {
+  const execution = manifest.execution;
+  return Boolean(
+    manifest.runtime === "container" &&
+    execution?.type === "container" &&
+    execution.protocol === "openleash-container-plugin.v1" &&
+    optionalString(execution.image) &&
+    optionalString(execution.eventPath) &&
+    (!requireDigest || /^sha256:[a-f0-9]{64}$/.test(execution.digest ?? "")),
   );
 }
 
@@ -6241,7 +6273,12 @@ async function installMarketplacePluginForUser(
   }
   return savePluginSettingsForUser(organizationId, userId, pluginId, {
     enabled: true,
-    config: manifest.defaultConfig ?? {},
+    config: {
+      ...(manifest.defaultConfig ?? {}),
+      ...(Object.hasOwn(manifest.defaultConfig ?? {}, "enabled")
+        ? { enabled: true }
+        : {}),
+    },
     installedVersion: manifest.version,
   });
 }
@@ -6970,23 +7007,23 @@ function pluginReleaseFieldsFromManifest(
       "Plugin manifest requires id, version, name or slug, and description.",
     );
   }
-  const runtime = (["node", "container"] as const).includes(manifest.runtime as "node" | "container")
-    ? (manifest.runtime as "node" | "container")
-    : "openleash-core";
+  if (manifest.runtime !== "container") {
+    throw new HttpError(400, "OpenLeash plugins must use the container runtime.");
+  }
+  const runtime: OpenLeashPluginManifest["runtime"] = "container";
   const executionEnvironment = manifest.executionEnvironment === "cloud-only" ? "cloud-only" : "any";
   const execution = objectValue(manifest.execution) as OpenLeashPluginManifest["execution"];
-  if (runtime === "container") {
-    if (
-      execution?.type !== "container" ||
-      execution.protocol !== "openleash-container-plugin.v1" ||
-      !optionalString(execution.image) ||
-      !optionalString(execution.digest)
-    ) {
-      throw new HttpError(
-        400,
-        "Community container plugins require a container execution block with an immutable image digest.",
-      );
-    }
+  if (
+    execution?.type !== "container" ||
+    execution.protocol !== "openleash-container-plugin.v1" ||
+    !optionalString(execution.image) ||
+    !optionalString(execution.digest) ||
+    !optionalString(execution.eventPath)
+  ) {
+    throw new HttpError(
+      400,
+      "Plugins require a container execution block with an immutable image digest and generic event endpoint.",
+    );
   }
   const entrypoint = optionalString(manifest.entrypoint) ?? "";
   if (!entrypoint)

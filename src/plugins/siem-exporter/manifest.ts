@@ -1,4 +1,4 @@
-import type { OpenLeashPluginManifest } from "@openleash/shared";
+import { firstPartyEventContainer, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const siemExporterManifest: OpenLeashPluginManifest = {
   id: "openleash.siem-exporter",
@@ -8,8 +8,9 @@ export const siemExporterManifest: OpenLeashPluginManifest = {
   repositoryUrl: "https://github.com/open-leash/plugin-siem-exporter",
   version: "1.0.0",
   publisher: "openleash",
-  runtime: "openleash-core",
-  entrypoint: "plugins/siem-exporter",
+  runtime: "container",
+  execution: firstPartyEventContainer("siem-exporter", "1.0.0", { failureMode: "open" }),
+  entrypoint: "container",
   events: ["prompt.beforeSubmit", "agent.response", "tool.beforeUse", "tool.afterUse", "session.started", "session.ended", "skill.detected", "skill.changed", "skill.removed", "log.emitted"],
   permissions: ["event:read", "prompt:read", "tool:read", "network:access", "audit:write", "log:write"],
   effects: ["observe", "notify"],
