@@ -144,13 +144,13 @@ export async function activeIslandContributions(
         pluginId: "openleash.prompt-compression",
         kind: "annotation",
         key: "token-savings",
-        label: "Token saver",
+        label: "token-saver",
         value: `${savedPercent}% saved`,
         detail: savedPercent > 0
           ? `Reduced the latest model request from ${inputTokens} to ${tokensAfter} estimated tokens.`
           : "Checked the latest model request; no safe compression opportunity was found.",
         tone: savedPercent > 0 ? "success" : "neutral",
-        action: { id: "open-token-saver", label: "Token saver settings", type: "open-plugin-settings" },
+        action: { id: "open-token-saver", label: "token-saver settings", type: "open-plugin-settings" },
         updatedAt: new Date(usage.occurred_at).toISOString(),
         expiresAt: new Date(now + 60_000).toISOString(),
       });

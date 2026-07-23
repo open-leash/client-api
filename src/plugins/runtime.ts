@@ -307,8 +307,8 @@ function promptPipelineSummary(
     const saved = Math.max(0, Math.round((1 - compression.ratio) * 100));
     parts.push(
       saved > 0
-        ? `compressed prompt by ${saved}%`
-        : "checked prompt compression",
+        ? `token-saver reduced the prompt by ${saved}%`
+        : "token-saver checked the prompt",
     );
   }
   if (dlp?.enabled) {
@@ -316,7 +316,7 @@ function promptPipelineSummary(
       parts.push(`masked ${dlp.categories.join(", ") || "sensitive data"}`);
     else if (dlp.matched)
       parts.push(`detected ${dlp.categories.join(", ") || "sensitive data"}`);
-    else parts.push("checked DLP");
+    else parts.push("data-leakage-prevention checked the prompt");
   }
   if (parts.length === 0) return "No prompt plugins were enabled.";
   if (finalPrompt !== originalPrompt)

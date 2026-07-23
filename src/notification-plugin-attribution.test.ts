@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { notificationPluginAttribution } from "./notification-plugin-attribution.js";
+import { canonicalPluginSlug } from "./plugin-slug.js";
+
+test("canonicalizes plugin aliases and display names to slugs", () => {
+  assert.equal(canonicalPluginSlug("Blast Radius"), "blast-radius");
+  assert.equal(canonicalPluginSlug("openleash.blast-radius"), "blast-radius");
+  assert.equal(canonicalPluginSlug("openleash.prompt-compression"), "token-saver");
+  assert.equal(canonicalPluginSlug("token-compression"), "token-saver");
+  assert.equal(canonicalPluginSlug("Token Saver"), "token-saver");
+  assert.equal(canonicalPluginSlug("openleash.core"), "openleash-core");
+});
+
+test("uses a slug for core attribution", () => {
+  assert.equal(notificationPluginAttribution({}).plugin_name, "openleash-core");
+});
 
 test("attributes recursive deletion to blast-radius instead of the first asking plugin", () => {
   const attribution = notificationPluginAttribution({

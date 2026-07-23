@@ -36,7 +36,7 @@ For prompts, ordering matters:
 token-saver -> data-leakage-prevention -> sensitive-access
 ```
 
-Token-saver runs first so data-leakage-prevention checks the final prompt that would be sent to the model.
+`token-saver` runs first so `data-leakage-prevention` checks the final prompt that would be sent to the model.
 
 For tool events:
 

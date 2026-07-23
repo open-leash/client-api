@@ -1,3 +1,5 @@
+import { canonicalPluginSlug } from "./plugin-slug.js";
+
 type PluginRun = Record<string, unknown>;
 
 const STATUS_PRIORITY: Record<string, number> = {
@@ -60,12 +62,9 @@ function highestFindingSeverity(run: PluginRun) {
 }
 
 function coreAttribution() {
-  return { plugin_id: "openleash.core", plugin_name: "OpenLeash core" };
+  return { plugin_id: "openleash.core", plugin_name: "openleash-core" };
 }
 
 function pluginPackageSlug(pluginId: string) {
-  const slug = pluginId.replace(/^openleash\./, "");
-  return slug === "prompt-compression"
-    ? "token-saver"
-    : slug || "openleash-core";
+  return canonicalPluginSlug(pluginId);
 }

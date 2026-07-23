@@ -50,6 +50,7 @@ import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
 import { summarizeActionPurpose } from "./evaluator.js";
 import { pluginIconText } from "./plugin-icons.js";
 import { normalizePluginIconInput } from "./plugin-icon-input.js";
+import { canonicalPluginSlug } from "./plugin-slug.js";
 import { notificationPluginAttribution } from "./notification-plugin-attribution.js";
 import { activeIslandContributions } from "./plugins/island-contributions.js";
 import {
@@ -1779,16 +1780,7 @@ function normalizeOutcomeEvidence(
 }
 
 function outcomeSourceLabel(pluginId?: string | null) {
-  const value = String(pluginId ?? "").trim();
-  if (value === "openleash.rules-enforcer") return "Rules Enforcer";
-  if (value === "openleash.dlp") return "Data Protection";
-  if (value === "openleash.mcp-scanner") return "MCP and Tool Risk";
-  if (value === "openleash.skill-scanner") return "Skill Review";
-  if (value === "openleash.prompt-compression") return "token-saver";
-  if (value === "openleash.siem-exporter") return "SIEM Export";
-  return (
-    value.replace(/^openleash\./, "").replace(/[-_.]+/g, " ") || "OpenLeash"
-  );
+  return canonicalPluginSlug(pluginId);
 }
 
 function outcomeDomainLabel(domain: OpenLeashOutcomeDomain) {
