@@ -7,6 +7,7 @@ import type {
   PluginLogRequest,
   PluginIslandPublishRequest,
   PluginSignalRequest,
+  PluginPermission,
   PluginUsageRecordRequest,
 } from "@openleash/shared";
 
@@ -73,6 +74,7 @@ export type ContainerCapabilityRequest = {
   id: string;
   capability:
     | "context.instructions.list"
+    | "context.conversation.recent"
     | "llm.evaluateJson"
     | "storage.get"
     | "storage.set"
@@ -165,7 +167,12 @@ export async function executeContainerPluginEvent<T = unknown>(input: {
       if (Object.hasOwn(capabilityResults, call.id)) continue;
       capabilityResults[call.id] = {
         ok: true,
-        value: (await executeHostCapability(input.capabilities, call)) ?? null,
+        value:
+          (await executeHostCapability(
+            input.capabilities,
+            input.plugin.permissions,
+            call,
+          )) ?? null,
       };
     }
   }
@@ -393,13 +400,20 @@ async function invokeContainerEvent(input: {
 
 async function executeHostCapability(
   capabilities: PluginCapabilities,
+  permissions: PluginPermission[],
   call: ContainerCapabilityRequest,
 ) {
-  // The manifest permission set was already applied when the host created this
-  // capability object. Calling an undeclared capability therefore fails here.
+  const requiredPermission = permissionForCapability(call.capability);
+  if (!permissions.includes(requiredPermission)) {
+    throw new Error(
+      `plugin capability ${call.capability} requires ${requiredPermission}`,
+    );
+  }
   switch (call.capability) {
     case "context.instructions.list":
       return capabilities.context.instructions.list(call.request as Parameters<typeof capabilities.context.instructions.list>[0]);
+    case "context.conversation.recent":
+      return capabilities.context.conversation.recent(call.request as Parameters<typeof capabilities.context.conversation.recent>[0]);
     case "llm.evaluateJson":
       return capabilities.llm.evaluateJson(call.request as Parameters<typeof capabilities.llm.evaluateJson>[0]);
     case "storage.get":
@@ -428,6 +442,42 @@ async function executeHostCapability(
       return capabilities.usage.record(call.request as Parameters<typeof capabilities.usage.record>[0]);
     default: {
       const exhaustive: never = call.capability;
+      throw new Error(`unsupported plugin capability: ${exhaustive}`);
+    }
+  }
+}
+
+function permissionForCapability(
+  capability: ContainerCapabilityRequest["capability"],
+): PluginPermission {
+  switch (capability) {
+    case "context.instructions.list":
+      return "instructions:read";
+    case "context.conversation.recent":
+      return "conversation:read";
+    case "llm.evaluateJson":
+      return "model:invoke";
+    case "storage.get":
+    case "storage.list":
+      return "storage:read";
+    case "storage.set":
+    case "storage.delete":
+      return "storage:write";
+    case "notification.send":
+      return "notification:send";
+    case "island.annotateSession":
+    case "island.reportActivity":
+    case "island.publishStatus":
+    case "island.clear":
+      return "island:publish";
+    case "log.emit":
+      return "log:write";
+    case "signals.emit":
+      return "signal:write";
+    case "usage.record":
+      return "usage:write";
+    default: {
+      const exhaustive: never = capability;
       throw new Error(`unsupported plugin capability: ${exhaustive}`);
     }
   }

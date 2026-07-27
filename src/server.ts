@@ -103,6 +103,7 @@ import {
   isOrganizationManagedAccount,
   openLeashProductModeFromEnv,
   pluginExecutionAvailable,
+  pluginImageDigestRequired,
   publicProductMode,
   type OpenLeashCapability,
 } from "./product-mode.js";
@@ -123,6 +124,12 @@ import {
   isReusableHandledIntent,
   pendingIntentKey,
 } from "./intent-dedupe.js";
+import {
+  attentionEventForPending,
+  attentionKindForTool,
+  buildAttentionEvents,
+} from "./attention-events.js";
+import { ClientSyncBroker } from "./client-sync.js";
 
 class HttpError extends Error {
   constructor(
@@ -165,6 +172,7 @@ export type PrepareOpenLeashApiOptions = Pick<
 >;
 
 export const app = express();
+const clientSyncBroker = new ClientSyncBroker(pool);
 type NormalizedEventDecision =
   EvaluationResponse | Awaited<ReturnType<typeof handlePromptOnlyHook>>;
 const inflightNormalizedEvents = new Map<
@@ -386,14 +394,13 @@ app.post("/v1/client/prompt-transforms", async (req, res, next) => {
         organizationId,
         user.id,
         "openleash.prompt-compression",
-        {
-          enabled: config.compression.enabled,
-          config: config.compression,
-        },
+        config.compression.enabled
+          ? { enabled: true, config: config.compression }
+          : { enabled: false },
       ),
       savePluginSettingsForUser(organizationId, user.id, "openleash.dlp", {
         enabled: config.dlp.enabled,
-        config: config.dlp,
+        ...(config.dlp.enabled ? { config: config.dlp } : {}),
       }),
     ]);
     res.json({ ok: true, config });
@@ -3371,6 +3378,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       return res.status(401).json({ error: "invalid OpenLeash session" });
     const [
       pending,
+      blocked,
       agents,
       history,
       sessionMetrics,
@@ -3379,6 +3387,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       pluginOutcomes,
     ] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
+      browserBlockedNotifications(session.organization.id, session.user.id),
       mobileAgents(session.organization.id, session.user.id),
       mobileRecentActivity(session.organization.id, session.user.id),
       mobileSessionMetrics(session.organization.id, session.user.id),
@@ -3402,6 +3411,11 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       apiUrl: publicApiUrl(req),
       mode: clientModeFromEnvironment(),
       pendingApprovals: pending.rows,
+      attentionEvents: buildAttentionEvents({
+        pending: pending.rows,
+        blocked: blocked.rows,
+        activity: history.rows,
+      }),
       agents: agents.rows,
       recentActivity: history.rows,
       sessionMetrics: sessionMetrics.rows[0],
@@ -3486,6 +3500,49 @@ app.get("/v1/client/notifications", async (req, res, next) => {
         activity: activity.rows,
       }),
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/v1/client/events", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    res.status(200);
+    res.setHeader("content-type", "text/event-stream");
+    res.setHeader("cache-control", "no-cache, no-transform");
+    res.setHeader("connection", "keep-alive");
+    res.setHeader("x-accel-buffering", "no");
+    res.flushHeaders();
+
+    let closed = false;
+    const writeEvent = (event: unknown) => {
+      if (closed || res.writableEnded) return;
+      res.write(`event: sync\ndata: ${JSON.stringify(event)}\n\n`);
+    };
+    const unsubscribe = await clientSyncBroker.subscribe(
+      { userId: session.user.id },
+      writeEvent,
+    );
+    writeEvent({
+      schemaVersion: "2026-07-27.client-sync.v1",
+      id: `ready:${Date.now()}`,
+      kind: "activity.created",
+      occurredAt: new Date().toISOString(),
+    });
+    const heartbeat = setInterval(() => {
+      if (!closed && !res.writableEnded) res.write(": heartbeat\n\n");
+    }, 20_000);
+    req.on("close", () => {
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
+    return undefined;
   } catch (error) {
     next(error);
   }
@@ -4476,6 +4533,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
             userId: user.id,
             tenantModelKey,
             request: skillScanRequest,
+            permissions: skillScannerManifest.permissions,
           }),
         })
       : {
@@ -4656,6 +4714,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           computerId: signalContext.computerId,
           runtimeId: signalContext.runtimeId,
           request: skillScanRequest,
+          permissions: skillScannerManifest?.permissions ?? [],
         }).signals.emit({
           kind: "security.finding",
           severity: "high",
@@ -5487,8 +5546,17 @@ async function handlePromptOnlyHook(
       summary,
       question,
       purposeSummary,
+      attentionKindForTool(request.event.tool?.name ?? ""),
     ).catch((error) => {
       console.warn("mobile approval notification failed", error);
+    });
+  } else if (decision === "deny") {
+    notifyMobileEvent(user.id, {
+      title: "OpenLeash blocked an agent action",
+      body: summary,
+      data: { decisionId: evaluation.rows[0].id, kind: "blocked" },
+    }).catch((error) => {
+      console.warn("mobile blocked notification failed", error);
     });
   }
   const response: EvaluationResponse = {
@@ -5708,7 +5776,10 @@ function pluginCatalogItem(
     : undefined;
   const selectedManifest = executableRelease ?? manifest;
   const releaseAvailable = (!installedVersion || installedVersion === manifest.version)
-    ? validContainerManifest(manifest, manifest.publisher !== "openleash")
+    ? validContainerManifest(
+        manifest,
+        pluginImageDigestRequired(productMode, marketplace ?? manifest),
+      )
     : Boolean(executableRelease && validContainerManifest(executableRelease, true));
   const environmentAvailable = pluginExecutionAvailable(productMode, selectedManifest.executionEnvironment);
   const runtimeAvailable = releaseAvailable && environmentAvailable;
@@ -5803,8 +5874,24 @@ function pluginManifestFromRelease(release: ReturnType<typeof pluginReleaseFromR
   };
 }
 
-function assertPluginExecutionAvailable(manifest: OpenLeashPluginManifest) {
-  if (!validContainerManifest(manifest, manifest.publisher !== "openleash")) {
+function assertPluginExecutionAvailable(
+  manifest: OpenLeashPluginManifest,
+  marketplace?: unknown,
+) {
+  const pluginDescriptor =
+    marketplace && typeof marketplace === "object"
+      ? (marketplace as {
+          publisher?: string;
+          source?: string;
+          packageUrl?: string;
+        })
+      : manifest;
+  if (
+    !validContainerManifest(
+      manifest,
+      pluginImageDigestRequired(productMode, pluginDescriptor),
+    )
+  ) {
     throw new HttpError(409, `${manifest.name} has no approved container runtime.`);
   }
   if (pluginExecutionAvailable(productMode, manifest.executionEnvironment)) return;
@@ -5852,7 +5939,7 @@ async function savePluginSettingsForOrganization(
     (!currentSettings?.enabled && enabled) ||
     requestedProfiles?.some((profile) => profile.enabled === true)
   ) {
-    assertPluginExecutionAvailable(manifest);
+    assertPluginExecutionAvailable(manifest, body.marketplace);
   }
   const config =
     body.config &&
@@ -5931,7 +6018,7 @@ async function savePluginSettingsForUser(
   const uninstalling = currentlyEnabled && !enabled;
   const configuring = body.config !== undefined || body.profiles !== undefined || body.orderingPriority !== undefined;
   if (installing || requestedProfiles?.some((profile) => profile.enabled === true)) {
-    assertPluginExecutionAvailable(manifest);
+    assertPluginExecutionAvailable(manifest, body.marketplace);
   }
   const providedByOrganization = pluginProvidedByOrganization({
     policy: pluginPolicy,
@@ -7852,6 +7939,7 @@ async function evaluateAndRecord(
       summary,
       question,
       purposeSummary,
+      attentionKindForTool(request.event.tool?.name ?? ""),
     ).catch((error) => {
       console.warn("mobile approval notification failed", error);
     });
@@ -7862,6 +7950,27 @@ async function evaluateAndRecord(
       data: { decisionId: evaluation.rows[0].id, kind: "blocked" },
     }).catch((error) => {
       console.warn("mobile blocked notification failed", error);
+    });
+  }
+  if (
+    ["Stop", "SessionEnd", "SubagentStop"].includes(request.event.eventName)
+  ) {
+    const subagent = request.event.eventName === "SubagentStop";
+    notifyMobileEvent(user.id, {
+      title: subagent
+        ? `${request.agent.displayName} subagent finished`
+        : `${request.agent.displayName} finished`,
+      body:
+        eventCompletionSummary(request) ??
+        (subagent
+          ? "A delegated agent finished its latest task."
+          : "The agent finished its latest turn."),
+      data: {
+        kind: subagent ? "subagent_completed" : "completed",
+        sessionId: request.event.sessionId,
+      },
+    }).catch((error) => {
+      console.warn("mobile completion notification failed", error);
     });
   }
   return {
@@ -8289,6 +8398,10 @@ async function waitForHookDecision(
   user: ApiUser,
   decision: EvaluationResponse,
 ): Promise<EvaluationResponse> {
+  // The original hook/proxy request owns this waiter. A phone or web client
+  // only resolves the durable evaluation; the resulting native response is
+  // returned to that exact desktop, cloud-agent, or SaaS request rather than
+  // being broadcast as an executable command to an arbitrary desktop.
   if (decision.decision !== "ask") return decision;
   const timeoutMs = Number(
     process.env.OPENLEASH_HOOK_APPROVAL_TIMEOUT_MS ?? 600000,
@@ -9778,6 +9891,12 @@ function dedupePendingApprovalRows<
 }
 
 async function enrichMobileApproval(row: {
+  id?: string;
+  tool_name?: string | null;
+  agent_name?: string | null;
+  agent_kind?: string | null;
+  hostname?: string | null;
+  created_at?: string | Date;
   project_path?: string | null;
   prompt?: string | null;
   payload?: unknown;
@@ -9800,6 +9919,10 @@ async function enrichMobileApproval(row: {
     ...row,
     payload: payloadWithContext,
   });
+  const attention = attentionEventForPending({
+    ...row,
+    payload: payloadWithContext,
+  });
   return {
     ...row,
     ...notificationPluginAttribution(payloadWithContext),
@@ -9815,6 +9938,8 @@ async function enrichMobileApproval(row: {
       primaryPolicy,
     ),
     recent_context: approvalRecentContext(payloadWithContext),
+    attention_kind: attention.kind,
+    interaction: attention.interaction,
   };
 }
 
@@ -10375,183 +10500,53 @@ function browserBlockedNotifications(organizationId: string, userId: string) {
   );
 }
 
-function buildAttentionEvents(input: {
-  pending: Array<Record<string, any>>;
-  blocked: Array<Record<string, any>>;
-  activity: Array<Record<string, any>>;
-}) {
-  const pending = input.pending.map((row) => attentionEventForPending(row));
-  const blocked = input.blocked.map((row) => ({
-    schemaVersion: "2026-07-19.v1",
-    id: `blocked:${row.id}`,
-    kind: "blocked",
-    state: "resolved",
-    title: `${row.agent_name ?? "Agent"} was blocked`,
-    body: row.summary ?? "OpenLeash blocked an agent action.",
-    createdAt: isoValue(row.created_at),
-    agent: attentionAgent(row),
-    session: attentionSession(row),
-  }));
-  const completions = input.activity
-    .filter((row) =>
-      ["Stop", "SessionEnd", "SubagentStop"].includes(
-        String(row.event_name ?? ""),
-      ),
-    )
-    .map((row) => ({
-      schemaVersion: "2026-07-19.v1",
-      id: `completed:${row.id}`,
-      kind: row.event_name === "SubagentStop" ? "subagent_completed" : "completed",
-      state: "resolved",
-      title: `${row.agent_name ?? "Agent"} finished`,
-      body:
-        eventPrompt(row.payload) ??
-        row.summary ??
-        "The agent finished its latest turn.",
-      createdAt: isoValue(row.created_at),
-      agent: attentionAgent(row),
-      session: attentionSession(row),
-    }));
-  const seen = new Set<string>();
-  return [...pending, ...blocked, ...completions].filter((event) => {
-    if (seen.has(event.id)) return false;
-    seen.add(event.id);
-    return true;
-  });
-}
-
-function attentionEventForPending(row: Record<string, any>) {
-  const toolName = String(row.tool_name ?? "");
-  const event = eventRecord(row.payload);
-  const toolInput = event?.tool?.input;
-  const kind = /^AskUserQuestion$/i.test(toolName)
-    ? "question"
-    : /^ExitPlanMode$/i.test(toolName)
-      ? "plan_review"
-      : "approval";
-  return {
-    schemaVersion: "2026-07-19.v1",
-    id: `pending:${row.id}`,
-    decisionId: row.id,
-    kind,
-    state: "waiting",
-    title:
-      kind === "question"
-        ? `${row.agent_name ?? "Agent"} asks`
-        : kind === "plan_review"
-          ? `${row.agent_name ?? "Agent"} has a plan`
-          : `Allow ${row.agent_name ?? "agent"}?`,
-    body: row.summary ?? row.question ?? "An agent is waiting for you.",
-    createdAt: isoValue(row.created_at),
-    agent: attentionAgent(row),
-    session: attentionSession(row),
-    interaction:
-      kind === "question"
-        ? { type: "questions", questions: normalizeAttentionQuestions(toolInput) }
-        : kind === "plan_review"
-          ? {
-              type: "plan",
-              markdown: planMarkdown(toolInput, event?.raw),
-              originalInput:
-                toolInput && typeof toolInput === "object" ? toolInput : {},
-            }
-          : { type: "approval" },
-  };
-}
-
-function attentionAgent(row: Record<string, any>) {
-  return {
-    kind: String(row.agent_kind ?? "unknown"),
-    name: String(row.agent_name ?? "AI agent"),
-    hostname: String(row.hostname ?? "cloud"),
-  };
-}
-
-function attentionSession(row: Record<string, any>) {
-  const event = eventRecord(row.payload);
-  return {
-    id: String(event?.sessionId ?? event?.raw?.session_id ?? "unknown"),
-    projectPath: row.project_path ?? event?.projectPath ?? undefined,
-  };
-}
-
-function eventRecord(value: unknown): Record<string, any> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, any>)
-    : undefined;
-}
-
-function eventPrompt(value: unknown) {
-  const event = eventRecord(value);
-  const prompt = firstString(
-    event?.prompt,
-    event?.raw?.last_assistant_message,
-    event?.raw?.prompt_response,
-    event?.raw?.message,
-  );
-  return prompt ? truncate(cleanContextText(prompt), 180) : undefined;
-}
-
-function normalizeAttentionQuestions(input: unknown) {
-  const record = eventRecord(input);
-  const questions = Array.isArray(record?.questions) ? record.questions : [];
-  return questions
-    .filter((item): item is Record<string, any> => Boolean(eventRecord(item)))
-    .slice(0, 4)
-    .map((item) => ({
-      question: String(item.question ?? "").trim(),
-      header: String(item.header ?? "Question").trim().slice(0, 40),
-      multiSelect: Boolean(item.multiSelect ?? item.multiple),
-      options: (Array.isArray(item.options) ? item.options : [])
-        .filter((option): option is Record<string, any> => Boolean(eventRecord(option)))
-        .slice(0, 12)
-        .map((option) => ({
-          label: String(option.label ?? "").trim(),
-          description:
-            typeof option.description === "string"
-              ? option.description.trim()
-              : undefined,
-        }))
-        .filter((option) => option.label),
-    }))
-    .filter((item) => item.question);
-}
-
-function planMarkdown(input: unknown, raw: unknown) {
-  const toolInput = eventRecord(input);
-  const rawInput = eventRecord(raw);
-  return firstString(
-    toolInput?.plan,
-    toolInput?.content,
-    toolInput?.planContent,
-    rawInput?.plan,
-    rawInput?.plan_content,
-    rawInput?.planContent,
-  );
-}
-
-function isoValue(value: unknown) {
-  const date = value instanceof Date ? value : new Date(String(value ?? ""));
-  return Number.isNaN(date.getTime())
-    ? new Date().toISOString()
-    : date.toISOString();
-}
-
 async function notifyMobileApprovers(
   userId: string,
   decisionId: string,
   summary: string,
   question?: string,
   purposeSummary?: string,
+  kind: "approval" | "question" | "plan_review" = "approval",
 ) {
   await notifyMobileEvent(userId, {
-    title: summary || "OpenLeash approval needed",
+    title:
+      kind === "question"
+        ? "An agent has a question"
+        : kind === "plan_review"
+          ? "An agent plan is ready"
+          : summary || "OpenLeash approval needed",
     body:
       [purposeSummary, question].filter(Boolean).join("\n") ||
-      "An AI agent is waiting for your decision.",
-    categoryId: "openleash.approval",
-    data: { decisionId, purposeSummary },
+      (kind === "question"
+        ? "Open OpenLeash to answer and continue the agent."
+        : kind === "plan_review"
+          ? "Open OpenLeash to approve the plan or request changes."
+          : "An AI agent is waiting for your decision."),
+    categoryId:
+      kind === "approval" ? "openleash.approval" : `openleash.${kind}`,
+    data: { decisionId, purposeSummary, kind },
   });
+}
+
+function eventCompletionSummary(request: EvaluationRequest) {
+  const raw =
+    request.event.raw &&
+    typeof request.event.raw === "object" &&
+    !Array.isArray(request.event.raw)
+      ? (request.event.raw as Record<string, unknown>)
+      : {};
+  const direct = firstString(
+    raw.last_assistant_message,
+    raw.prompt_response,
+    raw.message,
+  );
+  if (direct) return truncate(cleanContextText(direct), 180);
+  const lastAssistant = [...(request.event.transcript ?? [])]
+    .reverse()
+    .find((turn) => turn.role === "assistant" && turn.content.trim());
+  return lastAssistant
+    ? truncate(cleanContextText(lastAssistant.content), 180)
+    : undefined;
 }
 
 async function notifyMobileEvent(
@@ -10593,9 +10588,8 @@ async function mobilePushDevicesForUser(userId: string) {
   const devices = await pool.query<{ push_token: string }>(
     `select distinct md.push_token
      from mobile_devices md
-     join users u on u.id = md.user_id
      where md.push_token is not null
-       and (md.user_id = $1 or u.organization_id = (select organization_id from users where id = $1))
+       and md.user_id = $1
        and md.last_seen_at > now() - interval '45 days'
      limit 50`,
     [userId],
@@ -11785,6 +11779,7 @@ function surfaceForRequest(
     requestPath === "/v1/plugin-submissions" ||
     requestPath === "/v1/plugin-releases" ||
     requestPath === "/v1/client/notifications" ||
+    requestPath === "/v1/client/events" ||
     /^\/v1\/client\/decisions\/[^/]+\/resolve$/.test(requestPath) ||
     /^\/v1\/plugins\/[^/]+\/settings$/.test(requestPath) ||
     /^\/v1\/plugins\/[^/]+\/install$/.test(requestPath) ||
@@ -11989,6 +11984,8 @@ function apiFunctionForRequest(
     return "mobileDecisionResolve";
   if (verb === "GET" && requestPath === "/v1/client/notifications")
     return "clientNotifications";
+  if (verb === "GET" && requestPath === "/v1/client/events")
+    return "clientEvents";
   if (
     verb === "POST" &&
     /^\/v1\/client\/decisions\/[^/]+\/resolve$/.test(requestPath)

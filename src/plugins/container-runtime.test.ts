@@ -205,3 +205,144 @@ test("round-trips privileged capabilities without giving the container credentia
   assert.equal(calls, 2);
   assert.equal(result.decision, "ask");
 });
+
+test("rejects a container capability that is not declared by the manifest", async () => {
+  const plugin = {
+    id: "openleash.review",
+    name: "review",
+    description: "test",
+    version: "1.0.0",
+    publisher: "openleash",
+    runtime: "container",
+    execution: {
+      type: "container",
+      placement: "server",
+      protocol: "openleash-container-plugin.v1",
+      image: "example/review:1.0.0",
+      eventPath: "/v1/events",
+    },
+    entrypoint: "container",
+    events: ["tool.beforeUse"],
+    permissions: ["event:read"],
+    effects: ["observe"],
+    settings: { enabled: true, config: {}, installedVersion: "1.0.0" },
+  } as PluginCatalogItem;
+  await assert.rejects(
+    executeContainerPluginEvent({
+      plugin,
+      organizationId: "org",
+      userId: "user",
+      event: "tool.beforeUse",
+      payload: {},
+      capabilities: {} as PluginCapabilities,
+      env: {
+        OPENLEASH_PLUGIN_ENDPOINTS: JSON.stringify({
+          "openleash.review": "http://worker",
+        }),
+        OPENLEASH_PLUGIN_RUNTIME_SECRET: "secret",
+      },
+      fetchImpl: async (_url, init) => {
+        const request = JSON.parse(String(init?.body));
+        return new Response(
+          JSON.stringify({
+            protocol: "openleash-container-plugin.v1",
+            requestId: request.requestId,
+            status: "capability_required",
+            capabilityRequests: [
+              {
+                id: "storage-1",
+                capability: "storage.get",
+                request: { key: "another-plugin-state" },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      },
+    }),
+    /storage\.get requires storage:read/,
+  );
+});
+
+test("round-trips bounded current-conversation context", async () => {
+  const plugin = {
+    id: "openleash.memory",
+    name: "memory",
+    description: "test",
+    version: "1.0.0",
+    publisher: "openleash",
+    runtime: "container",
+    execution: {
+      type: "container",
+      placement: "server",
+      protocol: "openleash-container-plugin.v1",
+      image: "example/memory:1.0.0",
+      eventPath: "/v1/events",
+    },
+    entrypoint: "container",
+    events: ["agent.response"],
+    permissions: ["event:read", "conversation:read"],
+    effects: ["observe"],
+    settings: { enabled: true, config: {}, installedVersion: "1.0.0" },
+  } as PluginCatalogItem;
+  let calls = 0;
+  const capabilities = {
+    context: {
+      conversation: {
+        recent: async () => ({
+          sessionId: "session",
+          turns: [{ role: "user", content: "previous message" }],
+          truncated: false,
+        }),
+      },
+    },
+  } as unknown as PluginCapabilities;
+  const result = await executeContainerPluginEvent<{ remembered: string }>({
+    plugin,
+    organizationId: "org",
+    userId: "user",
+    event: "agent.response",
+    payload: {},
+    capabilities,
+    env: {
+      OPENLEASH_PLUGIN_ENDPOINTS: JSON.stringify({
+        "openleash.memory": "http://worker",
+      }),
+      OPENLEASH_PLUGIN_RUNTIME_SECRET: "secret",
+    },
+    fetchImpl: async (_url, init) => {
+      calls += 1;
+      const request = JSON.parse(String(init?.body));
+      return new Response(
+        JSON.stringify(
+          calls === 1
+            ? {
+                protocol: "openleash-container-plugin.v1",
+                requestId: request.requestId,
+                status: "capability_required",
+                capabilityRequests: [
+                  {
+                    id: "conversation-1",
+                    capability: "context.conversation.recent",
+                    request: { limit: 20 },
+                  },
+                ],
+              }
+            : {
+                protocol: "openleash-container-plugin.v1",
+                requestId: request.requestId,
+                status: "completed",
+                output: {
+                  remembered:
+                    request.capabilityResults["conversation-1"].value.turns[0]
+                      .content,
+                },
+              },
+        ),
+        { status: 200 },
+      );
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.remembered, "previous message");
+});

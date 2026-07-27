@@ -115,6 +115,22 @@ export function pluginExecutionAvailable(
   return executionEnvironment !== "cloud-only" || mode.id === "openleash-cloud";
 }
 
+export function pluginImageDigestRequired(
+  mode: OpenLeashProductMode,
+  plugin: {
+    publisher?: string;
+    source?: string;
+    packageUrl?: string;
+  },
+) {
+  if (plugin.publisher === "openleash") return false;
+  const localDevelopmentPlugin =
+    mode.id === "individual-open-source" &&
+    plugin.source === "private" &&
+    plugin.packageUrl?.startsWith("file:") === true;
+  return !localDevelopmentPlugin;
+}
+
 function capabilities(partial: Partial<Record<OpenLeashCapability, boolean>>): Record<OpenLeashCapability, boolean> {
   return {
     singleUserRuntime: false,

@@ -11,6 +11,7 @@ import { pluginIconText } from "./plugin-icons.js";
 type PluginImport = {
   manifest: OpenLeashPluginManifest;
   root: string;
+  format: "module" | "json";
   packageName?: string;
   readme?: string;
 };
@@ -57,32 +58,71 @@ try {
 }
 
 async function discoverPlugins(dir: string): Promise<PluginImport[]> {
+  const direct = await readPluginDirectory(dir);
+  if (direct) return [direct];
   const entries = await fs.readdir(dir, { withFileTypes: true });
   const imports: PluginImport[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     const root = path.join(dir, entry.name);
-    const manifestPath = await firstExisting([
-      path.join(root, "src", "manifest.ts"),
-      path.join(root, "manifest.ts"),
-    ]);
-    if (!(await exists(manifestPath))) continue;
-    const imported = (await import(pathToFileURL(manifestPath).href)) as Record<
-      string,
-      unknown
-    >;
-    const manifest = findManifestExport(imported);
-    if (!manifest?.id) continue;
-    imports.push({
-      manifest,
-      root,
-      packageName: await readPackageName(root),
-      readme: await readOptional(path.join(root, "README.md")),
-    });
+    const plugin = await readPluginDirectory(root);
+    if (plugin) imports.push(plugin);
   }
   return imports.sort((left, right) =>
     left.manifest.id.localeCompare(right.manifest.id),
   );
+}
+
+async function readPluginDirectory(
+  root: string,
+): Promise<PluginImport | undefined> {
+  const manifestPath = await firstExisting([
+    path.join(root, "src", "manifest.ts"),
+    path.join(root, "manifest.ts"),
+  ]);
+  let manifest: OpenLeashPluginManifest | undefined;
+  let format: PluginImport["format"];
+  if (await exists(manifestPath)) {
+    const imported = (await import(
+      pathToFileURL(manifestPath).href
+    )) as Record<string, unknown>;
+    manifest = findManifestExport(imported);
+    format = "module";
+  } else {
+    manifest = await readJsonManifest(root);
+    format = "json";
+  }
+  if (!manifest?.id) return undefined;
+  return {
+    manifest,
+    root,
+    format,
+    packageName: await readPackageName(root),
+    readme: await readOptional(path.join(root, "README.md")),
+  };
+}
+
+async function readJsonManifest(
+  root: string,
+): Promise<OpenLeashPluginManifest | undefined> {
+  for (const filename of [
+    "openleash.plugin.json",
+    "plugin.json",
+    "manifest.json",
+  ]) {
+    const raw = await readOptional(path.join(root, filename));
+    if (!raw) continue;
+    const parsed = JSON.parse(raw) as unknown;
+    if (isManifest(parsed)) return parsed;
+  }
+  const packageRaw = await readOptional(path.join(root, "package.json"));
+  if (!packageRaw) return undefined;
+  const packageJson = JSON.parse(packageRaw) as {
+    openleash?: unknown;
+    openleashPlugin?: unknown;
+  };
+  const embedded = packageJson.openleash ?? packageJson.openleashPlugin;
+  return isManifest(embedded) ? embedded : undefined;
 }
 
 async function firstExisting(paths: string[]): Promise<string> {
@@ -119,7 +159,11 @@ function toMarketplaceListing(
   const readmeDescription = descriptionFromReadme(item.readme);
   const source =
     sourceOverride ??
-    (manifest.publisher === "openleash" ? "first_party" : "community");
+    (manifest.publisher === "openleash"
+      ? "first_party"
+      : item.format === "json"
+        ? "private"
+        : "community");
   const developerName =
     manifest.publisher === "openleash"
       ? "OpenLeash"
@@ -137,9 +181,12 @@ function toMarketplaceListing(
     shortDescription,
     longDescription,
     heroTagline: shortDescription,
-    packageUrl: item.packageName
-      ? `npm:${item.packageName}`
-      : `openleash:plugin/${slug}`,
+    packageUrl:
+      item.format === "json"
+        ? `file:${item.root}`
+        : item.packageName
+          ? `npm:${item.packageName}`
+          : `openleash:plugin/${slug}`,
     repositoryUrl:
       manifest.repositoryUrl ?? firstPartyRepositoryUrl(manifest.id, slug),
     documentationUrl: `https://docs.openleash.com/plugins/${slug}`,

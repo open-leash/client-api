@@ -1,6 +1,8 @@
 import type {
   EvaluationRequest,
   PluginCapabilities,
+  PluginConversationContext,
+  PluginConversationRecentRequest,
   PluginInstructionFile,
   PluginLlmJsonRequest,
   PluginLlmJsonResult,
@@ -57,7 +59,9 @@ export function createPluginCapabilities({
 }): PluginCapabilities {
   const storage: PluginCapabilities["storage"] = {
     async get<T = unknown>({ key, scope }: PluginStorageGetRequest) {
+      requirePermission(permissions, "storage:read");
       if (!organizationId) return undefined;
+      const stateKey = normalizedStateKey(key);
       const result = await pool.query<{ value: unknown; updated_at: string; expires_at: string | null }>(
         `select state_key, value, updated_at, expires_at
          from plugin_state
@@ -66,14 +70,17 @@ export function createPluginCapabilities({
            and scope_key = $3
            and state_key = $4
            and (expires_at is null or expires_at > now())`,
-        [organizationId, pluginId, scopeKey(scope, request), key]
+        [organizationId, pluginId, scopeKey(scope, request, userId), stateKey]
       );
       const row = result.rows[0];
-      return row ? { key, scope, value: row.value as T, updatedAt: row.updated_at, expiresAt: row.expires_at } : undefined;
+      return row ? { key: stateKey, scope, value: row.value as T, updatedAt: row.updated_at, expiresAt: row.expires_at } : undefined;
     },
     async set({ key, value, scope, ttlSeconds }) {
+      requirePermission(permissions, "storage:write");
+      const stateKey = normalizedStateKey(key);
+      const serializedValue = serializedPluginState(value);
       if (!organizationId) {
-        return { value, updatedAt: new Date().toISOString(), expiresAt: null };
+        return { key: stateKey, scope, value, updatedAt: new Date().toISOString(), expiresAt: null };
       }
       const result = await pool.query<{ value: unknown; updated_at: string; expires_at: string | null }>(
         `insert into plugin_state (organization_id, plugin_id, scope_key, state_key, value, expires_at, updated_at)
@@ -83,12 +90,13 @@ export function createPluginCapabilities({
            expires_at = excluded.expires_at,
            updated_at = now()
          returning value, updated_at, expires_at`,
-        [organizationId, pluginId, scopeKey(scope, request), key, JSON.stringify(value), normalizedTtl(ttlSeconds)]
+        [organizationId, pluginId, scopeKey(scope, request, userId), stateKey, serializedValue, normalizedTtl(ttlSeconds)]
       );
       const row = result.rows[0];
-      return { key, scope, value: row.value, updatedAt: row.updated_at, expiresAt: row.expires_at };
+      return { key: stateKey, scope, value: row.value, updatedAt: row.updated_at, expiresAt: row.expires_at };
     },
     async list<T = unknown>({ keyPrefix, scope, limit }: PluginStorageListRequest = {}) {
+      requirePermission(permissions, "storage:read");
       if (!organizationId) return [];
       const result = await pool.query<{ state_key: string; value: unknown; updated_at: string; expires_at: string | null }>(
         `select state_key, value, updated_at, expires_at
@@ -100,7 +108,7 @@ export function createPluginCapabilities({
            and (expires_at is null or expires_at > now())
          order by updated_at desc
          limit $5`,
-        [organizationId, pluginId, scopeKey(scope, request), cleanPrefix(keyPrefix), normalizedLimit(limit)]
+        [organizationId, pluginId, scopeKey(scope, request, userId), cleanPrefix(keyPrefix), normalizedLimit(limit)]
       );
       return result.rows.map((row) => ({
         key: row.state_key,
@@ -111,11 +119,13 @@ export function createPluginCapabilities({
       }));
     },
     async delete({ key, scope }) {
+      requirePermission(permissions, "storage:write");
       if (!organizationId) return;
+      const stateKey = normalizedStateKey(key);
       await pool.query(
         `delete from plugin_state
          where organization_id = $1 and plugin_id = $2 and scope_key = $3 and state_key = $4`,
-        [organizationId, pluginId, scopeKey(scope, request), key]
+        [organizationId, pluginId, scopeKey(scope, request, userId), stateKey]
       );
     }
   };
@@ -124,6 +134,7 @@ export function createPluginCapabilities({
     context: {
       instructions: {
         async list({ agent, scope } = {}) {
+          requirePermission(permissions, "instructions:read");
           const rawFiles = Array.isArray((request?.event.raw as { instructionFiles?: unknown })?.instructionFiles)
             ? (request?.event.raw as { instructionFiles: unknown[] }).instructionFiles
             : [];
@@ -133,36 +144,76 @@ export function createPluginCapabilities({
             .filter((file) => !agent || file.agent.toLowerCase() === agent.toLowerCase())
             .filter((file) => !scope || file.scope === scope);
         }
+      },
+      conversation: {
+        async recent(recentRequest: PluginConversationRecentRequest = {}) {
+          requirePermission(permissions, "conversation:read");
+          return recentConversationContext({
+            userId,
+            request,
+            limit: recentRequest.limit,
+          });
+        }
       }
     },
     llm: {
       evaluateJson(request) {
+        requirePermission(permissions, "model:invoke");
         return evaluatePluginJson(request, tenantModelKey);
       }
     },
     storage,
     notification: {
       async send(notification) {
+        requirePermission(permissions, "notification:send");
         const dedupeKey = notification.dedupeKey?.trim();
         if (!dedupeKey || !organizationId) {
           return { sent: true, deduped: false };
         }
-        const key = `notification:${dedupeKey}`;
-        const existing = await storage.get({ key, scope: notification.scope });
-        if (existing && notification.minIntervalSeconds) {
-          const ageMs = Date.now() - new Date(existing.updatedAt).getTime();
+        const key = normalizedStateKey(`notification:${dedupeKey}`);
+        const existing = await pool.query<{ updated_at: string }>(
+          `select updated_at
+           from plugin_state
+           where organization_id = $1
+             and plugin_id = $2
+             and scope_key = $3
+             and state_key = $4
+             and (expires_at is null or expires_at > now())`,
+          [
+            organizationId,
+            pluginId,
+            scopeKey(notification.scope, request, userId),
+            key,
+          ],
+        );
+        if (existing.rows[0] && notification.minIntervalSeconds) {
+          const ageMs =
+            Date.now() - new Date(existing.rows[0].updated_at).getTime();
           if (ageMs < notification.minIntervalSeconds * 1000) return { sent: false, deduped: true };
         }
-        await storage.set({
-          key,
-          scope: notification.scope,
-          value: {
-            level: notification.level,
-            title: notification.title,
-            summary: notification.summary
-          },
-          ttlSeconds: notification.minIntervalSeconds
-        });
+        await pool.query(
+          `insert into plugin_state
+           (organization_id, plugin_id, scope_key, state_key, value, expires_at, updated_at)
+           values ($1, $2, $3, $4, $5::jsonb,
+             case when $6::int is null then null else now() + ($6::int * interval '1 second') end,
+             now())
+           on conflict (organization_id, plugin_id, scope_key, state_key) do update set
+             value = excluded.value,
+             expires_at = excluded.expires_at,
+             updated_at = now()`,
+          [
+            organizationId,
+            pluginId,
+            scopeKey(notification.scope, request, userId),
+            key,
+            serializedPluginState({
+              level: notification.level,
+              title: notification.title,
+              summary: notification.summary,
+            }),
+            normalizedTtl(notification.minIntervalSeconds),
+          ],
+        );
         return { sent: true, deduped: false };
       }
     },
@@ -198,6 +249,7 @@ export function createPluginCapabilities({
     },
     log: {
       async emit(log) {
+        requirePermission(permissions, "log:write");
         return emitPluginLog({
           organizationId,
           pluginId,
@@ -212,6 +264,7 @@ export function createPluginCapabilities({
     },
     signals: {
       async emit(signal) {
+        requirePermission(permissions, "signal:write");
         return emitPluginSignal({
           organizationId,
           pluginId,
@@ -226,6 +279,7 @@ export function createPluginCapabilities({
     },
     usage: {
       async record(usage) {
+        requirePermission(permissions, "usage:write");
         return recordPluginUsage({
           organizationId,
           pluginId,
@@ -245,6 +299,88 @@ function requirePermission(permissions: PluginPermission[], permission: PluginPe
   if (!permissions.includes(permission)) {
     throw new Error(`plugin capability requires ${permission}`);
   }
+}
+
+async function recentConversationContext({
+  userId,
+  request,
+  limit,
+}: {
+  userId?: string;
+  request?: EvaluationRequest;
+  limit?: number;
+}): Promise<PluginConversationContext> {
+  const sessionId = request?.event.sessionId ?? "";
+  const boundedLimit = normalizedConversationLimit(limit);
+  const candidates = [normalizeConversationTurns(request?.event.transcript)];
+
+  if (userId && sessionId) {
+    const result = await pool.query<{ payload: unknown }>(
+      `select ce.payload
+       from conversation_events ce
+       where ce.user_id = $1
+         and ce.session_id = $2
+       order by ce.occurred_at desc, ce.created_at desc
+       limit 20`,
+      [userId, sessionId],
+    );
+    candidates.push(
+      ...result.rows.map((row) => {
+        if (!row.payload || typeof row.payload !== "object") return [];
+        return normalizeConversationTurns(
+          (row.payload as { transcript?: unknown }).transcript,
+        );
+      }),
+    );
+  }
+
+  const turns = candidates.reduce(
+    (longest, candidate) =>
+      candidate.length > longest.length ? candidate : longest,
+    [] as PluginConversationContext["turns"],
+  );
+  return {
+    sessionId,
+    turns: turns.slice(-boundedLimit),
+    truncated: turns.length > boundedLimit,
+  };
+}
+
+function normalizeConversationTurns(
+  value: unknown,
+): PluginConversationContext["turns"] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (
+        turn,
+      ): turn is { role?: unknown; content?: unknown; at?: unknown } =>
+        Boolean(turn && typeof turn === "object"),
+    )
+    .flatMap((turn) => {
+      const role = turn.role;
+      const content =
+        typeof turn.content === "string" ? turn.content.trim() : "";
+      if (
+        !content ||
+        (role !== "user" &&
+          role !== "assistant" &&
+          role !== "tool" &&
+          role !== "system")
+      ) {
+        return [];
+      }
+      return [{
+        role: role as PluginConversationContext["turns"][number]["role"],
+        content: content.slice(0, 50_000),
+        ...(typeof turn.at === "string" ? { at: turn.at } : {}),
+      }];
+    });
+}
+
+function normalizedConversationLimit(value: number | undefined) {
+  if (!Number.isFinite(value)) return 20;
+  return Math.max(1, Math.min(100, Math.floor(Number(value))));
 }
 
 function normalizeInstructionFile(value: unknown): PluginInstructionFile | undefined {
@@ -647,13 +783,19 @@ async function recordPluginUsage({
   });
 }
 
-function scopeKey(scope: PluginStorageScope | undefined, request: EvaluationRequest | undefined) {
+function scopeKey(
+  scope: PluginStorageScope | undefined,
+  request: EvaluationRequest | undefined,
+  authenticatedUserId?: string,
+) {
   const merged = {
     agentKind: scope?.agentKind ?? request?.agent.kind,
     sessionId: scope?.sessionId ?? request?.event.sessionId,
     conversationId: scope?.conversationId,
     projectPath: scope?.projectPath ?? request?.event.projectPath,
-    userId: scope?.userId,
+    // The authenticated runtime owns user scope. A plugin cannot select another
+    // employee by putting a user id in its request.
+    userId: authenticatedUserId ?? scope?.userId,
     key: scope?.key
   };
   const entries = Object.entries(merged)
@@ -674,7 +816,31 @@ function normalizedLimit(value: number | undefined) {
 
 function cleanPrefix(value: string | undefined) {
   const text = typeof value === "string" ? value.trim() : "";
-  return text || null;
+  return text ? text.slice(0, 240) : null;
+}
+
+function normalizedStateKey(value: unknown) {
+  const key = typeof value === "string" ? value.trim() : "";
+  if (!key || key.length > 240) {
+    throw new Error("plugin storage key must contain 1 to 240 characters");
+  }
+  return key;
+}
+
+function serializedPluginState(value: unknown) {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error("plugin storage value must be JSON-serializable");
+  }
+  if (serialized === undefined) {
+    throw new Error("plugin storage value must be JSON-serializable");
+  }
+  if (Buffer.byteLength(serialized, "utf8") > 256 * 1024) {
+    throw new Error("plugin storage value exceeds the 256 KiB limit");
+  }
+  return serialized;
 }
 
 function normalizeLogLevel(value: unknown): PluginLogLevel {

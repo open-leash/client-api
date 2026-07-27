@@ -60,12 +60,20 @@ client-api ──► Postgres policy, plugin settings, audit, approvals, account
 
 ### Attention interaction contract
 
-`GET /v1/client/notifications` includes versioned `attentionEvents` for pending
-approvals, native questions, plan reviews, blocked actions, and completed
-turns. Desktop and mobile resolve the same durable decision through the client
+`GET /v1/client/notifications` and `GET /v1/mobile/state` include versioned
+`attentionEvents` for approvals, native questions, plan reviews, blocked
+actions, completed turns, and completed subagents. `GET /v1/client/events`
+provides an authenticated per-user server-sent event stream. Postgres emits an
+invalidation after activity creation, attention creation, and resolution, so
+desktop, web, and mobile can refresh the same durable record immediately.
+
+Desktop, web, and mobile resolve the same durable decision through the client
 or mobile decision endpoint. An allow resolution may include a bounded,
-structured `response`; the waiting hook receives that payload and the agent
-adapter translates it into the agent's native answer format.
+structured `response`; the exact hook/proxy request already waiting for that
+decision receives the payload and its agent adapter translates it into the
+agent's native answer format. Resolutions are not broadcast as commands to
+other desktops. Cloud and SaaS requests are resumed by their server-side
+request owner.
 
 This path is deliberately backend-owned. Individual Open Source uses its local
 `client-api` and Postgres, Private Cloud uses the customer-hosted service, and
@@ -84,6 +92,50 @@ OpenLeash resolves installation and configuration before invoking plugin code. I
 Plugins may publish typed, expiring annotations, progress, and ambient status through the Island capability. OpenLeash owns rendering and navigation; plugins never send UI code. See [`docs/PLUGIN_ISLAND.md`](docs/PLUGIN_ISLAND.md).
 
 Developer docs live in [`src/plugins/README.md`](src/plugins/README.md). First-party plugin examples live as one public repository per plugin under the `open-leash/plugin-*` pattern.
+
+---
+
+## 🧩 Build a container plugin
+
+OpenLeash plugins are ordinary OCI containers. Use any language, keep private
+files or a database under `/data`, and communicate through the signed
+`openleash-container-plugin.v1` HTTP protocol.
+
+```text
+GET  /healthz
+POST /v1/events
+```
+
+History-aware plugins should request the authenticated current conversation:
+
+```ts
+const conversation = await capabilities.context.conversation.recent({
+  limit: 20
+});
+```
+
+Use `/data` for runtime-local SQLite, PostgreSQL, MongoDB, files, indexes, or
+caches. OpenLeash does not copy private database files between desktop and
+cloud runtimes. `capabilities.storage` remains optional for small plugin-owned
+values; it is not the normal conversation-history interface.
+
+- [Read the complete plugin guide](src/plugins/README.md)
+- [Run the container example](examples/container-plugin)
+- [Browse the hosted documentation](https://docs.openleash.com/reference/plugin-containers)
+
+The example includes the complete local loop:
+
+```bash
+cd examples/container-plugin
+npm install
+npm run smoke
+```
+
+Then choose **Plugins → Add/reload local folder** in an Individual Open Source
+desktop. The smoke test validates the manifest and JavaScript, builds the
+image, exercises a signed conversation-context round trip, and leaves the image
+ready to load. For later edits, run `npm run image` and choose the same folder
+again; the desktop replaces the running development container automatically.
 
 ---
 

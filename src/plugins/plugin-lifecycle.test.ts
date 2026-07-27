@@ -31,7 +31,16 @@ function request(toolName = "Bash", input: unknown = { command: "echo ok" }): Ev
 function capabilities(llmResult?: unknown) {
   const emitted = { logs: [] as unknown[], signals: [] as unknown[], notifications: [] as unknown[], usage: [] as unknown[], island: [] as unknown[] };
   const cap = {
-    context: { instructions: { list: async () => [] } },
+    context: {
+      instructions: { list: async () => [] },
+      conversation: {
+        recent: async () => ({
+          sessionId: "session-test",
+          turns: [],
+          truncated: false,
+        }),
+      },
+    },
     llm: { evaluateJson: async () => llmResult as never },
     storage: {
       get: async () => undefined,
