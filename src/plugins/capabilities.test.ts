@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { EvaluationRequest } from "@openleash/shared";
-import { createPluginCapabilities } from "./capabilities.js";
+import { modelConfigFor } from "../evaluator.js";
+import { createPluginCapabilities, pluginModelConfig } from "./capabilities.js";
 
 function request(): EvaluationRequest {
   return {
@@ -74,5 +75,44 @@ test("portable plugin state enforces bounded JSON values", async () => {
   await assert.rejects(
     capabilities.storage.set({ key: "", value: {} }),
     /1 to 240 characters/,
+  );
+});
+
+test("plugin evaluation ignores an ambient agent OPENAI_API_KEY", () => {
+  assert.equal(
+    pluginModelConfig(undefined, {
+      OPENAI_API_KEY: "agent-owned-key",
+    }),
+    undefined,
+  );
+  assert.deepEqual(
+    pluginModelConfig(undefined, {
+      OPENAI_API_KEY: "agent-owned-key",
+      OPENLEASH_OPENAI_API_KEY: "managed-evaluation-key",
+    }),
+    {
+      provider: "openai",
+      apiKey: "managed-evaluation-key",
+      source: "openleash-managed",
+    },
+  );
+});
+
+test("approval summaries ignore an ambient agent OPENAI_API_KEY", () => {
+  assert.equal(
+    modelConfigFor(undefined, {
+      OPENAI_API_KEY: "agent-owned-key",
+    }),
+    undefined,
+  );
+  assert.deepEqual(
+    modelConfigFor(undefined, {
+      OPENLEASH_OPENAI_API_KEY: "managed-evaluation-key",
+    }),
+    {
+      provider: "openai",
+      apiKey: "managed-evaluation-key",
+      source: "openleash-managed",
+    },
   );
 });

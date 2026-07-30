@@ -488,7 +488,10 @@ async function evaluatePluginJson<T = unknown>(
   };
 }
 
-function pluginModelConfig(tenantModelKey?: TenantModelKey):
+export function pluginModelConfig(
+  tenantModelKey?: TenantModelKey,
+  env: NodeJS.ProcessEnv = process.env,
+):
   | { provider: "openai" | "anthropic" | "deepseek"; apiKey: string; baseURL?: string; source: "tenant-byok" | "openleash-managed" }
   | undefined {
   if (tenantModelKey?.apiKey) {
@@ -497,7 +500,12 @@ function pluginModelConfig(tenantModelKey?: TenantModelKey):
     }
     return { provider: tenantModelKey.provider, apiKey: tenantModelKey.apiKey, source: "tenant-byok" };
   }
-  const apiKey = process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY;
+  // OPENAI_API_KEY commonly belongs to the coding agent or shell that
+  // launched OpenLeash. Treating that ambient credential as the OpenLeash
+  // evaluation key can unexpectedly consume the user's quota and turns a
+  // provider error into a failed hook. Managed evaluation must be configured
+  // explicitly, while Individual Open Source uses its saved tenant BYOK key.
+  const apiKey = env.OPENLEASH_OPENAI_API_KEY;
   return apiKey ? { provider: "openai", apiKey, source: "openleash-managed" } : undefined;
 }
 

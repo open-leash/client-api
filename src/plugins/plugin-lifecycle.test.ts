@@ -164,6 +164,23 @@ test("cloud evaluation records edge work without rerunning the same plugin", asy
   assert.deepEqual(result.runs, []);
 });
 
+test("a required evaluation plugin failure becomes a recorded deny instead of an API error", async () => {
+  const result = await runEvaluationPipeline({
+    request: request("Bash", { command: "echo hello" }),
+    policies: [],
+    plugins: new Map([
+      ["openleash.blast-radius", { enabled: true, config: {} }],
+    ]),
+  });
+  assert.equal(result.results[0]?.status, "failed");
+  assert.equal(result.results[0]?.policyName, "blast-radius runtime");
+  assert.match(
+    result.results[0]?.explanation ?? "",
+    /blast-radius could not evaluate this action/,
+  );
+  assert.equal(result.runs[0]?.status, "failed");
+});
+
 test("blast-radius blocks recursive filesystem deletion", async () => {
   const { cap, emitted } = capabilities();
   const result = await runBlastRadius(pipelineInput(request("Bash", { command: "rm -rf /" })), cap);
@@ -248,7 +265,7 @@ test("sensitive-access ignores an LLM-only SQLite destruction classification", a
   assert.equal(result.run.status, "passed");
 });
 
-test("rules-enforcer applies policy fallback and records usage", async () => {
+test("rules-enforcer applies a configured rule and records usage", async () => {
   const { cap, emitted } = capabilities();
   const policies: Policy[] = [{
     id: "no-destruction", name: "No destructive commands", description: "", severity: "high",
@@ -257,6 +274,62 @@ test("rules-enforcer applies policy fallback and records usage", async () => {
   const result = await runSecurityEvaluator(pipelineInput(request("Bash", { command: "rm -rf /tmp/project" }), undefined, policies), cap);
   assert.ok(result.results.some((item) => item.status === "needs_question"));
   assert.equal(emitted.usage.length, 1);
+});
+
+test("rules-enforcer stays empty when no rules are configured", async () => {
+  const { cap, emitted } = capabilities();
+  const result = await runSecurityEvaluator(
+    pipelineInput(request("Bash", { command: "rm -rf /tmp/project" })),
+    cap,
+  );
+  assert.deepEqual(result.results, []);
+  assert.equal(result.run.summary, "No rules are configured.");
+  assert.equal(emitted.usage.length, 0);
+});
+
+test("rules-enforcer fails closed when natural-language evaluation is unavailable", async () => {
+  const { cap } = capabilities();
+  const policies: Policy[] = [{
+    id: "typescript-only",
+    name: "TypeScript only",
+    description: "",
+    severity: "medium",
+    naturalLanguageRule: "Only create TypeScript source files",
+    enabled: true,
+    enforcementAction: "block",
+  }];
+  await assert.rejects(
+    runSecurityEvaluator(
+      pipelineInput(request("Write", { file_path: "server.js" }), undefined, policies),
+      cap,
+    ),
+    /no evaluation model is configured/i,
+  );
+});
+
+test("rules-enforcer rejects an incomplete model evaluation", async () => {
+  const { cap } = capabilities({
+    json: { results: [] },
+    model: "fixture",
+    provider: "test",
+    source: "test",
+  });
+  const policies: Policy[] = [{
+    id: "tests-required",
+    name: "Tests required",
+    description: "",
+    severity: "medium",
+    naturalLanguageRule: "Always run the relevant tests",
+    enabled: true,
+    enforcementAction: "ask",
+  }];
+  await assert.rejects(
+    runSecurityEvaluator(
+      pipelineInput(request("Bash", { command: "git push" }), undefined, policies),
+      cap,
+    ),
+    /incomplete evaluation/i,
+  );
 });
 
 test("MCP scanner identifies a server/tool pair and emits discovery", async () => {

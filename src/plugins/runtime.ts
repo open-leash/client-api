@@ -16,6 +16,7 @@ import type {
   OpenLeashPluginManifest,
   PipelineEvent,
   PluginCatalogItem,
+  PluginRunRecord,
   PluginSettingState,
 } from "@openleash/shared";
 
@@ -90,13 +91,19 @@ export async function runPromptPipeline(
         };
       }
     } catch (error) {
-      if ((plugin.execution?.failureMode ?? "closed") === "closed") throw error;
-      runs.push({
-        pluginId: plugin.id,
-        event: "prompt.beforeSubmit",
-        status: "failed",
-        summary: error instanceof Error ? error.message : String(error),
-      });
+      const failure = pluginFailureRun(plugin, "prompt.beforeSubmit", error);
+      runs.push(failure);
+      if ((plugin.execution?.failureMode ?? "closed") === "closed") {
+        return {
+          finalPrompt: current,
+          blocked: true,
+          summary: pluginFailureExplanation(plugin),
+          model: [...models].join(", ") || "none",
+          compression,
+          dlp,
+          runs,
+        };
+      }
     }
   }
 
@@ -225,15 +232,24 @@ export async function runEvaluationPipeline(
             mcpCall: output.mcpCall,
           };
         } catch (error) {
-          if ((plugin.execution?.failureMode ?? "closed") === "closed") throw error;
+          const failure = pluginFailureRun(plugin, event, error);
+          if ((plugin.execution?.failureMode ?? "closed") === "closed") {
+            return {
+              results: [{
+                policyId: `${plugin.id}.runtime-failure`,
+                policyName: `${pluginSlug(plugin)} runtime`,
+                status: "failed" as const,
+                severity: "high" as const,
+                explanation: pluginFailureExplanation(plugin),
+                evidence: [],
+              }],
+              runs: [failure],
+              model: "none",
+            };
+          }
           return {
             results: [],
-            runs: [{
-              pluginId: plugin.id,
-              event,
-              status: "failed" as const,
-              summary: error instanceof Error ? error.message : String(error),
-            }],
+            runs: [failure],
             model: "none",
           };
         }
@@ -248,6 +264,27 @@ export async function runEvaluationPipeline(
       "none",
     runs: steps.flatMap((step) => step.runs),
     mcpCall: steps.find((step) => step.mcpCall)?.mcpCall,
+  };
+}
+
+function pluginSlug(plugin: OpenLeashPluginManifest) {
+  return plugin.slug || plugin.id.replace(/^openleash\./, "");
+}
+
+function pluginFailureExplanation(plugin: OpenLeashPluginManifest) {
+  return `${pluginSlug(plugin)} could not evaluate this action, so OpenLeash blocked it.`;
+}
+
+function pluginFailureRun(
+  plugin: OpenLeashPluginManifest,
+  event: PipelineEvent,
+  error: unknown,
+): PluginRunRecord {
+  return {
+    pluginId: plugin.id,
+    event,
+    status: "failed",
+    summary: error instanceof Error ? error.message : String(error),
   };
 }
 

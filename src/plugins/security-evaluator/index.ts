@@ -11,6 +11,20 @@ type RulesLlmResult = {
 
 export async function runSecurityEvaluator(input: EvaluationPipelineInput, capabilities: PluginCapabilities) {
   const startedAt = Date.now();
+  if (input.policies.length === 0) {
+    return {
+      results: [],
+      model: "none",
+      run: pluginRun({
+        pluginId: manifest.id,
+        event: eventForHookEvent(input.request.event.eventName),
+        status: "passed",
+        summary: "No rules are configured.",
+        startedAt,
+        metadata: { model: "none", ruleCount: 0 }
+      })
+    };
+  }
   const evaluated = await evaluateRules(input, capabilities);
   const { results, model } = evaluated;
   const failed = results.filter((result) => result.status === "failed" || result.status === "needs_question");
@@ -155,9 +169,30 @@ async function evaluateRules(input: EvaluationPipelineInput, capabilities: Plugi
     maxOutputTokens: 4000
   });
   const llmResults = sanitizePolicyDecisions(llm?.json?.results, input);
+  if (llm) {
+    const evaluatedPolicyIds = new Set(
+      llmResults.map((result) => result.policyId),
+    );
+    if (
+      input.policies.some((policy) => !evaluatedPolicyIds.has(policy.id))
+    ) {
+      throw new Error(
+        "Rules Enforcer received an incomplete evaluation for the configured rules."
+      );
+    }
+    return {
+      results: llmResults,
+      model: llm.model
+    };
+  }
+  if (fallback.some((result) => result.status === "passed")) {
+    throw new Error(
+      "Rules Enforcer cannot evaluate configured natural-language rules because no evaluation model is configured."
+    );
+  }
   return {
-    results: llmResults.length ? llmResults : fallback,
-    model: llm?.model ?? "rules-enforcer-heuristic"
+    results: fallback,
+    model: "rules-enforcer-heuristic"
   };
 }
 

@@ -171,7 +171,10 @@ export async function summarizeActionPurpose(request: EvaluationRequest, tenantM
   }
 }
 
-function modelConfigFor(tenantModelKey?: TenantModelKey):
+export function modelConfigFor(
+  tenantModelKey?: TenantModelKey,
+  env: NodeJS.ProcessEnv = process.env,
+):
   | { provider: "openai" | "anthropic" | "deepseek"; apiKey: string; baseURL?: string; source: "tenant-byok" | "openleash-managed" }
   | undefined {
   if (tenantModelKey?.apiKey) {
@@ -180,7 +183,9 @@ function modelConfigFor(tenantModelKey?: TenantModelKey):
     }
     return { provider: tenantModelKey.provider, apiKey: tenantModelKey.apiKey, source: "tenant-byok" };
   }
-  const managedKey = process.env.OPENAI_API_KEY || process.env.OPENLEASH_OPENAI_API_KEY;
+  // The coding agent may have OPENAI_API_KEY in its inherited shell. That key
+  // is not authorization for OpenLeash evaluations or summaries.
+  const managedKey = env.OPENLEASH_OPENAI_API_KEY;
   return managedKey ? { provider: "openai", apiKey: managedKey, source: "openleash-managed" } : undefined;
 }
 

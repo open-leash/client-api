@@ -48,6 +48,7 @@ import {
 import { z } from "zod";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
 import { summarizeActionPurpose } from "./evaluator.js";
+import { nativeHookDecision } from "./hook-decisions.js";
 import { pluginIconText } from "./plugin-icons.js";
 import { normalizePluginIconInput } from "./plugin-icon-input.js";
 import { canonicalPluginSlug } from "./plugin-slug.js";
@@ -130,6 +131,10 @@ import {
   buildAttentionEvents,
 } from "./attention-events.js";
 import { ClientSyncBroker } from "./client-sync.js";
+import {
+  normalizeSessionMonitoringScope,
+  normalizedSessionPauseExpiry,
+} from "./session-monitoring.js";
 
 class HttpError extends Error {
   constructor(
@@ -536,6 +541,86 @@ app.post("/v1/enroll", async (req, res, next) => {
   }
 });
 
+app.post("/v1/session-monitoring", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    if (isOrganizationManagedAccount(productMode, session.account?.audience)) {
+      return res.status(403).json({
+        error: "Organization-managed monitoring cannot be paused from the Island.",
+      });
+    }
+    const scope = normalizeSessionMonitoringScope(req.body);
+    if (!scope)
+      return res.status(400).json({
+        error: "A stable agent kind and conversation identifier are required.",
+      });
+    const expiresAt = normalizedSessionPauseExpiry(req.body?.expiresAt);
+    await pool.query(
+      `insert into session_monitoring_pauses
+         (organization_id, user_id, agent_kind, session_id, expires_at, updated_at)
+       select $1, $2, $3, unnest($4::text[]), $5, now()
+       on conflict (organization_id, user_id, agent_kind, session_id)
+       do update set expires_at = excluded.expires_at, updated_at = now()`,
+      [
+        session.organization.id,
+        session.user.id,
+        scope.agentKind,
+        scope.sessionIds,
+        expiresAt,
+      ],
+    );
+    res.json({
+      ok: true,
+      paused: true,
+      agentKind: scope.agentKind,
+      sessionIds: scope.sessionIds,
+      expiresAt: expiresAt.toISOString(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/v1/session-monitoring", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const scope = normalizeSessionMonitoringScope(req.body);
+    if (!scope)
+      return res.status(400).json({
+        error: "A stable agent kind and conversation identifier are required.",
+      });
+    await pool.query(
+      `delete from session_monitoring_pauses
+       where organization_id = $1
+         and user_id = $2
+         and agent_kind = $3
+         and session_id = any($4::text[])`,
+      [
+        session.organization.id,
+        session.user.id,
+        scope.agentKind,
+        scope.sessionIds,
+      ],
+    );
+    res.json({
+      ok: true,
+      paused: false,
+      agentKind: scope.agentKind,
+      sessionIds: scope.sessionIds,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/v1/evaluate", async (req, res, next) => {
   try {
     const token = tokenFromRequest(req);
@@ -544,6 +629,9 @@ app.post("/v1/evaluate", async (req, res, next) => {
       return res.status(401).json({ error: "invalid OpenLeash token" });
 
     const request = eventSchema.parse(req.body) as EvaluationRequest;
+    if (await isSessionMonitoringPaused(user, request)) {
+      return res.json(sessionMonitoringPausedDecision());
+    }
     res.json(await evaluateAndRecord(request, user));
   } catch (error) {
     next(error);
@@ -563,6 +651,13 @@ app.post("/v1/agent-events", async (req, res, next) => {
       });
     }
     const request = eventSchema.parse(req.body?.request) as EvaluationRequest;
+    if (await isSessionMonitoringPaused(user, request)) {
+      return res.json({
+        ...sessionMonitoringPausedDecision(),
+        source,
+        deduplicated: false,
+      });
+    }
     await writePipelineTrace("ingress.raw", {
       source,
       provider: req.body?.provider,
@@ -708,6 +803,18 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
       optionalString(req.body?.agentId),
     );
     const sessionId = String(req.body?.sessionId ?? "proxy").trim() || "proxy";
+    if (await isSessionMonitoringPaused(user, {
+      agent: { kind: agentKind },
+      event: { agentKind, sessionId },
+    })) {
+      return res.json({
+        protocol: "openleash-container-plugin.v1",
+        requestBody,
+        appliedPluginIds: [],
+        runs: [],
+        monitoringPaused: true,
+      });
+    }
     const catalog = await pluginCatalogForOrganization(
       user.organization_id,
       user.id,
@@ -786,6 +893,13 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
         .json({ error: "unsupported OpenLeash hook target" });
     }
     const request = normalizeHookRequest(agent, eventName, req.body, req.query);
+    if (await isSessionMonitoringPaused(user, request)) {
+      return res.json(nativeHookDecision(
+        agent,
+        eventName,
+        sessionMonitoringPausedDecision(),
+      ));
+    }
     await writePipelineTrace("ingress.raw_hook", {
       source: "api_hook",
       provider: agent,
@@ -3385,6 +3499,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       policies,
       pluginCatalog,
       pluginOutcomes,
+      sessionMonitoringPauses,
     ] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       browserBlockedNotifications(session.organization.id, session.user.id),
@@ -3398,6 +3513,19 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       userPluginOutcomes(session.organization.id, session.user.id, {
         limit: 40,
       }),
+      pool.query<{
+        agent_kind: string;
+        session_id: string;
+        expires_at: Date;
+      }>(
+        `select agent_kind, session_id, expires_at
+         from session_monitoring_pauses
+         where organization_id = $1
+           and user_id = $2
+           and expires_at > now()
+         order by expires_at asc`,
+        [session.organization.id, session.user.id],
+      ),
     ]);
     const islandContributions = await activeIslandContributions(
       session.organization.id,
@@ -3423,6 +3551,11 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       plugins: pluginCatalog.plugins,
       outcomes: pluginOutcomes.outcomes,
       islandContributions,
+      sessionMonitoringPauses: sessionMonitoringPauses.rows.map((item) => ({
+        agentKind: item.agent_kind,
+        sessionIds: [item.session_id],
+        expiresAt: item.expires_at.toISOString(),
+      })),
       viewModel: buildOpenLeashClientViewModel({
         plugins: pluginCatalog.plugins,
         outcomes: pluginOutcomes.outcomes,
@@ -5451,10 +5584,7 @@ async function handlePromptOnlyHook(
           plugins: runtimePlugins,
         })
       : Promise.resolve(undefined);
-  const runtimePolicies = policiesForRulesEnforcer(
-    runtimePlugins,
-    policies.rows,
-  );
+  const runtimePolicies = policiesForRulesEnforcer(runtimePlugins);
   const [promptResult, pipeline] = await Promise.all([
     promptEvaluation,
     runEvaluationPipeline({
@@ -5688,17 +5818,11 @@ async function pluginCatalogForOrganization(
   plugins: PluginCatalogItem[];
   marketplacePolicy: MarketplacePolicyRecord;
 }> {
-  const [settings, userSettings, policyRows, approvedReleaseRows] = await Promise.all([
+  const [settings, userSettings, approvedReleaseRows] = await Promise.all([
     readPluginSettings(organizationId),
     userId
       ? readUserPluginSettings(organizationId, userId)
       : Promise.resolve(new Map<string, PluginSettingRecord>()),
-    pool.query<Policy>(
-      `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
-       from policies
-       where enabled = true
-       order by created_at asc`,
-    ),
     pool.query(
       `select * from plugin_releases where review_status = 'approved'`,
     ),
@@ -5732,7 +5856,6 @@ async function pluginCatalogForOrganization(
           listing,
           policy.get(pluginId),
           marketplacePolicy,
-          policyRows.rows,
           approvedReleases,
           options.agentKind,
           options.agentId,
@@ -5750,7 +5873,6 @@ function pluginCatalogItem(
   marketplace?: PluginMarketplaceListing,
   policy?: PluginPolicyRecord,
   marketplacePolicy?: MarketplacePolicyRecord,
-  fallbackPolicies: Policy[] = [],
   approvedReleases: Map<string, OpenLeashPluginManifest> = new Map(),
   agentKind?: string,
   agentId?: string,
@@ -5800,12 +5922,6 @@ function pluginCatalogItem(
     configLocked,
     mandatory: policy?.mandatory,
   });
-  if (
-    manifest.id === "openleash.rules-enforcer" &&
-    normalizeRuleConfigs(resolved.config.rules).length === 0
-  ) {
-    resolved.config.rules = policyRulesForConfig(fallbackPolicies);
-  }
   return {
     ...selectedManifest,
     slug: manifest.slug ?? marketplace?.slug,
@@ -6121,7 +6237,6 @@ async function savePluginSettingsForUser(
       undefined,
       pluginPolicy,
       marketplacePolicy,
-      [],
       new Map(),
       undefined,
       undefined,
@@ -7770,10 +7885,7 @@ async function evaluateAndRecord(
     `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
      from policies where enabled = true order by created_at asc`,
   );
-  const runtimePolicies = policiesForRulesEnforcer(
-    runtimePlugins,
-    policies.rows,
-  );
+  const runtimePolicies = policiesForRulesEnforcer(runtimePlugins);
   const pipeline = await runEvaluationPipeline({
     request,
     organizationId,
@@ -7994,11 +8106,9 @@ function resolvePolicyResultPolicyId(
 
 function policiesForRulesEnforcer(
   settings: Map<string, PluginSettingRecord | PluginSettingState>,
-  fallback: Policy[],
 ): Policy[] {
   const rulesPlugin = settings.get("openleash.rules-enforcer");
   const rules = normalizeRuleConfigs(rulesPlugin?.config?.rules);
-  if (rules.length === 0) return fallback;
   return rules.map((rule, index) => ({
     id: `rules-enforcer-${stableRuleId(rule.text, index)}`,
     name: summarizePolicyTitle(rule.text),
@@ -8062,17 +8172,6 @@ function splitRuleString(value: string) {
   return value.split(
     /,\s+(?=Ask before|Never|Do not|Don't|Always|Require|Block|Pause)/gi,
   );
-}
-
-function policyRulesForConfig(policies: Policy[]) {
-  return policies
-    .map((policy) => ({
-      text: String(
-        policy.naturalLanguageRule || policy.description || policy.name || "",
-      ).trim(),
-      action: policy.enforcementAction === "block" ? "block" : "ask",
-    }))
-    .filter((rule) => rule.text);
 }
 
 function applyConfiguredRuleActions(
@@ -11043,6 +11142,45 @@ async function getClientOrDashboardSession(authHeader: string) {
   };
 }
 
+async function isSessionMonitoringPaused(
+  user: { id: string; organization_id?: string | null },
+  request: {
+    agent?: { kind?: unknown };
+    event?: { agentKind?: unknown; sessionId?: unknown };
+  },
+) {
+  if (!user.organization_id) return false;
+  const agentKind = String(
+    request.agent?.kind ?? request.event?.agentKind ?? "",
+  ).trim().toLowerCase();
+  const sessionId = String(request.event?.sessionId ?? "").trim();
+  if (!agentKind || !sessionId) return false;
+  const result = await pool.query(
+    `select 1
+     from session_monitoring_pauses
+     where organization_id = $1
+       and user_id = $2
+       and agent_kind = $3
+       and session_id = $4
+       and expires_at > now()
+     limit 1`,
+    [user.organization_id, user.id, agentKind, sessionId],
+  );
+  return result.rowCount === 1;
+}
+
+function sessionMonitoringPausedDecision(): EvaluationResponse & {
+  monitoringPaused: true;
+} {
+  return {
+    decision: "allow",
+    decisionId: "",
+    summary: "Monitoring is temporarily paused for this conversation.",
+    results: [],
+    monitoringPaused: true,
+  };
+}
+
 function bearerToken(authHeader: string) {
   return authHeader.replace(/^Bearer\s+/i, "").trim();
 }
@@ -11572,59 +11710,6 @@ function isHookEventName(value: string): value is HookEventName {
   ].includes(value);
 }
 
-function nativeHookDecision(
-  agent: HookAgentSlug,
-  eventName: HookEventName,
-  decision: EvaluationResponse,
-) {
-  const reason = humanDecisionReason(decision);
-  if (agent === "copilot") {
-    if (eventName === "PreToolUse") {
-      return {
-        permissionDecision: decision.decision,
-        permissionDecisionReason: reason,
-      };
-    }
-    if (eventName === "Stop" || eventName === "SubagentStop") {
-      return {
-        decision: decision.decision === "deny" ? "block" : "allow",
-        reason,
-      };
-    }
-    return {};
-  }
-  if (agent === "claude" || agent === "nanoclaw") {
-    if (eventName === "PreToolUse") {
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: decision.decision,
-          permissionDecisionReason: reason,
-          ...(decision.resolutionPayload
-            ? { updatedInput: decision.resolutionPayload }
-            : {}),
-        },
-        suppressOutput: true,
-      };
-    }
-    return {
-      continue: decision.decision !== "deny",
-      stopReason: reason,
-      suppressOutput: true,
-    };
-  }
-  return {
-    decision: decision.decision === "deny" ? "block" : decision.decision,
-    reason,
-    ...(decision.resolutionPayload
-      ? {
-          response: decision.resolutionPayload,
-          updatedInput: decision.resolutionPayload,
-        }
-      : {}),
-  };
-}
-
 function promptTransformHookDecision(
   agent: HookAgentSlug,
   eventName: HookEventName,
@@ -11651,16 +11736,6 @@ function promptTransformHookDecision(
       replacementPrompt: prompt,
     },
   };
-}
-
-function humanDecisionReason(decision: EvaluationResponse) {
-  if (decision.decision === "allow") return "OpenLeash approved this action.";
-  if (decision.decision === "deny" && decision.resolutionGuidance) {
-    return `OpenLeash denied this action. User guidance: ${decision.resolutionGuidance}`;
-  }
-  if (decision.decision === "deny")
-    return decision.summary || "OpenLeash denied this action.";
-  return decision.question ?? decision.summary;
 }
 
 function cleanResolutionGuidance(value?: string) {
@@ -11834,6 +11909,11 @@ function apiFunctionForRequest(
     return "desktopEnroll";
   if (verb === "POST" && /^\/v1\/agents\/[^/]+\/monitoring$/.test(requestPath))
     return "mobileState";
+  if (
+    ["POST", "DELETE"].includes(verb) &&
+    requestPath === "/v1/session-monitoring"
+  )
+    return "sessionMonitoring";
   if (verb === "GET" && requestPath === "/v1/plugins")
     return "tenantPluginsRead";
   if (verb === "GET" && requestPath === "/v1/plugin-marketplace")
