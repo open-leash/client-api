@@ -122,6 +122,16 @@ async function migrateSchema(database: Pool) {
 }
 
 export async function checkForClientUpdate(request: ClientUpdateRequest): Promise<ClientUpdateResponse> {
+  if (!clientUpdatesEnabled()) {
+    return {
+      updateAvailable: false,
+      latestVersion: request.version,
+      currentVersion: request.version,
+      channel: request.channel,
+      platform: request.platform,
+      arch: request.arch,
+    };
+  }
   await ensureReleaseSchema();
   const release = await latestRelease(request);
   const currentVersion = request.version;
@@ -150,6 +160,12 @@ export async function checkForClientUpdate(request: ClientUpdateRequest): Promis
       }
     } : {})
   };
+}
+
+export function clientUpdatesEnabled(
+  value = process.env.OPENLEASH_CLIENT_UPDATES_ENABLED,
+) {
+  return !["0", "false", "off"].includes(String(value ?? "true").toLowerCase());
 }
 
 async function latestRelease(request: ClientUpdateRequest) {
