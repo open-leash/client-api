@@ -176,7 +176,8 @@ create index if not exists agent_monitoring_settings_org_idx on agent_monitoring
 
 create table if not exists policies (
   id uuid primary key default gen_random_uuid(),
-  name text not null unique,
+  organization_id uuid references organizations(id) on delete cascade,
+  name text not null,
   category text not null default 'General',
   description text not null default '',
   severity text not null default 'medium',
@@ -189,6 +190,14 @@ create table if not exists policies (
 
 alter table policies add column if not exists category text not null default 'General';
 alter table policies add column if not exists locked boolean not null default false;
+alter table policies add column if not exists organization_id uuid references organizations(id) on delete cascade;
+alter table policies drop constraint if exists policies_name_key;
+drop index if exists policies_name_unique_idx;
+create unique index if not exists policies_organization_name_unique_idx
+  on policies(organization_id, name)
+  where organization_id is not null;
+create index if not exists policies_organization_created_idx
+  on policies(organization_id, created_at asc);
 
 create table if not exists conversation_events (
   id uuid primary key default gen_random_uuid(),
@@ -742,6 +751,7 @@ create index if not exists policy_results_status_idx on policy_results(status);
 
 create table if not exists deployment_tokens (
   id uuid primary key default gen_random_uuid(),
+  organization_id uuid references organizations(id) on delete cascade,
   label text not null,
   token_hash text unique not null,
   mode text not null default 'cloud',
@@ -753,8 +763,10 @@ create table if not exists deployment_tokens (
   last_used_at timestamptz
 );
 
+alter table deployment_tokens add column if not exists organization_id uuid references organizations(id) on delete cascade;
 create index if not exists deployment_tokens_created_at_idx on deployment_tokens(created_at desc);
 create index if not exists deployment_tokens_active_idx on deployment_tokens(token_hash) where revoked_at is null;
+create index if not exists deployment_tokens_organization_created_idx on deployment_tokens(organization_id, created_at desc);
 
 create table if not exists external_agent_connections (
   id uuid primary key default gen_random_uuid(),
@@ -776,49 +788,8 @@ create index if not exists conversation_events_external_evaluation_key_idx
 alter table computers add column if not exists enrollment_token_id uuid references deployment_tokens(id) on delete set null;
 alter table computers add column if not exists enrolled_at timestamptz;
 
-delete from policies p
-using policies older
-where p.name = older.name
-  and p.created_at > older.created_at;
-
-create unique index if not exists policies_name_unique_idx on policies(name);
-
 delete from policies
 where name in ('Credential file protection', 'Destructive command review', 'Sensitive data minimization');
-
-insert into policies (name, description, severity, natural_language_rule, locked)
-values
-  ('Filesystem destruction', 'Requires approval before recursive local deletion or project/workspace removal.', 'critical', 'Ask before allowing rm -rf /, rm -rf ., recursive deletion of the current project/workspace, deleting the project directory, or formatting local disks/volumes.', true),
-  ('Database destructive changes', 'Requires approval before destructive database commands.', 'critical', 'Ask before allowing DROP DATABASE, DROP TABLE, DROP SCHEMA, TRUNCATE TABLE, or unfiltered DELETE FROM statements.', true),
-  ('Database mass update', 'Requires approval before broad database mutation.', 'high', 'Ask before allowing UPDATE statements that modify a table without an explicit WHERE clause.', true),
-  ('Cloud resource deletion', 'Requires approval before deleting cloud resources.', 'critical', 'Ask before deleting S3 buckets, GCP projects, Kubernetes namespaces, VMs, DNS zones, CloudFormation stacks, storage accounts, or similar cloud resources.', true),
-  ('Terraform and Kubernetes destruction', 'Requires approval before destructive infrastructure operations.', 'critical', 'Ask before terraform destroy, terraform apply -destroy, tofu destroy, kubectl delete namespace, helm uninstall, or equivalent destructive infrastructure operations.', true),
-  ('Git commit or push', 'Requires approval before publishing or committing code.', 'medium', 'Ask before agents run git commit, git push, gh repo sync, release upload, or otherwise publish commits without approval.', false),
-  ('Protected branch push', 'Requires approval before direct pushes to protected branches.', 'high', 'Ask before direct git pushes to main, master, trunk, production, prod, or release branches.', true),
-  ('Git history rewrite or cleanup', 'Requires approval before destructive source-control operations.', 'high', 'Ask before git push --force, git reset --hard, git clean -fdx, interactive rebase rewrites, git filter-branch, or similar history/worktree destructive commands.', true),
-  ('Committing secrets', 'Requires approval before committing staged secrets.', 'critical', 'Ask before committing staged content that appears to include .env values, private keys, access tokens, API keys, cloud credentials, or similar secrets.', true),
-  ('Dependency or lockfile changes', 'Requires approval before supply-chain changes.', 'medium', 'Ask before installing dependencies, upgrading packages, or modifying package-lock.json, pnpm-lock.yaml, yarn.lock, requirements.txt, poetry.lock, Cargo.lock, go.sum, .csproj, or similar manifests/lockfiles.', false),
-  ('Global package install', 'Requires approval before global package installation.', 'medium', 'Ask before globally installing packages with npm, pnpm, yarn, pip, gem, cargo, go install, or similar package managers.', true),
-  ('Secrets and credentials access', 'Requires approval before touching secrets or credential stores.', 'critical', 'Ask before reading, copying, printing, editing, exfiltrating, or summarizing .env files, SSH keys, cloud credentials, API tokens, browser cookies, kubeconfigs, npm tokens, or password stores.', true),
-  ('Personal data use', 'Requires approval before using personal or regulated data.', 'high', 'Ask before processing personal, customer, employee, passport, SSN, credit card, or similarly regulated data.', false),
-  ('External data sharing', 'Requires approval before sending project data externally.', 'high', 'Ask before uploading files, calling unknown external URLs, pasting logs to third-party services, sending source code, or exfiltrating secrets during debugging.', true)
-on conflict do nothing;
-
-update policies
-set locked = true
-where name in (
-  'Filesystem destruction',
-  'Database destructive changes',
-  'Database mass update',
-  'Cloud resource deletion',
-  'Terraform and Kubernetes destruction',
-  'Protected branch push',
-  'Git history rewrite or cleanup',
-  'Committing secrets',
-  'Global package install',
-  'Secrets and credentials access',
-  'External data sharing'
-);
 
 insert into organizations (name, slug, region, setup_completed, current_step, onboarding_code)
 values ('', 'openleash', null, false, 1, null)
