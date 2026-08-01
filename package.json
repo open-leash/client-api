@@ -1,6 +1,6 @@
 {
   "name": "@openleash/client-api",
-  "version": "0.36.30",
+  "version": "0.36.31",
   "type": "module",
   "main": "dist/server.js",
   "types": "dist/server.d.ts",
@@ -28,7 +28,7 @@
     "db:create-org": "tsx src/create-organization.ts"
   },
   "dependencies": {
-    "@openleash/shared": "0.1.0",
+    "@openleash/shared": "0.1.1",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^4.19.2",
