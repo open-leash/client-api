@@ -502,7 +502,7 @@ export function pluginModelConfig(
   }
   // OPENAI_API_KEY commonly belongs to the coding agent or shell that
   // launched OpenLeash. Treating that ambient credential as the OpenLeash
-  // evaluation key can unexpectedly consume the user's quota and turns a
+  // evaluation key can unexpectedly consume the user's provider allowance and turns a
   // provider error into a failed hook. Managed evaluation must be configured
   // explicitly, while Individual Open Source uses its saved tenant BYOK key.
   const apiKey = env.OPENLEASH_OPENAI_API_KEY;

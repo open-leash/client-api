@@ -288,10 +288,36 @@ app.use(async (req, res, next) => {
     const session = await getDashboardSession(
       req.header("authorization") ?? "",
     );
-    if (!session || !["owner", "admin"].includes(session.user.role)) {
+    const permittedRoles = req.path.startsWith("/admin/decisions/")
+      ? ["owner", "admin", "ciso", "security_admin", "responder"]
+      : ["owner", "admin", "ciso", "security_admin"];
+    if (!session) {
       return res
         .status(401)
         .json({ error: "dashboard admin session required" });
+    }
+    if (!permittedRoles.includes(session.user.role)) {
+      return res
+        .status(403)
+        .json({ error: "dashboard role cannot perform this action" });
+    }
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+});
+app.use(async (req, res, next) => {
+  try {
+    const requestedSlug =
+      typeof req.query.organizationSlug === "string"
+        ? req.query.organizationSlug
+        : undefined;
+    if (!requestedSlug || !req.path.startsWith("/admin/")) return next();
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (session && requestedSlug !== session.organization.slug) {
+      return res.status(403).json({ error: "cannot access another organization" });
     }
     return next();
   } catch (error) {
@@ -471,6 +497,7 @@ app.post("/v1/enroll", async (req, res, next) => {
       return res.status(401).json({ error: "missing deployment token" });
     const token = await pool.query<{
       id: string;
+      organization_id: string;
       label: string;
       mode: string;
       tenant_url: string;
@@ -481,7 +508,8 @@ app.post("/v1/enroll", async (req, res, next) => {
        where token_hash = $1
          and revoked_at is null
          and (expires_at is null or expires_at > now())
-       returning id, label, mode, tenant_url, mdm`,
+         and organization_id is not null
+       returning id, organization_id, label, mode, tenant_url, mdm`,
       [hashToken(deploymentToken)],
     );
     const deployment = token.rows[0];
@@ -508,12 +536,20 @@ app.post("/v1/enroll", async (req, res, next) => {
       email: string;
       display_name: string;
     }>(
-      `insert into users (email, display_name, role, token_hash)
-       values ($1, $2, 'engineer', $3)
-       on conflict (email) do update set display_name = excluded.display_name, token_hash = excluded.token_hash
+      `insert into users (organization_id, email, display_name, role, token_hash)
+       values ($1, $2, $3, 'engineer', $4)
+       on conflict (email) do update set
+         display_name = excluded.display_name,
+         token_hash = excluded.token_hash
+       where users.organization_id = excluded.organization_id
        returning id, email, display_name`,
-      [email, displayName, hashToken(agentToken)],
+      [deployment.organization_id, email, displayName, hashToken(agentToken)],
     );
+    if (!user.rows[0]) {
+      return res.status(409).json({
+        error: "This email is already enrolled in a different OpenLeash organization.",
+      });
+    }
     const computer = await pool.query<{ id: string }>(
       `insert into computers (user_id, hostname, platform, os_release, enrollment_token_id, enrolled_at, last_seen_at)
        values ($1, $2, $3, $4, $5, now(), now())
@@ -998,8 +1034,9 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
   }
 });
 
-app.get("/admin/external-agents", async (_req, res, next) => {
+app.get("/admin/external-agents", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const connectors = await listExternalConnectors();
     const known = await pool.query(
       `select ar.id, ar.kind, ar.display_name, ar.version, ar.last_seen_at,
@@ -1017,9 +1054,9 @@ app.get("/admin/external-agents", async (_req, res, next) => {
          limit 1
        ) latest on true
        left join evaluations ev on ev.conversation_event_id = latest.id
-       where ar.kind = any($1)
+       where ar.kind = any($1) and u.organization_id = $2
        order by greatest(ar.last_seen_at, coalesce(latest.created_at, ar.last_seen_at)) desc`,
-      [EXTERNAL_PROVIDER_IDS],
+      [EXTERNAL_PROVIDER_IDS, organizationId],
     );
     res.json({ connectors, known: known.rows });
   } catch (error) {
@@ -1029,17 +1066,18 @@ app.get("/admin/external-agents", async (_req, res, next) => {
 
 app.post("/admin/external-agents/sync", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const provider =
       typeof req.body?.provider === "string"
         ? (req.body.provider as ExternalProvider)
         : undefined;
     const conversations = await fetchConfiguredExternalConversations(provider);
-    const user = await ensureExternalUser(provider ?? "external-agents");
+    const user = await ensureExternalUser(organizationId, provider ?? "external-agents");
     const synced = [];
     const skipped = [];
     for (const conversation of conversations) {
       const key = externalEvaluationKey(conversation);
-      if (await externalEventExists(key)) {
+      if (await externalEventExists(organizationId, key)) {
         skipped.push({
           provider: conversation.provider,
           sessionId: conversation.sessionId,
@@ -1203,6 +1241,13 @@ app.post("/admin/provider-usage/sync", async (req, res, next) => {
 app.post("/admin/evaluation-key", async (req, res, next) => {
   try {
     const organizationId = await organizationIdForAdminRequest(req);
+    if (await organizationUsesManagedEvaluation(organizationId)) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "This organization uses OpenLeash-managed evaluation. Switch to a BYOK package before adding an evaluation key.",
+      });
+    }
     const provider = normalizeTenantModelProvider(
       req.body?.provider ?? req.body?.apiProvider,
     );
@@ -2102,8 +2147,9 @@ function usageSessionsSql(
   };
 }
 
-app.get("/admin/mcp-servers", async (_req, res, next) => {
+app.get("/admin/mcp-servers", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const servers = await pool.query(
       `select s.id, s.server_name, s.first_seen_at, s.last_seen_at, s.tool_count, s.call_count,
               count(distinct c.user_id) as user_count,
@@ -2112,7 +2158,7 @@ app.get("/admin/mcp-servers", async (_req, res, next) => {
               coalesce(recent.items, '[]'::jsonb) as recent_calls
        from mcp_servers s
        left join mcp_tool_calls c on c.mcp_server_id = s.id
-       left join users u on u.id = c.user_id
+       left join users u on u.id = c.user_id and u.organization_id = $1
        left join lateral (
          select jsonb_agg(jsonb_build_object(
            'id', rc.id,
@@ -2130,6 +2176,7 @@ app.get("/admin/mcp-servers", async (_req, res, next) => {
            select *
            from mcp_tool_calls
            where mcp_server_id = s.id
+             and exists (select 1 from users scoped_user where scoped_user.id = mcp_tool_calls.user_id and scoped_user.organization_id = $1)
            order by occurred_at desc
            limit 5
          ) rc
@@ -2137,9 +2184,15 @@ app.get("/admin/mcp-servers", async (_req, res, next) => {
          left join computers comp on comp.id = rc.computer_id
          left join users ru on ru.id = rc.user_id
        ) recent on true
+       where exists (
+         select 1 from mcp_tool_calls scoped_call
+         join users scoped_user on scoped_user.id = scoped_call.user_id
+         where scoped_call.mcp_server_id = s.id and scoped_user.organization_id = $1
+       )
        group by s.id, recent.items
        order by s.last_seen_at desc
        limit 250`,
+      [organizationId],
     );
     res.json({ servers: servers.rows });
   } catch (error) {
@@ -2149,15 +2202,16 @@ app.get("/admin/mcp-servers", async (_req, res, next) => {
 
 app.get("/admin/mcp-servers/:id", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const [server, calls] = await Promise.all([
       pool.query(
         `select s.id, s.server_name, s.first_seen_at, s.last_seen_at, s.tool_count, s.call_count,
                 count(distinct c.user_id) as user_count
          from mcp_servers s
          left join mcp_tool_calls c on c.mcp_server_id = s.id
-         where s.id = $1
+         where s.id = $1 and u.organization_id = $2
          group by s.id`,
-        [req.params.id],
+        [req.params.id, organizationId],
       ),
       pool.query(
         `select c.id, c.server_name, c.tool_name, c.full_tool_name, c.arguments, c.argument_summary,
@@ -2171,10 +2225,10 @@ app.get("/admin/mcp-servers/:id", async (req, res, next) => {
          left join agent_runtimes ar on ar.id = c.agent_runtime_id
          left join computers comp on comp.id = c.computer_id
          left join users u on u.id = c.user_id
-         where c.mcp_server_id = $1
+         where c.mcp_server_id = $1 and u.organization_id = $2
          order by c.occurred_at desc
          limit 100`,
-        [req.params.id],
+        [req.params.id, organizationId],
       ),
     ]);
     if (!server.rows[0])
@@ -2185,22 +2239,26 @@ app.get("/admin/mcp-servers/:id", async (req, res, next) => {
   }
 });
 
-app.get("/admin/skills", async (_req, res, next) => {
+app.get("/admin/skills", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const skills = await pool.query(
       `select s.*, u.display_name as user_name, u.email as user_email
        from skills s
        left join users u on u.id = s.user_id
-       where s.status <> 'deleted'
+       where s.status <> 'deleted' and u.organization_id = $1
        order by s.updated_at desc
        limit 500`,
+      [organizationId],
     );
     const events = await pool.query(
       `select se.*, u.display_name as user_name
        from skill_events se
        left join users u on u.id = se.user_id
+       where u.organization_id = $1
        order by se.created_at desc
        limit 100`,
+      [organizationId],
     );
     res.json({ skills: skills.rows, events: events.rows });
   } catch (error) {
@@ -2208,10 +2266,146 @@ app.get("/admin/skills", async (_req, res, next) => {
   }
 });
 
+app.get("/admin/bootstrap/status", async (req, res, next) => {
+  try {
+    const privateMode = normalizeDeploymentMode(process.env.OPENLEASH_DEPLOYMENT_MODE) === "private";
+    const requestedSlug = String(req.query.organizationSlug ?? "").trim();
+    const organization = requestedSlug ? await getOrganizationBySlug(requestedSlug) : undefined;
+    if (!privateMode || !organization) {
+      return res.json({ available: false, required: false, configured: false });
+    }
+    const administrators = await pool.query(
+      `select count(*)::int as count from users
+       where organization_id = $1 and status = 'active'
+         and role in ('owner', 'admin', 'ciso', 'security_admin')`,
+      [organization.id],
+    );
+    res.json({
+      available: true,
+      required: Number(administrators.rows[0]?.count ?? 0) === 0,
+      configured: Boolean(privateBootstrapToken()),
+      organization: {
+        name: organization.name,
+        slug: organization.slug,
+        deploymentMode: "private",
+        setupCompleted: organization.setup_completed,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/admin/bootstrap", async (req, res, next) => {
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    if (normalizeDeploymentMode(process.env.OPENLEASH_DEPLOYMENT_MODE) !== "private") {
+      return res.status(404).json({ error: "not found" });
+    }
+    const expectedToken = privateBootstrapToken();
+    if (!expectedToken) {
+      return res.status(503).json({
+        error: "Private Cloud bootstrap is not configured on the dashboard API.",
+      });
+    }
+    const suppliedToken = String(
+      req.body?.bootstrapToken ?? req.header("x-openleash-bootstrap-token") ?? "",
+    ).trim();
+    if (!secureTokenEquals(suppliedToken, expectedToken)) {
+      return res.status(401).json({ error: "Invalid bootstrap token." });
+    }
+    const requestedSlug = String(req.body?.organizationSlug ?? "").trim();
+    const name = String(req.body?.organizationName ?? "").trim();
+    const adminName = String(req.body?.adminName ?? "").trim();
+    const adminEmail = String(req.body?.adminEmail ?? "").trim().toLowerCase();
+    if (!requestedSlug) return res.status(400).json({ error: "organizationSlug is required" });
+    if (!name) return res.status(400).json({ error: "Organization name is required." });
+    if (!adminName) return res.status(400).json({ error: "Administrator name is required." });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) {
+      return res.status(400).json({ error: "Enter a valid administrator email." });
+    }
+
+    await client.query("begin");
+    transactionStarted = true;
+    const organizationResult = await client.query(
+      `select * from organizations where slug = $1 for update`,
+      [requestedSlug],
+    );
+    const organization = organizationResult.rows[0];
+    if (!organization) throw new HttpError(404, "organization not found");
+    const existingAdmin = await client.query(
+      `select 1 from users
+       where organization_id = $1 and status = 'active'
+         and role in ('owner', 'admin', 'ciso', 'security_admin')
+       limit 1`,
+      [organization.id],
+    );
+    if ((existingAdmin.rowCount ?? 0) > 0) {
+      throw new HttpError(409, "Private Cloud bootstrap has already been completed.");
+    }
+    const existingEmail = await client.query(
+      `select organization_id from users where lower(email) = lower($1) limit 1`,
+      [adminEmail],
+    );
+    if (existingEmail.rows[0] && existingEmail.rows[0].organization_id !== organization.id) {
+      throw new HttpError(409, "That administrator email already belongs to another organization.");
+    }
+    const userResult = existingEmail.rows[0]
+      ? await client.query(
+          `update users
+           set display_name = $2, role = 'owner', status = 'active',
+               metadata = coalesce(metadata, '{}'::jsonb) || $4::jsonb
+           where organization_id = $1 and lower(email) = lower($3)
+           returning id, email, display_name, role`,
+          [organization.id, adminName, adminEmail, JSON.stringify({ accountAudience: "organization", privateBootstrap: true })],
+        )
+      : await client.query(
+          `insert into users (organization_id, email, display_name, role, status, metadata)
+           values ($1, $2, $3, 'owner', 'active', $4::jsonb)
+           returning id, email, display_name, role`,
+          [organization.id, adminEmail, adminName, JSON.stringify({ accountAudience: "organization", privateBootstrap: true })],
+        );
+    const user = userResult.rows[0];
+    const sessionToken = `ols_${crypto.randomBytes(32).toString("base64url")}`;
+    const expiresAt = new Date(
+      Date.now() + Number(process.env.OPENLEASH_DASHBOARD_SESSION_DAYS ?? 14) * 86400000,
+    );
+    await client.query(
+      `insert into dashboard_sessions (organization_id, user_id, token_hash, provider, expires_at)
+       values ($1, $2, $3, 'private_bootstrap', $4)`,
+      [organization.id, user.id, hashToken(sessionToken), expiresAt.toISOString()],
+    );
+    const updatedOrganization = await client.query(
+      `update organizations
+       set name = $2, setup_completed = false,
+           current_step = greatest(current_step, 2), updated_at = now()
+       where id = $1
+       returning id, name, slug, region, setup_completed, current_step, deployment_mode`,
+      [organization.id, name],
+    );
+    await client.query("commit");
+    transactionStarted = false;
+    res.status(201).json({
+      success: true,
+      token: sessionToken,
+      tokens: { accessToken: sessionToken, expiresAt: expiresAt.toISOString() },
+      user,
+      organization: updatedOrganization.rows[0],
+      account: { audience: "organization", packageId: null },
+    });
+  } catch (error) {
+    if (transactionStarted) await client.query("rollback").catch(() => undefined);
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/admin/onboarding", async (req, res, next) => {
   try {
     const organization = await resolveOnboardingOrganization(req);
-    const [idp, groups, users, roles, tokens, providerUsage] =
+    const [idp, groups, users, roles, tokens, providerUsage, readiness] =
       await Promise.all([
         pool.query(
           `select id, provider, enabled, last_sync_at, user_count, group_count, last_error, created_at, updated_at,
@@ -2251,13 +2445,23 @@ app.get("/admin/onboarding", async (req, res, next) => {
         pool.query(
           `select id, label, mode, tenant_url, mdm, expires_at, revoked_at, created_at, last_used_at
          from deployment_tokens
+         where organization_id = $1
          order by created_at desc
          limit 10`,
+          [organization.id],
         ),
         pool.query(
           `select
            (select count(*)::int from provider_usage_connections where organization_id = $1 and enabled = true) as connection_count,
            (select count(*)::int from provider_usage_budgets where organization_id = $1 and enabled = true) as budget_count`,
+          [organization.id],
+        ),
+        pool.query(
+          `select
+           (select count(*)::int from users where organization_id = $1 and status = 'active' and role in ('owner', 'admin', 'ciso', 'security_admin')) as administrator_count,
+           (select count(*)::int from policies where organization_id = $1 and enabled = true) as active_policy_count,
+           (select count(*)::int from plugin_settings where organization_id = $1 and enabled = true) as enabled_plugin_count,
+           (select count(*)::int from organization_plugin_policy where organization_id = $1 and (mandatory = true or default_enabled = true or user_install_allowed = false)) as governed_plugin_count`,
           [organization.id],
         ),
       ]);
@@ -2276,6 +2480,12 @@ app.get("/admin/onboarding", async (req, res, next) => {
       providerUsage: providerUsage.rows[0] ?? {
         connection_count: 0,
         budget_count: 0,
+      },
+      readiness: readiness.rows[0] ?? {
+        administrator_count: 0,
+        active_policy_count: 0,
+        enabled_plugin_count: 0,
+        governed_plugin_count: 0,
       },
     });
   } catch (error) {
@@ -2302,6 +2512,14 @@ app.get("/organizations/:slug", async (req, res, next) => {
 
 app.post("/organizations", async (req, res, next) => {
   try {
+    const bootstrapToken = process.env.OPENLEASH_ORG_BOOTSTRAP_TOKEN?.trim();
+    const suppliedToken =
+      req.header("x-openleash-bootstrap-token")?.trim() ||
+      bearerToken(req.header("authorization") ?? "");
+    if (!bootstrapToken)
+      return res.status(404).json({ error: "not found" });
+    if (!secureTokenEquals(suppliedToken, bootstrapToken))
+      return res.status(403).json({ error: "organization bootstrap authorization is required" });
     const name = String(req.body.name ?? "").trim();
     if (!name)
       return res.status(400).json({ error: "Organization name is required" });
@@ -2886,6 +3104,10 @@ app.get("/v1/mobile/dev-auth/callback", (req, res) => {
   const redirect = new URL(redirectUri);
   redirect.searchParams.set("code", "development");
   redirect.searchParams.set("state", String(req.query.state ?? "development"));
+  // The dashboard callback uses the same URI for the development exchange.
+  // Production providers carry this value in encoded OAuth state; the local
+  // development shortcut must preserve the same callback contract.
+  redirect.searchParams.set("exchangeRedirectUri", redirectUri);
   const audience = String(req.query.audience ?? "").trim();
   if (audience) redirect.searchParams.set("audience", audience);
   res.redirect(302, redirect.toString());
@@ -3013,18 +3235,20 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       !idToken &&
       process.env.OPENLEASH_MOBILE_DEV_AUTH === "1"
     ) {
+      const developmentEmail =
+        process.env.OPENLEASH_MOBILE_DEV_EMAIL ??
+        (requestedOrganization
+          ? "ava.chen@example.com"
+          : "mobile.user@openleash.com");
+      const developmentName =
+        process.env.OPENLEASH_MOBILE_DEV_NAME ??
+        (requestedOrganization ? "Ava Chen" : "Mobile User");
       const profile = {
-        subject: "mobile-dev-user",
-        email:
-          process.env.OPENLEASH_MOBILE_DEV_EMAIL ??
-          (requestedOrganization
-            ? "ava.chen@example.com"
-            : "mobile.user@openleash.com"),
-        name:
-          process.env.OPENLEASH_MOBILE_DEV_NAME ??
-          (requestedOrganization ? "Ava Chen" : "Mobile User"),
-        givenName: requestedOrganization ? "Ava" : "Mobile",
-        familyName: requestedOrganization ? "Chen" : "User",
+        subject: `mobile-dev:${developmentEmail.toLowerCase()}`,
+        email: developmentEmail,
+        name: developmentName,
+        givenName: null,
+        familyName: null,
         raw: { development: true },
       };
       if (
@@ -3053,11 +3277,9 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
         organizationId: organization.id,
         providerType: developmentProviderType,
         profile,
-        role: requestedOrganization
-          ? organization.defaultUserRole
-          : audience === "organization"
-            ? "admin"
-            : "engineer",
+        role:
+          organization.defaultUserRole ??
+          (audience === "organization" ? "admin" : "engineer"),
         provisionUser,
         accountAudience: audience,
       });
@@ -3177,11 +3399,9 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
       organizationId: organization.id,
       providerType,
       profile,
-      role: requestedOrganization
-        ? organization.defaultUserRole
-        : audience === "organization"
-          ? "admin"
-          : "engineer",
+      role:
+        organization.defaultUserRole ??
+        (audience === "organization" ? "admin" : "engineer"),
       provisionUser,
       accountAudience: audience,
     });
@@ -3507,7 +3727,9 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       mobileRecentActivity(session.organization.id, session.user.id),
       mobileSessionMetrics(session.organization.id, session.user.id),
       pool.query(
-        `select id, name, description, severity, natural_language_rule, enabled, locked from policies order by created_at asc`,
+        `select id, name, description, severity, natural_language_rule, enabled, locked
+         from policies where organization_id = $1 order by created_at asc`,
+        [session.organization.id],
       ),
       pluginCatalogForOrganization(session.organization.id, session.user.id),
       userPluginOutcomes(session.organization.id, session.user.id, {
@@ -3850,18 +4072,11 @@ app.post("/admin/onboarding/infrastructure", async (req, res, next) => {
     if (deploymentMode !== "private") {
       return res.json({ success: true, organization });
     }
-    const databaseUrl = String(req.body.databaseUrl ?? "").trim();
-    if (!databaseUrl)
-      return res.status(400).json({
-        success: false,
-        error:
-          "Postgres connection string is required for private deployments.",
-      });
     const config = {
-      databaseUrl,
       apiUrl: String(req.body.apiUrl ?? "").trim(),
       dashboardUrl: String(req.body.dashboardUrl ?? "").trim(),
       identityLoaderUrl: String(req.body.identityLoaderUrl ?? "").trim(),
+      updateMode: String(req.body.updateMode ?? "public").trim(),
       updateFeedUrl: String(req.body.updateFeedUrl ?? "").trim(),
     };
     const result = await pool.query(
@@ -4084,9 +4299,10 @@ app.post("/admin/onboarding/rbac", async (req, res, next) => {
       [organization.id],
     );
     const roles = Array.isArray(req.body.roles) ? req.body.roles : [];
-    const adminUserIds: string[] = [];
+    const assignedRoles = new Map<string, { role: string; direct: boolean }>();
+    const roleRank: Record<string, number> = { viewer: 1, responder: 2, analyst: 3, admin: 4, security_admin: 5, ciso: 6 };
     for (const item of roles) {
-      const role = ["admin", "analyst", "responder", "viewer"].includes(
+      const role = ["admin", "ciso", "security_admin", "analyst", "responder", "viewer"].includes(
         item.role,
       )
         ? item.role
@@ -4096,20 +4312,35 @@ app.post("/admin/onboarding/rbac", async (req, res, next) => {
       const userId =
         typeof item.userId === "string" && item.userId ? item.userId : null;
       if (!groupId && !userId) continue;
-      if (role === "admin" && userId) adminUserIds.push(userId);
       await pool.query(
         `insert into role_assignments (organization_id, role, group_id, user_id) values ($1, $2, $3, $4)`,
         [organization.id, role, groupId, userId],
       );
+      const targetUserIds = userId
+        ? [userId]
+        : (await pool.query<{ user_id: string }>(
+            `select gm.user_id
+             from identity_group_members gm
+             join identity_groups g on g.id = gm.group_id
+             where gm.group_id = $1 and g.organization_id = $2`,
+            [groupId, organization.id],
+          )).rows.map((row) => row.user_id);
+      for (const targetUserId of targetUserIds) {
+        const current = assignedRoles.get(targetUserId);
+        if (!current || Boolean(userId) || (!current.direct && roleRank[role] > roleRank[current.role])) {
+          assignedRoles.set(targetUserId, { role, direct: Boolean(userId) });
+        }
+      }
     }
     await pool.query(
-      `update users set role = 'engineer' where organization_id = $1 and role = 'admin'`,
+      `update users set role = 'engineer'
+       where organization_id = $1 and role in ('admin', 'ciso', 'security_admin', 'analyst', 'responder', 'viewer')`,
       [organization.id],
     );
-    if (adminUserIds.length > 0) {
+    for (const [userId, assignment] of assignedRoles) {
       await pool.query(
-        `update users set role = 'admin' where organization_id = $1 and id = any($2::uuid[])`,
-        [organization.id, adminUserIds],
+        `update users set role = $3 where organization_id = $1 and id = $2`,
+        [organization.id, userId, assignment.role],
       );
     }
     await pool.query(
@@ -4131,6 +4362,35 @@ app.post("/admin/onboarding/complete", async (req, res, next) => {
         error: "Save your company profile before activating OpenLeash.",
       });
     }
+    const readiness = await pool.query(
+      `select
+       (select count(*)::int from users where organization_id = $1 and status = 'active' and role in ('owner', 'admin', 'ciso', 'security_admin')) as administrators,
+       (select count(*)::int from idp_connections where organization_id = $1 and enabled = true and last_error is null) as identity_connections,
+       (select count(*)::int from role_assignments where organization_id = $1) as role_assignments,
+       (select count(*)::int from deployment_tokens where organization_id = $1 and revoked_at is null and (expires_at is null or expires_at > now())) as deployment_tokens,
+       (select count(*)::int from policies where organization_id = $1 and enabled = true) as active_policies,
+       (select count(*)::int from plugin_settings where organization_id = $1 and enabled = true) as enabled_plugins,
+       (select count(*)::int from organization_plugin_policy where organization_id = $1 and (mandatory = true or default_enabled = true or user_install_allowed = false)) as governed_plugins`,
+      [organization.id],
+    );
+    const state = readiness.rows[0] ?? {};
+    const missing = [
+      Number(state.administrators ?? 0) < 1 ? "an active organization administrator" : null,
+      Number(state.identity_connections ?? 0) < 1 ? "a connected identity provider" : null,
+      Number(state.role_assignments ?? 0) < 1 ? "at least one delegated dashboard role" : null,
+      Number(state.deployment_tokens ?? 0) < 1 ? "an active endpoint deployment token" : null,
+      Number(state.active_policies ?? 0) + Number(state.enabled_plugins ?? 0) < 1
+        ? "at least one enabled organization safeguard or plugin"
+        : null,
+      Number(state.governed_plugins ?? 0) < 1 ? "an organization plugin governance rule" : null,
+    ].filter(Boolean);
+    if (missing.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Complete the rollout baseline first: ${missing.join(", ")}.`,
+        missing,
+      });
+    }
     const result = await pool.query(
       `update organizations set setup_completed = true, current_step = 8, updated_at = now() where id = $1 returning *`,
       [organization.id],
@@ -4141,9 +4401,9 @@ app.post("/admin/onboarding/complete", async (req, res, next) => {
   }
 });
 
-app.get("/admin/identity", async (_req, res, next) => {
+app.get("/admin/identity", async (req, res, next) => {
   try {
-    const organization = await ensureDefaultOrganization();
+    const organization = { id: await organizationIdForAdminRequest(req) };
     const [idp, groups, users, roles] = await Promise.all([
       pool.query(
         `select provider, enabled, last_sync_at, user_count, group_count, last_error from idp_connections where organization_id = $1`,
@@ -4190,10 +4450,12 @@ app.get("/admin/identity", async (_req, res, next) => {
 
 app.get("/admin/triggers", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const filters: string[] = [
+      "u.organization_id = $1",
       "exists (select 1 from policy_results pr where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question'))",
     ];
-    const values: unknown[] = [];
+    const values: unknown[] = [organizationId];
     const add = (value: unknown) => {
       values.push(value);
       return `$${values.length}`;
@@ -4265,6 +4527,7 @@ app.get("/admin/triggers", async (req, res, next) => {
 
 app.get("/admin/triggers/:id", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const [trigger, policies] = await Promise.all([
       pool.query(
         `select e.id, e.decision, e.resolution, e.resolved_at, e.resolved_by, e.summary, e.question, e.model, e.created_at,
@@ -4276,15 +4539,17 @@ app.get("/admin/triggers/:id", async (req, res, next) => {
          join agent_runtimes ar on ar.id = ce.agent_runtime_id
          join computers c on c.id = ce.computer_id
          left join users u on u.id = e.user_id
-         where e.id = $1`,
-        [req.params.id],
+         where e.id = $1 and u.organization_id = $2`,
+        [req.params.id, organizationId],
       ),
       pool.query(
-        `select policy_name, status, severity, explanation, evidence, question, created_at
-         from policy_results
-         where evaluation_id = $1
-         order by created_at asc`,
-        [req.params.id],
+        `select pr.policy_name, pr.status, pr.severity, pr.explanation, pr.evidence, pr.question, pr.created_at
+         from policy_results pr
+         join evaluations e on e.id = pr.evaluation_id
+         join users u on u.id = e.user_id
+         where pr.evaluation_id = $1 and u.organization_id = $2
+         order by pr.created_at asc`,
+        [req.params.id, organizationId],
       ),
     ]);
     if (!trigger.rows[0])
@@ -4895,8 +5160,9 @@ app.post("/v1/skills/observations", async (req, res, next) => {
   }
 });
 
-app.get("/admin/pending-decisions", async (_req, res, next) => {
+app.get("/admin/pending-decisions", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const pending = await pool.query(
       `select e.id, e.decision, e.summary, e.question, e.created_at,
               ce.event_name, ce.tool_name, ce.project_path, ce.payload,
@@ -4922,9 +5188,10 @@ app.get("/admin/pending-decisions", async (_req, res, next) => {
          from policy_results pr
          where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question')
        ) triggered on true
-       where e.decision = 'ask' and e.resolution is null
+       where e.decision = 'ask' and e.resolution is null and u.organization_id = $1
        order by e.created_at asc
        limit 20`,
+      [organizationId],
     );
     res.json({ pending: pending.rows });
   } catch (error) {
@@ -4932,8 +5199,9 @@ app.get("/admin/pending-decisions", async (_req, res, next) => {
   }
 });
 
-app.get("/admin/tray-status", async (_req, res, next) => {
+app.get("/admin/tray-status", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const [pending, agents] = await Promise.all([
       pool.query(
         `select e.id, e.decision, e.summary, e.question, e.created_at,
@@ -4960,9 +5228,10 @@ app.get("/admin/tray-status", async (_req, res, next) => {
            from policy_results pr
            where pr.evaluation_id = e.id and pr.status in ('failed', 'needs_question')
          ) triggered on true
-         where e.decision = 'ask' and e.resolution is null
+         where e.decision = 'ask' and e.resolution is null and u.organization_id = $1
          order by e.created_at asc
          limit 20`,
+        [organizationId],
       ),
       pool.query(
         `select ar.id, ar.kind, ar.display_name, ar.version, ar.last_seen_at,
@@ -5018,10 +5287,12 @@ app.get("/admin/tray-status", async (_req, res, next) => {
              limit 5
            ) item
          ) recent on true
-         where ar.last_seen_at > now() - interval '5 minutes'
-            or latest.created_at > now() - interval '5 minutes'
+         where u.organization_id = $1
+           and (ar.last_seen_at > now() - interval '5 minutes'
+             or latest.created_at > now() - interval '5 minutes')
          order by greatest(ar.last_seen_at, coalesce(latest.created_at, ar.last_seen_at)) desc
          limit 12`,
+        [organizationId],
       ),
     ]);
 
@@ -5059,6 +5330,14 @@ app.get("/v1/decisions/:id", async (req, res, next) => {
 
 app.post("/admin/decisions/:id/resolve", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const scopedDecision = await pool.query(
+      `select 1 from evaluations e
+       join users u on u.id = e.user_id
+       where e.id = $1 and u.organization_id = $2`,
+      [req.params.id, organizationId],
+    );
+    if (!scopedDecision.rows[0]) return res.status(404).json({ error: "decision not found" });
     const resolution = req.body.resolution === "allow" ? "allow" : "deny";
     const result = await resolveApprovalGroup(
       req.params.id,
@@ -5075,12 +5354,14 @@ app.post("/admin/decisions/:id/resolve", async (req, res, next) => {
 
 app.post("/admin/users", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const token = `ol_${crypto.randomBytes(24).toString("base64url")}`;
     const user = await pool.query(
-      `insert into users (email, display_name, role, token_hash)
-       values ($1, $2, $3, $4)
+      `insert into users (organization_id, email, display_name, role, token_hash)
+       values ($1, $2, $3, $4, $5)
        returning id, email, display_name, role, created_at`,
       [
+        organizationId,
         req.body.email,
         req.body.displayName,
         req.body.role ?? "engineer",
@@ -5093,13 +5374,16 @@ app.post("/admin/users", async (req, res, next) => {
   }
 });
 
-app.get("/admin/deployment-tokens", async (_req, res, next) => {
+app.get("/admin/deployment-tokens", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const tokens = await pool.query(
       `select id, label, mode, tenant_url, mdm, expires_at, revoked_at, created_at, last_used_at
        from deployment_tokens
+       where organization_id = $1
        order by created_at desc
        limit 50`,
+      [organizationId],
     );
     res.json({ tokens: tokens.rows });
   } catch (error) {
@@ -5109,23 +5393,48 @@ app.get("/admin/deployment-tokens", async (_req, res, next) => {
 
 app.post("/admin/deployment-tokens", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
+    const organizationResult = await pool.query<{ deployment_mode: string | null }>(
+      `select deployment_mode from organizations where id = $1 limit 1`,
+      [organizationId],
+    );
+    const organizationMode = organizationResult.rows[0]?.deployment_mode === "private" ? "private" : "cloud";
     const token = `ol_deploy_${crypto.randomBytes(24).toString("base64url")}`;
     const label =
       String(req.body.label ?? "MDM deployment").trim() || "MDM deployment";
     const mode = req.body.mode === "private" ? "private" : "cloud";
+    if (mode !== organizationMode) {
+      return res.status(400).json({
+        error: `This organization is configured for OpenLeash ${organizationMode === "private" ? "Private Cloud" : "Cloud"}; a ${mode} deployment token cannot be issued.`,
+      });
+    }
     const tenantUrl = String(
       req.body.tenantUrl ?? process.env.OPENLEASH_TENANT_URL ?? "openleash.com",
     ).trim();
+    if (!tenantUrl) {
+      return res.status(400).json({ error: "A client API URL is required." });
+    }
+    if (mode === "private") {
+      try {
+        const parsedTenantUrl = new URL(tenantUrl);
+        if (!["http:", "https:"].includes(parsedTenantUrl.protocol)) throw new Error("unsupported protocol");
+      } catch {
+        return res.status(400).json({
+          error: "Private Cloud enrollment requires the full reachable client API URL, including https://.",
+        });
+      }
+    }
     const mdm =
       typeof req.body.mdm === "string" && req.body.mdm.trim()
         ? req.body.mdm.trim()
         : null;
     const expiresInDays = Number(req.body.expiresInDays ?? 30);
     const result = await pool.query(
-      `insert into deployment_tokens (label, token_hash, mode, tenant_url, mdm, expires_at)
-       values ($1, $2, $3, $4, $5, now() + ($6::text || ' days')::interval)
+      `insert into deployment_tokens (organization_id, label, token_hash, mode, tenant_url, mdm, expires_at)
+       values ($1, $2, $3, $4, $5, $6, now() + ($7::text || ' days')::interval)
        returning id, label, mode, tenant_url, mdm, expires_at, created_at`,
       [
+        organizationId,
         label,
         hashToken(token),
         mode,
@@ -5148,9 +5457,12 @@ app.post("/admin/deployment-tokens", async (req, res, next) => {
 
 app.post("/admin/deployment-tokens/:id/revoke", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const result = await pool.query(
-      `update deployment_tokens set revoked_at = now() where id = $1 returning id, revoked_at`,
-      [req.params.id],
+      `update deployment_tokens set revoked_at = now()
+       where id = $1 and organization_id = $2
+       returning id, revoked_at`,
+      [req.params.id, organizationId],
     );
     res.json(result.rows[0] ?? null);
   } catch (error) {
@@ -5160,12 +5472,15 @@ app.post("/admin/deployment-tokens/:id/revoke", async (req, res, next) => {
 
 app.get("/admin/events/:id", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const event = await pool.query(
       `select ce.*, e.decision, e.summary, e.question
        from conversation_events ce
        left join evaluations e on e.conversation_event_id = ce.id
-       where ce.id = $1`,
-      [req.params.id],
+       join computers c on c.id = ce.computer_id
+       join users u on u.id = c.user_id
+       where ce.id = $1 and u.organization_id = $2`,
+      [req.params.id, organizationId],
     );
     res.json(event.rows[0] ?? null);
   } catch (error) {
@@ -5175,7 +5490,15 @@ app.get("/admin/events/:id", async (req, res, next) => {
 
 app.post("/admin/policies", async (req, res, next) => {
   try {
-    const naturalLanguageRule = String(req.body.naturalLanguageRule ?? "");
+    const organizationId = await organizationIdForAdminRequest(req);
+    const naturalLanguageRule = String(
+      req.body.naturalLanguageRule ?? req.body.rule ?? "",
+    ).trim();
+    if (!naturalLanguageRule) {
+      return res.status(400).json({
+        error: "naturalLanguageRule is required",
+      });
+    }
     const name = summarizePolicyTitle(naturalLanguageRule);
     const category = policyCategory(
       String(req.body.category ?? ""),
@@ -5183,9 +5506,10 @@ app.post("/admin/policies", async (req, res, next) => {
       naturalLanguageRule,
     );
     const result = await pool.query(
-      `insert into policies (name, category, description, severity, natural_language_rule, enabled, locked)
-       values ($1, $2, $3, $4, $5, $6, $7) returning *`,
+      `insert into policies (organization_id, name, category, description, severity, natural_language_rule, enabled, locked)
+       values ($1, $2, $3, $4, $5, $6, $7, $8) returning *`,
       [
+        organizationId,
         name,
         category,
         req.body.description ?? "",
@@ -5289,7 +5613,7 @@ app.get("/admin/plugin-marketplace", async (req, res, next) => {
 
 app.get("/admin/plugin-releases", async (req, res, next) => {
   try {
-    await organizationIdForAdminRequest(req);
+    if (!requirePluginReleaseAdmin(req, res)) return;
     res.json({
       releases: await listPluginReleases(String(req.query.status ?? "")),
     });
@@ -5300,10 +5624,10 @@ app.get("/admin/plugin-releases", async (req, res, next) => {
 
 app.post("/admin/plugin-releases/:id/approve", async (req, res, next) => {
   try {
-    const reviewer = await adminUserForRequest(req);
+    if (!requirePluginReleaseAdmin(req, res)) return;
     const result = await approvePluginRelease(
       req.params.id,
-      reviewer?.id,
+      undefined,
       req.body,
     );
     if (!result)
@@ -5316,11 +5640,11 @@ app.post("/admin/plugin-releases/:id/approve", async (req, res, next) => {
 
 app.post("/admin/plugin-releases/:id/reject", async (req, res, next) => {
   try {
-    const reviewer = await adminUserForRequest(req);
+    if (!requirePluginReleaseAdmin(req, res)) return;
     const result = await reviewPluginRelease(
       req.params.id,
       "rejected",
-      reviewer?.id,
+      undefined,
       req.body?.reviewerNote,
     );
     if (!result)
@@ -5333,11 +5657,11 @@ app.post("/admin/plugin-releases/:id/reject", async (req, res, next) => {
 
 app.post("/admin/plugin-releases/:id/yank", async (req, res, next) => {
   try {
-    const reviewer = await adminUserForRequest(req);
+    if (!requirePluginReleaseAdmin(req, res)) return;
     const result = await reviewPluginRelease(
       req.params.id,
       "yanked",
-      reviewer?.id,
+      undefined,
       req.body?.reviewerNote,
     );
     if (!result)
@@ -5567,7 +5891,8 @@ async function handlePromptOnlyHook(
     tenantModelKeyForEvaluation(organizationId),
     pool.query<Policy>(
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
-       from policies where enabled = true order by created_at asc`,
+       from policies where organization_id = $1 and enabled = true order by created_at asc`,
+      [organizationId],
     ),
   ]);
   const promptEvaluation =
@@ -5584,7 +5909,14 @@ async function handlePromptOnlyHook(
           plugins: runtimePlugins,
         })
       : Promise.resolve(undefined);
-  const runtimePolicies = policiesForRulesEnforcer(runtimePlugins);
+  const runtimePolicies = policiesForEvaluation(
+    policies.rows,
+    runtimePlugins,
+  );
+  const evaluationPlugins = pluginsWithPolicyEngine(
+    runtimePlugins,
+    policies.rows.length > 0,
+  );
   const [promptResult, pipeline] = await Promise.all([
     promptEvaluation,
     runEvaluationPipeline({
@@ -5596,7 +5928,7 @@ async function handlePromptOnlyHook(
       runtimeId,
       policies: runtimePolicies,
       tenantModelKey,
-      plugins: runtimePlugins,
+      plugins: evaluationPlugins,
     }),
   ]);
   if (promptResult) {
@@ -7883,9 +8215,17 @@ async function evaluateAndRecord(
   );
   const policies = await pool.query<Policy>(
     `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
-     from policies where enabled = true order by created_at asc`,
+     from policies where organization_id = $1 and enabled = true order by created_at asc`,
+    [organizationId],
   );
-  const runtimePolicies = policiesForRulesEnforcer(runtimePlugins);
+  const runtimePolicies = policiesForEvaluation(
+    policies.rows,
+    runtimePlugins,
+  );
+  const evaluationPlugins = pluginsWithPolicyEngine(
+    runtimePlugins,
+    policies.rows.length > 0,
+  );
   const pipeline = await runEvaluationPipeline({
     request,
     organizationId,
@@ -7895,7 +8235,7 @@ async function evaluateAndRecord(
     runtimeId,
     policies: runtimePolicies,
     tenantModelKey,
-    plugins: runtimePlugins,
+    plugins: evaluationPlugins,
   });
   const { results: evaluatedResults, model } = pipeline;
   const actionedResults = applyConfiguredRuleActions(
@@ -8119,6 +8459,41 @@ function policiesForRulesEnforcer(
     locked: false,
     enforcementAction: rule.action,
   }));
+}
+
+function policiesForEvaluation(
+  organizationPolicies: Policy[],
+  settings: Map<string, PluginSettingRecord | PluginSettingState>,
+) {
+  const policies = organizationPolicies.filter(
+    (policy) => policy.enabled && policy.naturalLanguageRule?.trim(),
+  );
+  const organizationRules = new Set(
+    policies.map((policy) => policy.naturalLanguageRule.trim().toLowerCase()),
+  );
+  return [
+    ...policies,
+    ...policiesForRulesEnforcer(settings).filter(
+      (policy) =>
+        !organizationRules.has(policy.naturalLanguageRule.trim().toLowerCase()),
+    ),
+  ];
+}
+
+function pluginsWithPolicyEngine(
+  settings: Map<string, PluginSettingState>,
+  hasOrganizationPolicies: boolean,
+) {
+  if (!hasOrganizationPolicies) return settings;
+  const policyEngine = settings.get("openleash.rules-enforcer");
+  if (policyEngine?.enabled) return settings;
+  const enabled = new Map(settings);
+  enabled.set("openleash.rules-enforcer", {
+    ...(policyEngine ?? {}),
+    enabled: true,
+    config: policyEngine?.config ?? { rules: [] },
+  });
+  return enabled;
 }
 
 function normalizeRuleConfigs(
@@ -8549,33 +8924,36 @@ async function waitForHookDecision(
   };
 }
 
-async function ensureExternalUser(provider: string): Promise<ApiUser> {
+async function ensureExternalUser(organizationId: string, provider: string): Promise<ApiUser> {
   const displayName =
     provider === "external-agents"
       ? "SaaS agents"
       : externalProviderLabel(provider);
-  const email = `${slug(displayName)}@external.openleash.com`;
+  const email = `${slug(displayName)}.${organizationId.slice(0, 8)}@external.openleash.com`;
   const result = await pool.query<{
     id: string;
+    organization_id: string;
     email: string;
     display_name: string;
   }>(
-    `insert into users (email, display_name, role)
-     values ($1, $2, 'external-agent')
+    `insert into users (organization_id, email, display_name, role)
+     values ($1, $2, $3, 'external-agent')
      on conflict (email) do update set display_name = excluded.display_name
-     returning id, email, display_name`,
-    [email, displayName],
+     returning id, organization_id, email, display_name`,
+    [organizationId, email, displayName],
   );
   return result.rows[0];
 }
 
-async function externalEventExists(key: string) {
+async function externalEventExists(organizationId: string, key: string) {
   const result = await pool.query(
     `select 1
-     from conversation_events
-     where payload->'raw'->>'externalEvaluationKey' = $1
+     from conversation_events ce
+     join users u on u.id = ce.user_id
+     where u.organization_id = $1
+       and ce.payload->'raw'->>'externalEvaluationKey' = $2
      limit 1`,
-    [key],
+    [organizationId, key],
   );
   return (result.rowCount ?? 0) > 0;
 }
@@ -8768,6 +9146,7 @@ function primaryResource(request: EvaluationRequest) {
 
 app.put("/admin/policies/:id", async (req, res, next) => {
   try {
+    const organizationId = await organizationIdForAdminRequest(req);
     const naturalLanguageRule = String(req.body.naturalLanguageRule ?? "");
     const name = summarizePolicyTitle(naturalLanguageRule);
     const category = policyCategory(
@@ -8776,10 +9155,11 @@ app.put("/admin/policies/:id", async (req, res, next) => {
       naturalLanguageRule,
     );
     const result = await pool.query(
-      `update policies set name = $2, category = $3, description = $4, severity = $5, natural_language_rule = $6, enabled = $7, locked = $8, updated_at = now()
-       where id = $1 returning *`,
+      `update policies set name = $3, category = $4, description = $5, severity = $6, natural_language_rule = $7, enabled = $8, locked = $9, updated_at = now()
+       where id = $1 and organization_id = $2 returning *`,
       [
         req.params.id,
+        organizationId,
         name,
         category,
         req.body.description ?? "",
@@ -9152,6 +9532,10 @@ async function ensureDefaultOrganization() {
 
 async function resolveOnboardingOrganization(req: express.Request) {
   const session = await getDashboardSession(req.header("authorization") ?? "");
+  if (!session) throw new HttpError(401, "dashboard session required");
+  if (!isDashboardAccessRole(session.user.role)) {
+    throw new HttpError(403, "dashboard admin role required");
+  }
   const slug = String(
     req.query.organizationSlug ??
       req.body?.organizationSlug ??
@@ -9159,7 +9543,7 @@ async function resolveOnboardingOrganization(req: express.Request) {
       "",
   ).trim();
   if (slug) {
-    if (session && slug !== session.organization.slug)
+    if (slug !== session.organization.slug)
       throw new HttpError(403, "cannot access another organization");
     const organization = await getOrganizationBySlug(slug);
     if (!organization) {
@@ -9175,12 +9559,9 @@ async function resolveOnboardingOrganization(req: express.Request) {
       ReturnType<typeof ensureDefaultOrganization>
     >;
   }
-  if (session) {
-    const organization = await getOrganizationById(session.organization.id);
-    if (!organization) throw new HttpError(404, "organization not found");
-    return organization as Awaited<ReturnType<typeof ensureDefaultOrganization>>;
-  }
-  return ensureDefaultOrganization();
+  const organization = await getOrganizationById(session.organization.id);
+  if (!organization) throw new HttpError(404, "organization not found");
+  return organization as Awaited<ReturnType<typeof ensureDefaultOrganization>>;
 }
 
 async function ensureManagedMobileOrganization() {
@@ -9268,25 +9649,33 @@ async function resolveManagedMobileOrganization(
       );
       return {
         ...updated.rows[0],
-        defaultUserRole: audience === "organization" ? "admin" : "engineer",
+        defaultUserRole:
+          audience === "organization"
+            ? await initialOrganizationLoginRole(existing.id)
+            : "engineer",
       };
     }
     return {
       ...existing,
-      defaultUserRole: audience === "organization" ? "admin" : "engineer",
+      defaultUserRole:
+        audience === "organization"
+          ? await initialOrganizationLoginRole(existing.id)
+          : "engineer",
     };
   }
 
   if (audience === "organization" && domainSlug) {
+    const accountPackage = accountPackageForNewSession(audience);
     const result = await pool.query(
-      `insert into organizations (name, slug, region, setup_completed, current_step, deployment_mode)
-       values ($1, $2, $3, false, 1, 'cloud')
+      `insert into organizations (name, slug, region, setup_completed, current_step, deployment_mode, infrastructure_config)
+       values ($1, $2, $3, false, 1, 'cloud', jsonb_build_object('accountPackage', $4::text))
        on conflict (slug) do update set updated_at = now()
        returning id, name, slug, region, setup_completed, current_step, deployment_mode`,
       [
         organizationNameFromDomain(domain),
         domainSlug,
         process.env.OPENLEASH_ORG_REGION ?? null,
+        accountPackage,
       ],
     );
     return { ...result.rows[0], defaultUserRole: "admin" };
@@ -9296,6 +9685,20 @@ async function resolveManagedMobileOrganization(
     ...(await ensureManagedMobileOrganization()),
     defaultUserRole: audience === "organization" ? "admin" : "engineer",
   };
+}
+
+async function initialOrganizationLoginRole(organizationId: string) {
+  const result = await pool.query(
+    `select exists (
+       select 1
+       from users
+       where organization_id = $1
+         and status = 'active'
+         and role in ('owner', 'admin', 'ciso', 'security_admin')
+     ) as has_administrator`,
+    [organizationId],
+  );
+  return result.rows[0]?.has_administrator ? "engineer" : "admin";
 }
 
 async function resolveExistingMobileOrganizationForProfile(
@@ -9462,6 +9865,32 @@ function normalizeAccountPackage(value: unknown) {
   return null;
 }
 
+function accountPackageForNewSession(
+  audience: "individual" | "organization",
+) {
+  const configured = normalizeAccountPackage(
+    process.env.OPENLEASH_DEV_ACCOUNT_PACKAGE,
+  );
+  if (audience === "individual") {
+    return configured?.startsWith("personal-") ? configured : null;
+  }
+  return configured?.startsWith("work-") ? configured : "work-managed";
+}
+
+async function organizationUsesManagedEvaluation(organizationId: string) {
+  if (normalizeDeploymentMode(process.env.OPENLEASH_DEPLOYMENT_MODE) !== "cloud")
+    return false;
+  const result = await pool.query<{ package_id: string | null }>(
+    `select infrastructure_config->>'accountPackage' as package_id
+     from organizations
+     where id = $1
+     limit 1`,
+    [organizationId],
+  );
+  const packageId = normalizeAccountPackage(result.rows[0]?.package_id);
+  return packageId === "personal-managed" || packageId === "work-managed";
+}
+
 async function getOrganizationBySlug(slug: string) {
   const normalized = slugifyTenant(slug);
   const result = await pool.query(
@@ -9538,7 +9967,13 @@ function clientModeFromEnvironment() {
     mode.includes("on-prem")
   )
     return "enterprise";
-  if (mode.includes("community") || mode.includes("personal"))
+  if (
+    mode.includes("community") ||
+    mode.includes("personal") ||
+    mode.includes("individual") ||
+    mode.includes("open-source") ||
+    mode.includes("opensource")
+  )
     return "community";
   return "cloud";
 }
@@ -9799,11 +10234,14 @@ async function createDashboardSessionFromProfile({
   accountAudience?: "individual" | "organization";
 }) {
   const organizationResult = await pool.query(
-    `select id, name, slug, region, setup_completed from organizations where id = $1 limit 1`,
+    `select id, name, slug, region, setup_completed, infrastructure_config from organizations where id = $1 limit 1`,
     [organizationId],
   );
   const organization = organizationResult.rows[0];
   if (!organization) throw new Error("Organization not found");
+  const accountPackage =
+    normalizeAccountPackage(organization.infrastructure_config?.accountPackage) ??
+    accountPackageForNewSession(accountAudience);
   const profileNameParts = splitProfileName(profile.name || "");
   const firstName = profile.givenName || profileNameParts.givenName;
   const lastName = profile.familyName || profileNameParts.familyName;
@@ -9846,6 +10284,7 @@ async function createDashboardSessionFromProfile({
             ssoProfile: profile.raw,
             mobile: true,
             accountAudience,
+            accountPackage,
           }),
         ],
       )
@@ -9869,7 +10308,7 @@ async function createDashboardSessionFromProfile({
           userEmail,
           profile.subject || null,
           providerType || null,
-          JSON.stringify({ ssoProfile: profile.raw, accountAudience }),
+          JSON.stringify({ ssoProfile: profile.raw, accountAudience, accountPackage }),
         ],
       );
   if (!userResult.rows[0] && !provisionUser) {
@@ -9906,7 +10345,7 @@ async function createDashboardSessionFromProfile({
     organization,
     account: {
       audience: accountAudience,
-      packageId: null,
+      packageId: accountPackage,
     },
   };
 }
@@ -11185,8 +11624,32 @@ function bearerToken(authHeader: string) {
   return authHeader.replace(/^Bearer\s+/i, "").trim();
 }
 
+function privateBootstrapToken() {
+  return String(process.env.OPENLEASH_PRIVATE_BOOTSTRAP_TOKEN ?? "").trim();
+}
+
+function secureTokenEquals(provided: string, expected: string) {
+  if (!provided || !expected) return false;
+  const providedHash = Buffer.from(hashToken(provided));
+  const expectedHash = Buffer.from(hashToken(expected));
+  return crypto.timingSafeEqual(providedHash, expectedHash);
+}
+
+function requirePluginReleaseAdmin(req: express.Request, res: express.Response) {
+  const expected = String(process.env.OPENLEASH_RELEASE_ADMIN_TOKEN ?? "").trim();
+  if (!expected) {
+    res.status(503).json({ error: "Plugin release administration is not configured." });
+    return false;
+  }
+  if (!secureTokenEquals(bearerToken(req.header("authorization") ?? ""), expected)) {
+    res.status(403).json({ error: "Plugin release administrator authorization is required." });
+    return false;
+  }
+  return true;
+}
+
 function isDashboardAccessRole(role: unknown) {
-  return ["owner", "admin", "ciso", "security_admin"].includes(
+  return ["owner", "admin", "ciso", "security_admin", "analyst", "responder", "viewer"].includes(
     String(role ?? "").toLowerCase(),
   );
 }
@@ -11219,6 +11682,9 @@ function configuredCorsOrigins() {
 
 function requiresDashboardWriteSession(req: express.Request) {
   if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) return false;
+  if (req.path === "/admin/bootstrap") return false;
+  if (req.path.startsWith("/admin/plugin-releases")) return false;
+  if (req.path.startsWith("/admin/")) return true;
   if (req.path === "/admin/external-agents/sync") return true;
   if (req.path.startsWith("/admin/provider-usage")) return true;
   if (req.path.startsWith("/admin/onboarding")) return true;
@@ -11231,14 +11697,8 @@ function requiresDashboardWriteSession(req: express.Request) {
   return false;
 }
 
-function allowsLocalDashboardWriteBypass(req: express.Request) {
-  if (process.env.OPENLEASH_INSECURE_ADMIN_WRITE === "1") return true;
-  if (process.env.NODE_ENV === "production") return false;
-  const remote = req.socket.remoteAddress ?? "";
-  const forwarded = String(req.header("x-forwarded-for") ?? "")
-    .split(",")[0]
-    ?.trim();
-  return isLocalAddress(remote) && (!forwarded || isLocalAddress(forwarded));
+function allowsLocalDashboardWriteBypass(_req: express.Request) {
+  return process.env.OPENLEASH_INSECURE_ADMIN_WRITE === "1";
 }
 
 function isLocalAddress(value: string) {
@@ -11421,11 +11881,6 @@ function normalizeIdpProvider(provider: unknown) {
       keys: ["azure", "azuread", "entra", "entraid", "microsoftentra"],
       idpType: "AzureAD",
       label: "Microsoft Entra ID",
-    },
-    {
-      keys: ["oidc", "openid", "openidconnect", "genericopenid", "genericoidc"],
-      idpType: "OIDC",
-      label: "Generic OIDC",
     },
     { keys: ["okta"], idpType: "Okta", label: "Okta" },
     { keys: ["ping", "pingone"], idpType: "Ping", label: "Ping Identity" },
@@ -11814,6 +12269,8 @@ function surfaceForRequest(
     requestPath === "/admin/provider-usage" ||
     requestPath.startsWith("/admin/provider-usage/") ||
     requestPath === "/admin/evaluation-key" ||
+    requestPath === "/admin/bootstrap/status" ||
+    requestPath === "/admin/bootstrap" ||
     requestPath === "/admin/onboarding" ||
     requestPath.startsWith("/admin/onboarding/") ||
     requestPath === "/admin/identity" ||
@@ -12007,6 +12464,10 @@ function apiFunctionForRequest(
     return "adminProviderUsageWrite";
   if (verb === "POST" && requestPath === "/admin/evaluation-key")
     return "adminProviderUsageWrite";
+  if (verb === "GET" && requestPath === "/admin/bootstrap/status")
+    return "adminOnboardingRead";
+  if (verb === "POST" && requestPath === "/admin/bootstrap")
+    return "adminOnboardingWrite";
   if (verb === "GET" && requestPath === "/admin/onboarding")
     return "adminOnboardingRead";
   if (verb === "GET" && requestPath === "/admin/identity")
@@ -12246,6 +12707,7 @@ function policyInventorySql(organizationWhere = "") {
       where (pr.policy_id = p.id or pr.policy_name = p.name)
         ${organizationFilter}
     ) stats on true
+    where p.organization_id = $1
     order by p.category asc, p.created_at asc`;
 }
 

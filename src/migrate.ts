@@ -300,19 +300,26 @@ async function removeLegacyMockIdentityRows() {
         end,
         last_error = case
           when coalesce(real_users.count, 0) = 0 and coalesce(real_groups.count, 0) = 0 then 'Identity sync has not run with a real provider yet.'
+          when last_error = 'Identity sync has not run with a real provider yet.' then null
           else last_error
         end,
         updated_at = now()
     from (
       select c.organization_id, count(u.id)::int as count
       from idp_connections c
-      left join users u on u.organization_id = c.organization_id and u.idp_provider = c.provider
+      left join users u on u.organization_id = c.organization_id and (
+        lower(u.idp_provider) = lower(c.provider)
+        or (lower(c.provider) = 'google' and lower(u.idp_provider) = 'googleworkspace')
+      )
       group by c.organization_id
     ) real_users,
     (
       select c.organization_id, count(g.id)::int as count
       from idp_connections c
-      left join identity_groups g on g.organization_id = c.organization_id and g.idp_provider = c.provider
+      left join identity_groups g on g.organization_id = c.organization_id and (
+        lower(g.idp_provider) = lower(c.provider)
+        or (lower(c.provider) = 'google' and lower(g.idp_provider) = 'googleworkspace')
+      )
       group by c.organization_id
     ) real_groups
     where idp_connections.organization_id = real_users.organization_id
