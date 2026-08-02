@@ -91,3 +91,64 @@ test("targets one enrolled agent without creating another container", () => {
     agentId: "agent-desktop",
   }).config.level, "balanced");
 });
+
+test("normalizes project roots and applies project profiles to nested working directories", () => {
+  const profiles = normalizePluginSettingProfiles([{
+    id: "project-rules",
+    name: "Project rules",
+    agentKinds: [],
+    projectPaths: [" /Users/max/Code/OpenLeash/ ", "\\Users\\max\\Code\\OpenLeash"],
+    config: { rules: [{ text: "Ask before changing migrations", action: "ask" }] },
+  }]);
+  assert.deepEqual(profiles[0]?.projectPaths, ["/Users/max/Code/OpenLeash"]);
+  assert.equal(resolvePluginSettingProfiles({
+    enabled: true,
+    config: { rules: [] },
+    userProfiles: profiles,
+    projectPath: "/Users/max/Code/OpenLeash/apps/client-api",
+  }).effectiveProfileIds[0], "user:project-rules");
+  assert.deepEqual(resolvePluginSettingProfiles({
+    enabled: true,
+    config: { rules: [] },
+    userProfiles: profiles,
+    projectPath: "/Users/max/Code/Other",
+  }).config, { rules: [] });
+});
+
+test("project matching respects Windows casing and UNC roots", () => {
+  const profiles = normalizePluginSettingProfiles([{
+    id: "windows-project",
+    name: "Windows project",
+    agentKinds: [],
+    projectPaths: ["\\\\build-server\\repos\\OpenLeash", "C:\\Code\\OpenLeash"],
+    config: { strict: true },
+  }]);
+  assert.deepEqual(profiles[0]?.projectPaths, ["//build-server/repos/OpenLeash", "C:/Code/OpenLeash"]);
+  for (const projectPath of ["//BUILD-SERVER/repos/openleash/apps", "c:/code/openleash/packages"]) {
+    assert.equal(resolvePluginSettingProfiles({
+      enabled: true,
+      config: {},
+      userProfiles: profiles,
+      projectPath,
+    }).config.strict, true);
+  }
+});
+
+test("rules from the base, project, and agent scopes accumulate", () => {
+  const resolved = resolvePluginSettingProfiles({
+    enabled: true,
+    config: { rules: [{ text: "Global rule", action: "ask" }] },
+    organizationProfiles: [
+      { id: "project", name: "Project", agentKinds: [], projectPaths: ["/repo"], config: { rules: [{ text: "Project rule", action: "block" }] } },
+      { id: "agent", name: "Agent", agentKinds: ["codex"], config: { rules: [{ text: "Agent rule", action: "ask" }] } },
+    ],
+    agentKind: "codex",
+    projectPath: "/repo/apps/api",
+    mergeArrayKeys: ["rules"],
+  });
+  assert.deepEqual(resolved.config.rules, [
+    { text: "Global rule", action: "ask" },
+    { text: "Agent rule", action: "ask" },
+    { text: "Project rule", action: "block" },
+  ]);
+});

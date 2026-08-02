@@ -172,6 +172,7 @@ export function isIslandContributionEnabled(
     userProfiles: plugin.settings.profiles,
     agentKind: contribution.agentKind,
     agentId: contribution.agentId,
+    projectPath: contribution.projectPath,
     configLocked: plugin.organizationPolicy?.configLocked,
     mandatory: plugin.organizationPolicy?.mandatory,
   }).enabled;

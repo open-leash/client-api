@@ -29,6 +29,7 @@ export type ContainerTransformRequest = {
     provider: string;
     agentKind: string;
     sessionId: string;
+    projectPath?: string;
   };
   settings: {
     profileIds: string[];
@@ -251,6 +252,7 @@ export async function transformWithContainerPlugins(input: {
   provider: string;
   agentKind: string;
   sessionId: string;
+  projectPath?: string;
   payload: unknown;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
@@ -279,6 +281,7 @@ export async function transformWithContainerPlugins(input: {
           provider: input.provider,
           agentKind: input.agentKind,
           sessionId: input.sessionId,
+          projectPath: input.projectPath,
         },
         settings: settingsContext(plugin.settings),
         config: plugin.settings.config,

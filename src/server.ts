@@ -839,6 +839,7 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
       optionalString(req.body?.agentId),
     );
     const sessionId = String(req.body?.sessionId ?? "proxy").trim() || "proxy";
+    const projectPath = optionalString(req.body?.projectPath);
     if (await isSessionMonitoringPaused(user, {
       agent: { kind: agentKind },
       event: { agentKind, sessionId },
@@ -854,7 +855,7 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
     const catalog = await pluginCatalogForOrganization(
       user.organization_id,
       user.id,
-      { agentKind, agentId },
+      { agentKind, agentId, projectPath },
     );
     const result = await transformWithContainerPlugins({
       plugins: catalog.plugins,
@@ -863,6 +864,7 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
       provider,
       agentKind,
       sessionId,
+      projectPath,
       payload: requestBody,
     });
     res.json({
@@ -894,10 +896,11 @@ app.post("/v1/plugin-runtime/tools/execute", async (req, res, next) => {
       agentKind,
       optionalString(req.body?.agentId),
     );
+    const projectPath = optionalString(req.body?.projectPath);
     const catalog = await pluginCatalogForOrganization(
       user.organization_id,
       user.id,
-      { agentKind, agentId },
+      { agentKind, agentId, projectPath },
     );
     const plugin = catalog.plugins.find((candidate) => candidate.id === pluginId);
     if (!plugin) return res.status(404).json({ error: "enabled plugin not found" });
@@ -4822,6 +4825,8 @@ app.post("/v1/skills/observations", async (req, res, next) => {
       organizationId,
       user.id,
       String(body.agentKind ?? "unknown"),
+      undefined,
+      body.projectPath ?? undefined,
     );
     const reasons = normalizeSkillReasons(body.reasons);
     const content =
@@ -5886,8 +5891,8 @@ async function handlePromptOnlyHook(
     await recordConversationEvent(request, user, intentKey);
   const containerRuns = await recordContainerRuntimeRuns({ request, organizationId, conversationEventId, userId: user.id, computerId, runtimeId });
   const [config, runtimePlugins, tenantModelKey, policies] = await Promise.all([
-    readPromptTransformConfig(organizationId, user.id, request.agent.kind, runtimeId || request.agent.instanceId),
-    pluginSettingsForRuntime(organizationId, user.id, request.agent.kind, runtimeId || request.agent.instanceId),
+    readPromptTransformConfig(organizationId, user.id, request.agent.kind, runtimeId || request.agent.instanceId, request.event.projectPath),
+    pluginSettingsForRuntime(organizationId, user.id, request.agent.kind, runtimeId || request.agent.instanceId, request.event.projectPath),
     tenantModelKeyForEvaluation(organizationId),
     pool.query<Policy>(
       `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
@@ -6056,6 +6061,7 @@ async function readPromptTransformConfig(
   userId?: string,
   agentKind?: string,
   agentId?: string,
+  projectPath?: string,
 ): Promise<PromptTransformConfig> {
   const row = await pool.query<{ config: unknown }>(
     "select config from prompt_transform_settings where organization_id = $1",
@@ -6092,6 +6098,7 @@ async function readPromptTransformConfig(
       userProfiles: userStored?.profiles,
       agentKind,
       agentId,
+      projectPath,
       configLocked,
     });
   };
@@ -6145,7 +6152,7 @@ type MarketplacePolicyRecord = {
 async function pluginCatalogForOrganization(
   organizationId: string,
   userId?: string,
-  options: { agentKind?: string; agentId?: string } = {},
+  options: { agentKind?: string; agentId?: string; projectPath?: string } = {},
 ): Promise<{
   plugins: PluginCatalogItem[];
   marketplacePolicy: MarketplacePolicyRecord;
@@ -6191,6 +6198,7 @@ async function pluginCatalogForOrganization(
           approvedReleases,
           options.agentKind,
           options.agentId,
+          options.projectPath,
           Boolean(userId),
         );
       })
@@ -6208,6 +6216,7 @@ function pluginCatalogItem(
   approvedReleases: Map<string, OpenLeashPluginManifest> = new Map(),
   agentKind?: string,
   agentId?: string,
+  projectPath?: string,
   userScoped = false,
 ): PluginCatalogItem {
   const baseEnabled = pluginEnabledForUser({
@@ -6251,6 +6260,8 @@ function pluginCatalogItem(
     userProfiles,
     agentKind,
     agentId,
+    projectPath,
+    mergeArrayKeys: manifest.id === "openleash.rules-enforcer" ? ["rules"] : [],
     configLocked,
     mandatory: policy?.mandatory,
   });
@@ -6570,6 +6581,7 @@ async function savePluginSettingsForUser(
       pluginPolicy,
       marketplacePolicy,
       new Map(),
+      undefined,
       undefined,
       undefined,
       true,
@@ -7821,11 +7833,12 @@ async function pluginSettingsForRuntime(
   userId?: string,
   agentKind?: string,
   agentId?: string,
+  projectPath?: string,
 ) {
   const { plugins } = await pluginCatalogForOrganization(
     organizationId,
     userId,
-    { agentKind, agentId },
+    { agentKind, agentId, projectPath },
   );
   return new Map<string, PluginSettingState>(
     plugins.map((plugin) => [plugin.id, plugin.settings]),
@@ -7939,7 +7952,7 @@ async function recordContainerRuntimeRuns(input: {
     : {};
   const sourceRuns = Array.isArray(raw.containerPluginRuns) ? raw.containerPluginRuns : [];
   if (sourceRuns.length === 0) return [];
-  const runtimeSettings = await pluginSettingsForRuntime(input.organizationId, input.userId, input.request.agent.kind, input.runtimeId || input.request.agent.instanceId);
+  const runtimeSettings = await pluginSettingsForRuntime(input.organizationId, input.userId, input.request.agent.kind, input.runtimeId || input.request.agent.instanceId, input.request.event.projectPath);
   const runs: PluginRunRecord[] = [];
   for (const value of sourceRuns.slice(0, 32)) {
     if (!value || typeof value !== "object") continue;
@@ -8212,6 +8225,7 @@ async function evaluateAndRecord(
     user.id,
     request.agent.kind,
     runtimeId || request.agent.instanceId,
+    request.event.projectPath,
   );
   const policies = await pool.query<Policy>(
     `select id, name, description, severity, natural_language_rule as "naturalLanguageRule", enabled, locked
