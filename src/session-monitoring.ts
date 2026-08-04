@@ -1,5 +1,28 @@
 export const MAX_SESSION_MONITORING_PAUSE_MS = 30 * 60_000;
 
+export function isMissingSessionMonitoringSchema(error: unknown) {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "42P01"
+  );
+}
+
+export async function tolerateMissingSessionMonitoringSchema<T>(
+  operation: () => Promise<T>,
+  fallback: T,
+  onMissing?: () => void,
+) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!isMissingSessionMonitoringSchema(error)) throw error;
+    onMissing?.();
+    return fallback;
+  }
+}
+
 export function normalizeSessionMonitoringScope(value: unknown) {
   const input = value && typeof value === "object"
     ? value as { agentKind?: unknown; sessionIds?: unknown }

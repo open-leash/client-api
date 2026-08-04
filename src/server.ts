@@ -132,8 +132,10 @@ import {
 } from "./attention-events.js";
 import { ClientSyncBroker } from "./client-sync.js";
 import {
+  isMissingSessionMonitoringSchema,
   normalizeSessionMonitoringScope,
   normalizedSessionPauseExpiry,
+  tolerateMissingSessionMonitoringSchema,
 } from "./session-monitoring.js";
 
 class HttpError extends Error {
@@ -184,6 +186,7 @@ const inflightNormalizedEvents = new Map<
   string,
   Promise<NormalizedEventDecision>
 >();
+let missingSessionMonitoringSchemaWarningLogged = false;
 const pipelineTraceEnabled = process.env.OPENLEASH_PIPELINE_TRACE === "1";
 const pipelineTraceFile = process.env.OPENLEASH_PIPELINE_TRACE_FILE?.trim();
 export const apiSurface = apiSurfaceFromEnv();
@@ -617,7 +620,7 @@ app.post("/v1/session-monitoring", async (req, res, next) => {
       expiresAt: expiresAt.toISOString(),
     });
   } catch (error) {
-    next(error);
+    next(sessionMonitoringRouteError(error));
   }
 });
 
@@ -653,7 +656,7 @@ app.delete("/v1/session-monitoring", async (req, res, next) => {
       sessionIds: scope.sessionIds,
     });
   } catch (error) {
-    next(error);
+    next(sessionMonitoringRouteError(error));
   }
 });
 
@@ -3738,18 +3741,9 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       userPluginOutcomes(session.organization.id, session.user.id, {
         limit: 40,
       }),
-      pool.query<{
-        agent_kind: string;
-        session_id: string;
-        expires_at: Date;
-      }>(
-        `select agent_kind, session_id, expires_at
-         from session_monitoring_pauses
-         where organization_id = $1
-           and user_id = $2
-           and expires_at > now()
-         order by expires_at asc`,
-        [session.organization.id, session.user.id],
+      activeSessionMonitoringPauses(
+        session.organization.id,
+        session.user.id,
       ),
     ]);
     const islandContributions = await activeIslandContributions(
@@ -11608,18 +11602,58 @@ async function isSessionMonitoringPaused(
   ).trim().toLowerCase();
   const sessionId = String(request.event?.sessionId ?? "").trim();
   if (!agentKind || !sessionId) return false;
-  const result = await pool.query(
-    `select 1
-     from session_monitoring_pauses
-     where organization_id = $1
-       and user_id = $2
-       and agent_kind = $3
-       and session_id = $4
-       and expires_at > now()
-     limit 1`,
-    [user.organization_id, user.id, agentKind, sessionId],
+  return tolerateMissingSessionMonitoringSchema(async () => {
+    const result = await pool.query(
+      `select 1
+       from session_monitoring_pauses
+       where organization_id = $1
+         and user_id = $2
+         and agent_kind = $3
+         and session_id = $4
+         and expires_at > now()
+       limit 1`,
+      [user.organization_id, user.id, agentKind, sessionId],
+    );
+    return result.rowCount === 1;
+  }, false, warnMissingSessionMonitoringSchema);
+}
+
+async function activeSessionMonitoringPauses(
+  organizationId: string,
+  userId: string,
+) {
+  return tolerateMissingSessionMonitoringSchema(async () => {
+    return await pool.query<{
+      agent_kind: string;
+      session_id: string;
+      expires_at: Date;
+    }>(
+      `select agent_kind, session_id, expires_at
+       from session_monitoring_pauses
+       where organization_id = $1
+         and user_id = $2
+         and expires_at > now()
+       order by expires_at asc`,
+      [organizationId, userId],
+    );
+  }, { rows: [] }, warnMissingSessionMonitoringSchema);
+}
+
+function sessionMonitoringRouteError(error: unknown) {
+  if (!isMissingSessionMonitoringSchema(error)) return error;
+  warnMissingSessionMonitoringSchema();
+  return new HttpError(
+    503,
+    "Conversation monitoring controls are unavailable until database migrations finish.",
   );
-  return result.rowCount === 1;
+}
+
+function warnMissingSessionMonitoringSchema() {
+  if (missingSessionMonitoringSchemaWarningLogged) return;
+  missingSessionMonitoringSchemaWarningLogged = true;
+  console.warn(
+    "session monitoring schema is not migrated; model traffic will continue without conversation pauses",
+  );
 }
 
 function sessionMonitoringPausedDecision(): EvaluationResponse & {
