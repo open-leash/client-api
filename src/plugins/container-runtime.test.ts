@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import test from "node:test";
 import { applyValidatedProviderPatches, executeContainerPluginEvent, executeContainerPluginTool, transformWithContainerPlugins } from "./container-runtime.js";
 import type { PluginCapabilities, PluginCatalogItem } from "@openleash/shared";
@@ -179,11 +180,17 @@ test("round-trips privileged capabilities without giving the container credentia
     capabilities,
     env: {
       OPENLEASH_PLUGIN_ENDPOINTS: JSON.stringify({ "openleash.review": "http://worker" }),
-      OPENLEASH_PLUGIN_RUNTIME_SECRET: "secret",
+      OPENLEASH_PLUGIN_RUNTIME_SECRET: "secret\n",
     },
     fetchImpl: async (_url, init) => {
       calls += 1;
       const request = JSON.parse(String(init?.body));
+      const headers = init?.headers as Record<string, string>;
+      const expectedSignature = crypto
+        .createHmac("sha256", "secret")
+        .update(`${headers["x-openleash-timestamp"]}.${String(init?.body)}`)
+        .digest("hex");
+      assert.equal(headers["x-openleash-signature"], `sha256=${expectedSignature}`);
       assert.equal(request.tenant.organizationId, "org");
       assert.equal("providerKey" in request, false);
       const body = calls === 1

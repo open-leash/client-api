@@ -37,6 +37,8 @@ export type PromptPipelineInput = {
 export type PromptPipelineResult = {
   finalPrompt: string;
   blocked: boolean;
+  /** A required plugin could not run, so the action must be reviewed by a person. */
+  requiresApproval?: boolean;
   summary: string;
   model: string;
   compression?: {

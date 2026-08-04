@@ -210,7 +210,7 @@ export async function executeContainerPluginTool(input: {
   const env = input.env ?? process.env;
   const body = JSON.stringify(envelope);
   const timestamp = String(Date.now());
-  const secret = String(env.OPENLEASH_PLUGIN_RUNTIME_SECRET ?? "");
+  const secret = String(env.OPENLEASH_PLUGIN_RUNTIME_SECRET ?? "").trim();
   if (env.NODE_ENV === "production" && !secret) throw new Error("OPENLEASH_PLUGIN_RUNTIME_SECRET is required in production");
   const signature = secret ? crypto.createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex") : "";
   const response = await (input.fetchImpl ?? fetch)(
@@ -368,7 +368,7 @@ async function invokeContainerEvent(input: {
   );
   const body = JSON.stringify(input.request);
   const timestamp = String(Date.now());
-  const secret = String(input.env.OPENLEASH_PLUGIN_RUNTIME_SECRET ?? "");
+  const secret = String(input.env.OPENLEASH_PLUGIN_RUNTIME_SECRET ?? "").trim();
   if (input.env.NODE_ENV === "production" && !secret) {
     throw new Error("OPENLEASH_PLUGIN_RUNTIME_SECRET is required in production");
   }
@@ -389,7 +389,9 @@ async function invokeContainerEvent(input: {
     signal: AbortSignal.timeout(input.execution.timeoutMs ?? 30_000),
   });
   if (!response.ok) {
-    throw new Error(`container plugin ${input.plugin.id} event returned HTTP ${response.status}`);
+    throw new Error(
+      `container plugin ${input.plugin.id} event returned HTTP ${response.status}${await boundedErrorDetail(response)}`,
+    );
   }
   const result = (await response.json()) as Partial<ContainerEventResponse>;
   if (result.protocol !== CONTAINER_PLUGIN_PROTOCOL || result.requestId !== input.request.requestId) {
@@ -496,7 +498,7 @@ async function invokeContainerPlugin(input: {
   const endpoint = endpointForPlugin(input.plugin.id, input.execution, input.env);
   const body = JSON.stringify(input.request);
   const timestamp = String(Date.now());
-  const secret = String(input.env.OPENLEASH_PLUGIN_RUNTIME_SECRET ?? "");
+  const secret = String(input.env.OPENLEASH_PLUGIN_RUNTIME_SECRET ?? "").trim();
   if (input.env.NODE_ENV === "production" && !secret) {
     throw new Error("OPENLEASH_PLUGIN_RUNTIME_SECRET is required in production");
   }
@@ -517,7 +519,9 @@ async function invokeContainerPlugin(input: {
     signal: AbortSignal.timeout(input.execution.timeoutMs ?? 30_000),
   });
   if (!response.ok) {
-    throw new Error(`container plugin ${input.plugin.id} returned HTTP ${response.status}`);
+    throw new Error(
+      `container plugin ${input.plugin.id} returned HTTP ${response.status}${await boundedErrorDetail(response)}`,
+    );
   }
   const result = (await response.json()) as Partial<ContainerTransformResponse>;
   if (result.protocol !== CONTAINER_PLUGIN_PROTOCOL) {
@@ -564,6 +568,14 @@ function parseEndpointMap(value?: string) {
   } catch {
     throw new Error("OPENLEASH_PLUGIN_ENDPOINTS must be a JSON object of plugin ids to URLs");
   }
+}
+
+async function boundedErrorDetail(response: Response) {
+  const body = (await response.text().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+  return body ? `: ${body}` : "";
 }
 
 function joinUrl(base: string, path: string) {

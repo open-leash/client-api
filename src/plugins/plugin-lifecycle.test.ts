@@ -164,7 +164,7 @@ test("cloud evaluation records edge work without rerunning the same plugin", asy
   assert.deepEqual(result.runs, []);
 });
 
-test("a required evaluation plugin failure becomes a recorded deny instead of an API error", async () => {
+test("a required evaluation plugin failure becomes a recorded approval instead of a false policy deny", async () => {
   const result = await runEvaluationPipeline({
     request: request("Bash", { command: "echo hello" }),
     policies: [],
@@ -172,12 +172,36 @@ test("a required evaluation plugin failure becomes a recorded deny instead of an
       ["openleash.blast-radius", { enabled: true, config: {} }],
     ]),
   });
-  assert.equal(result.results[0]?.status, "failed");
+  assert.equal(result.results[0]?.status, "needs_question");
   assert.equal(result.results[0]?.policyName, "blast-radius runtime");
   assert.match(
     result.results[0]?.explanation ?? "",
-    /blast-radius could not evaluate this action/,
+    /blast-radius could not complete its safety check/,
   );
+  assert.match(result.results[0]?.question ?? "", /Allow this action once/);
+  assert.equal(result.runs[0]?.status, "failed");
+});
+
+test("a required prompt plugin failure holds the action for approval with the diagnostic", async () => {
+  const promptRequest = request();
+  promptRequest.event.eventName = "UserPromptSubmit";
+  promptRequest.event.tool = undefined;
+  promptRequest.event.prompt = "please copy the .env file here to test.env";
+  const result = await runPromptPipeline({
+    request: promptRequest,
+    organizationId: "org-test",
+    userId: "user-test",
+    config: {
+      compression: { enabled: false, level: "standard", conciseResponse: false, model: "" },
+      dlp: { enabled: true, action: "mask", categories: ["credentials"], model: "" },
+    },
+    plugins: new Map([
+      ["openleash.dlp", { enabled: true, config: { enabled: true, action: "mask", categories: ["credentials"] } }],
+    ]),
+  });
+  assert.equal(result.blocked, false);
+  assert.equal(result.requiresApproval, true);
+  assert.match(result.summary, /no container runtime endpoint is configured for openleash\.dlp/);
   assert.equal(result.runs[0]?.status, "failed");
 });
 

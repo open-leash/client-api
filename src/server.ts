@@ -5943,7 +5943,8 @@ async function handlePromptOnlyHook(
     promptResult?.blocked ||
     results.some((result) => result.status === "failed")
       ? "deny"
-      : results.some((result) => result.status === "needs_question")
+      : promptResult?.requiresApproval ||
+          results.some((result) => result.status === "needs_question")
         ? "ask"
         : "allow";
   const blockingResult = results.find((result) => result.status === "failed");
@@ -5952,14 +5953,18 @@ async function handlePromptOnlyHook(
   );
   const summary = promptResult?.blocked
     ? promptResult.summary
-    : (blockingResult?.explanation ??
-      reviewResult?.explanation ??
-      promptResult?.summary ??
-      "OpenLeash logged this prompt intent.");
+    : promptResult?.requiresApproval
+      ? promptResult.summary
+      : (blockingResult?.explanation ??
+        reviewResult?.explanation ??
+        promptResult?.summary ??
+        "OpenLeash logged this prompt intent.");
   const question =
     reviewResult?.question ??
     (decision === "ask"
-      ? `${request.agent.displayName} wants to proceed with sensitive access. Allow it once?`
+      ? promptResult?.requiresApproval
+        ? `${request.agent.displayName} is waiting because a plugin safety check failed. Allow this action once?`
+        : `${request.agent.displayName} wants to proceed with sensitive access. Allow it once?`
       : undefined);
   const evaluation = await pool.query<{ id: string }>(
     `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)

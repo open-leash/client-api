@@ -96,8 +96,9 @@ export async function runPromptPipeline(
       if ((plugin.execution?.failureMode ?? "closed") === "closed") {
         return {
           finalPrompt: current,
-          blocked: true,
-          summary: pluginFailureExplanation(plugin),
+          blocked: false,
+          requiresApproval: true,
+          summary: pluginFailureApprovalExplanation(plugin, error),
           model: [...models].join(", ") || "none",
           compression,
           dlp,
@@ -238,10 +239,11 @@ export async function runEvaluationPipeline(
               results: [{
                 policyId: `${plugin.id}.runtime-failure`,
                 policyName: `${pluginSlug(plugin)} runtime`,
-                status: "failed" as const,
+                status: "needs_question" as const,
                 severity: "high" as const,
-                explanation: pluginFailureExplanation(plugin),
+                explanation: pluginFailureApprovalExplanation(plugin, error),
                 evidence: [],
+                question: `${pluginSlug(plugin)} could not complete its safety check. Allow this action once?`,
               }],
               runs: [failure],
               model: "none",
@@ -271,8 +273,12 @@ function pluginSlug(plugin: OpenLeashPluginManifest) {
   return plugin.slug || plugin.id.replace(/^openleash\./, "");
 }
 
-function pluginFailureExplanation(plugin: OpenLeashPluginManifest) {
-  return `${pluginSlug(plugin)} could not evaluate this action, so OpenLeash blocked it.`;
+function pluginFailureApprovalExplanation(
+  plugin: OpenLeashPluginManifest,
+  error: unknown,
+) {
+  const diagnostic = error instanceof Error ? error.message : String(error);
+  return `${pluginSlug(plugin)} could not complete its safety check: ${diagnostic}. OpenLeash is holding the action for your approval.`;
 }
 
 function pluginFailureRun(
