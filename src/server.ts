@@ -3770,7 +3770,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       plugins: pluginCatalog.plugins,
       outcomes: pluginOutcomes.outcomes,
       islandContributions,
-      sessionMonitoringPauses: sessionMonitoringPauses.rows.map((item) => ({
+      sessionMonitoringPauses: sessionMonitoringPauses.map((item) => ({
         agentKind: item.agent_kind,
         sessionIds: [item.session_id],
         expiresAt: item.expires_at.toISOString(),
@@ -11623,7 +11623,7 @@ async function activeSessionMonitoringPauses(
   userId: string,
 ) {
   return tolerateMissingSessionMonitoringSchema(async () => {
-    return await pool.query<{
+    const result = await pool.query<{
       agent_kind: string;
       session_id: string;
       expires_at: Date;
@@ -11633,10 +11633,11 @@ async function activeSessionMonitoringPauses(
        where organization_id = $1
          and user_id = $2
          and expires_at > now()
-       order by expires_at asc`,
+      order by expires_at asc`,
       [organizationId, userId],
     );
-  }, { rows: [] }, warnMissingSessionMonitoringSchema);
+    return result.rows;
+  }, [], warnMissingSessionMonitoringSchema);
 }
 
 function sessionMonitoringRouteError(error: unknown) {
