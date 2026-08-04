@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
-import { applyValidatedProviderPatches, executeContainerPluginEvent, executeContainerPluginTool, transformWithContainerPlugins } from "./container-runtime.js";
+import { applyValidatedProviderPatches, executeContainerPluginEvent, executeContainerPluginTool, transformWithContainerPlugins, verifyContainerPluginRuntime } from "./container-runtime.js";
 import type { PluginCapabilities, PluginCatalogItem } from "@openleash/shared";
 
 test("applies only provider-safe JSON patches", () => {
@@ -15,6 +15,121 @@ test("applies only provider-safe JSON patches", () => {
     () => applyValidatedProviderPatches(result, [{ op: "replace", path: "/model", value: "steal" }]),
     /not allowed/,
   );
+});
+
+test("installation verification checks health and a signed event round-trip", async () => {
+  const plugin = {
+    id: "openleash.verify",
+    name: "verify",
+    description: "test",
+    version: "1.0.0",
+    publisher: "openleash",
+    runtime: "container",
+    execution: {
+      type: "container",
+      placement: "server",
+      protocol: "openleash-container-plugin.v1",
+      image: "example/verify:1.0.0",
+      healthPath: "/healthz",
+      eventPath: "/v1/events",
+    },
+    entrypoint: "container",
+    events: ["prompt.beforeSubmit"],
+    permissions: ["event:read"],
+    effects: ["observe"],
+    settings: {
+      enabled: true,
+      runtimeAvailable: true,
+      config: { enabled: true },
+      installedVersion: "1.0.0",
+    },
+  } as PluginCatalogItem;
+  let eventCalls = 0;
+  const result = await verifyContainerPluginRuntime({
+    plugin,
+    organizationId: "org",
+    userId: "user",
+    env: {
+      OPENLEASH_PLUGIN_ENDPOINTS: JSON.stringify({
+        "openleash.verify": "http://worker",
+      }),
+      OPENLEASH_PLUGIN_RUNTIME_SECRET: "secret\n",
+    },
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/healthz")) {
+        return new Response(JSON.stringify({
+          ok: true,
+          pluginId: "openleash.verify",
+          protocol: "openleash-container-plugin.v1",
+        }));
+      }
+      eventCalls += 1;
+      const request = JSON.parse(String(init?.body));
+      const headers = init?.headers as Record<string, string>;
+      const expected = crypto
+        .createHmac("sha256", "secret")
+        .update(`${headers["x-openleash-timestamp"]}.${String(init?.body)}`)
+        .digest("hex");
+      assert.equal(headers["x-openleash-signature"], `sha256=${expected}`);
+      assert.equal(request.event, "openleash.runtime.verify");
+      assert.equal(request.config.enabled, false);
+      return new Response(JSON.stringify({
+        protocol: "openleash-container-plugin.v1",
+        requestId: request.requestId,
+        status: "completed",
+        output: { ok: true },
+      }));
+    },
+  });
+  assert.equal(eventCalls, 1);
+  assert.deepEqual(result.checks, ["health", "event"]);
+  assert.equal(result.healthy, true);
+  assert.equal(result.protocolVerified, true);
+});
+
+test("installation verification reports signing or protocol failures", async () => {
+  const plugin = {
+    id: "openleash.verify",
+    name: "verify",
+    description: "test",
+    version: "1.0.0",
+    publisher: "openleash",
+    runtime: "container",
+    execution: {
+      type: "container",
+      placement: "server",
+      protocol: "openleash-container-plugin.v1",
+      image: "example/verify:1.0.0",
+      healthPath: "/healthz",
+      eventPath: "/v1/events",
+    },
+    entrypoint: "container",
+    events: ["prompt.beforeSubmit"],
+    permissions: ["event:read"],
+    effects: ["observe"],
+    settings: { enabled: true, runtimeAvailable: true, config: {} },
+  } as PluginCatalogItem;
+  const result = await verifyContainerPluginRuntime({
+    plugin,
+    organizationId: "org",
+    userId: "user",
+    env: {
+      OPENLEASH_PLUGIN_ENDPOINTS: JSON.stringify({
+        "openleash.verify": "http://worker",
+      }),
+      OPENLEASH_PLUGIN_RUNTIME_SECRET: "wrong-secret",
+    },
+    fetchImpl: async (url) => String(url).endsWith("/healthz")
+      ? new Response(JSON.stringify({
+          ok: true,
+          pluginId: "openleash.verify",
+          protocol: "openleash-container-plugin.v1",
+        }))
+      : new Response(JSON.stringify({ error: "invalid plugin signature" }), { status: 500 }),
+  });
+  assert.equal(result.healthy, true);
+  assert.equal(result.protocolVerified, false);
+  assert.match(result.error ?? "", /invalid plugin signature/);
 });
 
 test("invokes enabled container plugins and validates correlation", async () => {

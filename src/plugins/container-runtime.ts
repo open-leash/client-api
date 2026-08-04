@@ -70,6 +70,174 @@ export type ContainerTransformResult = {
   }>;
 };
 
+export type ContainerPluginRuntimeVerification = {
+  pluginId: string;
+  healthy: boolean;
+  protocolVerified: boolean;
+  checks: Array<"health" | "event" | "transform">;
+  error?: string;
+};
+
+/**
+ * Verifies the complete host-to-container path used by protected requests.
+ * A health check alone is insufficient: it cannot catch a missing endpoint,
+ * mismatched runtime secret, incompatible protocol, or uncorrelated response.
+ */
+export async function verifyContainerPluginRuntime(input: {
+  plugin: PluginCatalogItem;
+  organizationId: string;
+  userId: string;
+  env?: NodeJS.ProcessEnv;
+  fetchImpl?: typeof fetch;
+}): Promise<ContainerPluginRuntimeVerification> {
+  const { plugin } = input;
+  const execution = plugin.execution;
+  const checks: ContainerPluginRuntimeVerification["checks"] = [];
+  if (
+    !plugin.settings.enabled ||
+    plugin.settings.runtimeAvailable === false ||
+    execution?.type !== "container"
+  ) {
+    return {
+      pluginId: plugin.id,
+      healthy: false,
+      protocolVerified: false,
+      checks,
+      error: plugin.settings.runtimeError || "plugin runtime is not enabled and available",
+    };
+  }
+
+  const env = input.env ?? process.env;
+  const fetchImpl = input.fetchImpl ?? fetch;
+  try {
+    const healthResponse = await fetchImpl(
+      joinUrl(
+        endpointBaseForPlugin(plugin.id, env),
+        execution.healthPath ?? "/healthz",
+      ),
+      { signal: AbortSignal.timeout(Math.min(execution.timeoutMs ?? 30_000, 10_000)) },
+    );
+    const healthBody = await healthResponse.json().catch(() => ({})) as {
+      ok?: boolean;
+      pluginId?: string;
+      protocol?: string;
+    };
+    if (
+      !healthResponse.ok ||
+      healthBody.ok !== true ||
+      healthBody.pluginId !== plugin.id ||
+      healthBody.protocol !== CONTAINER_PLUGIN_PROTOCOL
+    ) {
+      throw new Error(
+        `health check returned ${healthResponse.status} with an incompatible identity or protocol`,
+      );
+    }
+    checks.push("health");
+
+    const probePlugin: PluginCatalogItem = {
+      ...plugin,
+      settings: {
+        ...plugin.settings,
+        enabled: true,
+        // Verification must never export data or invoke a model. The signed
+        // round-trip still exercises routing, authentication and the handler.
+        config: { ...plugin.settings.config, enabled: false, rules: [] },
+      },
+    };
+    if (execution.eventPath) {
+      await executeContainerPluginEvent({
+        plugin: probePlugin,
+        organizationId: input.organizationId,
+        userId: input.userId,
+        event: "openleash.runtime.verify",
+        payload: runtimeVerificationEventPayload(),
+        capabilities: runtimeVerificationCapabilities(),
+        env,
+        fetchImpl,
+      });
+      checks.push("event");
+    }
+    if (execution.transformPath) {
+      const transformed = await transformWithContainerPlugins({
+        plugins: [probePlugin],
+        organizationId: input.organizationId,
+        userId: input.userId,
+        provider: "openleash-verification",
+        agentKind: "codex",
+        sessionId: "openleash-runtime-verification",
+        payload: {
+          model: "openleash-verification",
+          messages: [{ role: "user", content: "OpenLeash runtime verification probe." }],
+        },
+        env,
+        fetchImpl,
+      });
+      const failed = transformed.runs.find((run) => run.status === "failed");
+      if (failed) throw new Error(failed.summary || "transform verification failed");
+      checks.push("transform");
+    }
+    if (checks.length === 1) {
+      throw new Error("plugin exposes no signed event or transform endpoint to verify");
+    }
+    return {
+      pluginId: plugin.id,
+      healthy: true,
+      protocolVerified: true,
+      checks,
+    };
+  } catch (error) {
+    return {
+      pluginId: plugin.id,
+      healthy: checks.includes("health"),
+      protocolVerified: false,
+      checks,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function runtimeVerificationEventPayload() {
+  return {
+    verification: true,
+    prompt: "OpenLeash runtime verification probe.",
+    policies: [],
+    request: {
+      computer: { hostname: "openleash-verification", platform: "runtime" },
+      agent: { kind: "codex", displayName: "OpenLeash verification" },
+      event: {
+        eventName: "UserPromptSubmit",
+        agentKind: "codex",
+        sessionId: "openleash-runtime-verification",
+        prompt: "OpenLeash runtime verification probe.",
+        raw: { openleashRuntimeVerification: true },
+      },
+    },
+  };
+}
+
+function runtimeVerificationCapabilities(): PluginCapabilities {
+  const none = async () => undefined as never;
+  const list = async () => [] as never;
+  return {
+    context: {
+      instructions: { list },
+      conversation: { recent: none },
+    },
+    llm: { evaluateJson: none },
+    storage: { get: none, set: none, list, delete: async () => undefined },
+    notification: { send: none },
+    island: {
+      annotateSession: none,
+      reportActivity: none,
+      publishStatus: none,
+      clear: async () => undefined,
+    },
+    log: { emit: none },
+    signals: { emit: none },
+    usage: { record: none },
+  };
+}
+
 export type ContainerCapabilityRequest = {
   /** Stable within one event invocation so a retried round can reuse the result. */
   id: string;

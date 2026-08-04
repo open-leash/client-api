@@ -64,7 +64,7 @@ import { firstPartyPluginManifests } from "./plugins/registry.js";
 import { eventForHookEvent } from "./plugins/events.js";
 import { runEvaluationPipeline, runPromptPipeline } from "./plugins/runtime.js";
 import { createPluginCapabilities } from "./plugins/capabilities.js";
-import { executeContainerPluginEvent, executeContainerPluginTool, transformWithContainerPlugins } from "./plugins/container-runtime.js";
+import { executeContainerPluginEvent, executeContainerPluginTool, transformWithContainerPlugins, verifyContainerPluginRuntime } from "./plugins/container-runtime.js";
 import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
 import { normalizePluginSettingProfiles, resolvePluginSettingProfiles } from "./plugins/settings-profiles.js";
 import {
@@ -876,6 +876,46 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
       appliedPluginIds: result.appliedPluginIds,
       runs: result.runs,
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/plugin-runtime/verify", async (req, res, next) => {
+  try {
+    const token = tokenFromRequest(req);
+    const user = token ? await getUserByToken(token) : undefined;
+    if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
+    const organizationId =
+      user.organization_id ?? (await ensureDefaultOrganization()).id;
+    const catalog = await pluginCatalogForOrganization(
+      organizationId,
+      user.id,
+    );
+    const plugins = catalog.plugins.filter((plugin) =>
+      plugin.settings.enabled &&
+      plugin.settings.runtimeAvailable !== false &&
+      plugin.runtime === "container" &&
+      plugin.execution?.type === "container" &&
+      plugin.execution.placement !== "edge"
+    );
+    const results = await Promise.all(
+      plugins.map((plugin) => verifyContainerPluginRuntime({
+        plugin,
+        organizationId,
+        userId: user.id,
+      })),
+    );
+    const failed = results.filter((result) => !result.protocolVerified);
+    const body = {
+      ok: failed.length === 0,
+      plugins: results,
+      verifiedAt: new Date().toISOString(),
+      ...(failed.length > 0 ? {
+        error: `Plugin runtime verification failed for ${failed.map((item) => item.pluginId).join(", ")}.`,
+      } : {}),
+    };
+    return res.status(failed.length > 0 ? 503 : 200).json(body);
   } catch (error) {
     next(error);
   }
