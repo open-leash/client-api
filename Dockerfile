@@ -1,7 +1,7 @@
 FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS builder
 WORKDIR /app
 RUN apk add --no-cache git
-ARG OPENLEASH_SHARED_REF=effe9afd1c616d52da9ea710283e9fbebbf4ce77
+ARG OPENLEASH_SHARED_REF=30173f4dbc07441a30233b77461a95f603eb47e3
 RUN git clone https://github.com/open-leash/shared.git packages/shared \
     && git -C packages/shared checkout --detach "$OPENLEASH_SHARED_REF"
 COPY . apps/client-api
@@ -14,7 +14,7 @@ RUN npm prune --omit=dev && npm cache clean --force
 
 FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS runner
 LABEL org.opencontainers.image.source="https://github.com/open-leash/client-api" \
-      org.opencontainers.image.title="OpenLeash client-api" \
+      org.opencontainers.image.title="Leash client-api" \
       org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /app
 ENV NODE_ENV=production
@@ -26,7 +26,7 @@ COPY --chown=node:node --from=builder /app/apps/client-api/package.json ./apps/c
 COPY --chown=node:node --from=builder /app/apps/client-api/dist ./apps/client-api/dist
 COPY --chown=node:node --from=builder /app/apps/client-api/infra ./apps/client-api/infra
 USER node
-EXPOSE 9318 9319
+EXPOSE 9318
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.OPENLEASH_API_PORT||9318)+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 CMD ["node", "apps/client-api/dist/server.js"]

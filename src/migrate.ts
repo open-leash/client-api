@@ -62,7 +62,7 @@ try {
     });
   }
 
-  if (shouldApply) console.log("OpenLeash database schema is ready.");
+  if (shouldApply) console.log("Leash database schema is ready.");
 } finally {
   await pool.end();
 }
@@ -177,7 +177,7 @@ function redactDatabaseUrl(value: string) {
 }
 
 function printUsage() {
-  console.log(`OpenLeash database migrations
+  console.log(`Leash database migrations
 
 Usage:
   DATABASE_URL=postgres://... npm run db:migrate -w @openleash/client-api -- --status

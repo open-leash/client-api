@@ -1,11 +1,17 @@
 import { createPluginCapabilities } from "./capabilities.js";
-import { executeContainerPluginEvent } from "./container-runtime.js";
+import { runBlastRadius } from "./blast-radius/index.js";
+import { runDlp } from "./dlp/index.js";
+import { runCodeScanner } from "./code-scanner/index.js";
+import { runMcpScanner } from "./mcp-scanner/index.js";
+import { runPromptCompression } from "./prompt-compression/index.js";
 import {
   pluginSupportsAgent,
   pluginsForEvent,
   orderPlugins,
 } from "./registry.js";
 import { eventForHookEvent } from "./events.js";
+import { runSecurityEvaluator } from "./security-evaluator/index.js";
+import { runSensitiveAccess } from "./sensitive-access/index.js";
 import {
   type EvaluationPipelineInput,
   type EvaluationPipelineResult,
@@ -15,7 +21,6 @@ import {
 import type {
   OpenLeashPluginManifest,
   PipelineEvent,
-  PluginCatalogItem,
   PluginRunRecord,
   PluginSettingState,
 } from "@openleash/shared";
@@ -34,7 +39,7 @@ export async function runPromptPipeline(
     input.plugins,
     input.request.agent.kind,
   ).filter((plugin) => plugin.effects.includes("transform"))) {
-    if (containerPluginAlreadyApplied(input.request, plugin.id)) continue;
+    if (featureAlreadyApplied(input.request, plugin.id)) continue;
     const capabilities = createPluginCapabilities({
       tenantModelKey: input.tenantModelKey,
       organizationId: input.organizationId,
@@ -46,49 +51,44 @@ export async function runPromptPipeline(
       runtimeId: input.runtimeId,
       permissions: plugin.permissions,
     });
-    const settings = input.plugins?.get(plugin.id) ?? {
-      enabled: true,
-      config: plugin.defaultConfig ?? {},
-    };
-    const catalogPlugin: PluginCatalogItem = { ...plugin, settings };
     try {
-      const step = await executeContainerPluginEvent<{
-        prompt?: string;
-        finalPrompt?: string;
-        blocked?: boolean;
-        summary?: string;
-        model?: string;
-        compression?: PromptPipelineResult["compression"];
-        dlp?: PromptPipelineResult["dlp"];
-        run?: PromptPipelineResult["runs"][number];
-        runs?: PromptPipelineResult["runs"];
-      }>({
-        plugin: catalogPlugin,
-        organizationId: requiredRuntimeScope(input.organizationId, "organization"),
-        userId: requiredRuntimeScope(input.userId, "user"),
-        event: "prompt.beforeSubmit",
-        payload: {
-          request: input.request,
+      if (plugin.id === "openleash.prompt-compression") {
+        const step = await runPromptCompression({
           prompt: current,
+          config: input.config.compression,
+          capabilities,
+          startedAt: Date.now(),
           supportsPromptReplacement: sourceAllowsPromptReplacement(input.request),
-        },
-        capabilities,
-      });
-      current = step.finalPrompt ?? step.prompt ?? current;
-      runs.push(...(step.runs ?? (step.run ? [step.run] : [])));
-      if (step.model && step.model !== "none") models.add(step.model);
-      if (step.compression) compression = step.compression;
-      if (step.dlp) dlp = step.dlp;
-      if (step.blocked) {
-        return {
-          finalPrompt: current,
-          blocked: true,
-          summary: step.summary ?? "A plugin blocked the prompt.",
-          model: [...models].join(", ") || "none",
-          compression,
-          dlp,
-          runs,
-        };
+        });
+        current = step.prompt;
+        runs.push(step.run);
+        if (step.result?.model) models.add(step.result.model);
+        if (step.result?.compression) compression = step.result.compression;
+        continue;
+      }
+
+      if (plugin.id === "openleash.dlp") {
+        const step = await runDlp({
+          prompt: current,
+          config: input.config.dlp,
+          capabilities,
+          startedAt: Date.now(),
+        });
+        current = step.prompt;
+        runs.push(step.run);
+        if (step.result?.model) models.add(step.result.model);
+        if (step.result?.dlp) dlp = step.result.dlp;
+        if (step.result?.blocked) {
+          return {
+            finalPrompt: current,
+            blocked: true,
+            summary: step.result.summary,
+            model: [...models].join(", ") || "none",
+            compression,
+            dlp,
+            runs,
+          };
+        }
       }
     } catch (error) {
       const failure = pluginFailureRun(plugin, "prompt.beforeSubmit", error);
@@ -124,7 +124,7 @@ export async function runPromptPipeline(
   };
 }
 
-function containerPluginAlreadyApplied(
+function featureAlreadyApplied(
   request: PromptPipelineInput["request"],
   pluginId: string,
 ) {
@@ -138,9 +138,8 @@ function containerPluginAlreadyApplied(
   ) {
     return true;
   }
-  // A container that successfully inspected a request owns that event even when
-  // it returned `unchanged`. Re-running its legacy in-process implementation in
-  // the cloud would duplicate work and can trigger a second model evaluation.
+  // Existing proxies use these compatibility fields. A Feature that already
+  // inspected a request owns that event even when it returned `unchanged`.
   return Array.isArray(raw?.containerPluginRuns) &&
     raw.containerPluginRuns.some((run) => {
       if (!run || typeof run !== "object") return false;
@@ -186,7 +185,7 @@ export async function runEvaluationPipeline(
       )
       .map(
       async (plugin) => {
-        if (containerPluginAlreadyApplied(input.request, plugin.id)) {
+        if (featureAlreadyApplied(input.request, plugin.id)) {
           return { results: [], runs: [], model: "none" };
         }
         const capabilities = createPluginCapabilities({
@@ -200,38 +199,33 @@ export async function runEvaluationPipeline(
           runtimeId: input.runtimeId,
           permissions: plugin.permissions,
         });
-        const settings = input.plugins?.get(plugin.id) ?? {
-          enabled: true,
-          config: plugin.defaultConfig ?? {},
-        };
-        const catalogPlugin: PluginCatalogItem = { ...plugin, settings };
         try {
-          const output = await executeContainerPluginEvent<{
-            results?: EvaluationPipelineResult["results"];
-            run?: EvaluationPipelineResult["runs"][number];
-            runs?: EvaluationPipelineResult["runs"];
-            model?: string;
-            mcpCall?: EvaluationPipelineResult["mcpCall"];
-          }>({
-            plugin: catalogPlugin,
-            organizationId: requiredRuntimeScope(input.organizationId, "organization"),
-            userId: requiredRuntimeScope(input.userId, "user"),
-            event,
-            payload: {
-              request: input.request,
-              policies: input.policies,
-              computerId: input.computerId,
-              runtimeId: input.runtimeId,
-              conversationEventId: input.conversationEventId,
-            },
-            capabilities,
-          });
-          return {
-            results: output.results ?? [],
-            runs: output.runs ?? (output.run ? [output.run] : []),
-            model: output.model ?? "none",
-            mcpCall: output.mcpCall,
-          };
+          if (plugin.id === "openleash.sensitive-access") {
+            const result = await runSensitiveAccess(input, capabilities);
+            return { results: result.results, runs: [result.run], model: "none" };
+          }
+          if (plugin.id === "openleash.code-scanner") {
+            const run = await runCodeScanner(
+              input.request,
+              event,
+              capabilities,
+              input.plugins?.get(plugin.id)?.config,
+            );
+            return { results: [], runs: [run], model: String(run.metadata?.evaluatedBy ?? "none") };
+          }
+          if (plugin.id === "openleash.blast-radius") {
+            const result = await runBlastRadius(input, capabilities);
+            return { results: result.results, runs: [result.run], model: "none" };
+          }
+          if (plugin.id === "openleash.rules-enforcer") {
+            const result = await runSecurityEvaluator(input, capabilities);
+            return { results: result.results, runs: [result.run], model: result.model };
+          }
+          if (plugin.id === "openleash.mcp-scanner") {
+            const result = await runMcpScanner(input, capabilities);
+            return { results: [], runs: [result.run], model: "none", mcpCall: result.call };
+          }
+          return { results: [], runs: [], model: "none" };
         } catch (error) {
           const failure = pluginFailureRun(plugin, event, error);
           if ((plugin.execution?.failureMode ?? "closed") === "closed") {
@@ -278,7 +272,7 @@ function pluginFailureApprovalExplanation(
   error: unknown,
 ) {
   const diagnostic = error instanceof Error ? error.message : String(error);
-  return `${pluginSlug(plugin)} could not complete its safety check: ${diagnostic}. OpenLeash is holding the action for your approval.`;
+  return `${pluginSlug(plugin)} could not complete its safety check: ${diagnostic}. Leash is holding the action for your approval.`;
 }
 
 function pluginFailureRun(
@@ -294,21 +288,12 @@ function pluginFailureRun(
   };
 }
 
-function requiredRuntimeScope(value: string | undefined, label: string) {
-  if (!value) throw new Error(`container plugin execution requires ${label} scope`);
-  return value;
-}
-
 function enabledPluginsForEvent(
   event: PipelineEvent,
   settings?: Map<string, PluginSettingState>,
   agentKind?: string,
 ) {
   const plugins = pluginsForEvent(event)
-    // This runtime is the managed/backend executor. Edge-only images are owned
-    // by the desktop; "either" runs here only when no correlated edge result
-    // was supplied with the event.
-    .filter((plugin) => plugin.execution?.placement !== "edge")
     .filter(
       (plugin) =>
         plugin.executionEnvironment !== "cloud-only" ||
@@ -361,8 +346,8 @@ function promptPipelineSummary(
       parts.push(`detected ${dlp.categories.join(", ") || "sensitive data"}`);
     else parts.push("data-leakage-prevention checked the prompt");
   }
-  if (parts.length === 0) return "No prompt plugins were enabled.";
+  if (parts.length === 0) return "No prompt Features were enabled.";
   if (finalPrompt !== originalPrompt)
-    return `OpenLeash ${parts.join(" and ")}.`;
-  return `OpenLeash ${parts.join(" and ")}. Prompt was unchanged.`;
+    return `Leash ${parts.join(" and ")}.`;
+  return `Leash ${parts.join(" and ")}. Prompt was unchanged.`;
 }

@@ -1,4 +1,4 @@
-export type OpenLeashProductModeId = "individual-open-source" | "private-cloud" | "openleash-cloud";
+export type OpenLeashProductModeId = "individual-open-source" | "leash-cloud";
 
 export type OpenLeashCapability =
   | "singleUserRuntime"
@@ -22,9 +22,10 @@ export type OpenLeashProductMode = {
 };
 
 const coreCapabilities = {
+  singleUserRuntime: true,
   clientRuntime: true,
   pluginRuntime: true,
-  publicPluginCatalog: true,
+  publicPluginCatalog: false,
   desktopUpdates: true
 } satisfies Partial<Record<OpenLeashCapability, boolean>>;
 
@@ -43,7 +44,7 @@ export function openLeashProductModeFromEnv(env: NodeJS.ProcessEnv = process.env
   if (raw.includes("individual") || raw.includes("open-source") || raw.includes("opensource") || raw.includes("community") || raw.includes("personal")) {
     return {
       id: "individual-open-source",
-      label: "Individual Open Source",
+      label: "Personal Open Source",
       accountScope: "single-user",
       capabilities: capabilities({
         ...coreCapabilities,
@@ -52,36 +53,14 @@ export function openLeashProductModeFromEnv(env: NodeJS.ProcessEnv = process.env
       })
     };
   }
-  if (raw.includes("private") || raw.includes("self-host") || raw.includes("selfhost") || raw.includes("enterprise") || raw.includes("onprem") || raw.includes("on-prem")) {
-    return {
-      id: "private-cloud",
-      label: "Private Cloud",
-      accountScope: "organization",
-      capabilities: capabilities({
-        ...coreCapabilities,
-        singleUserRuntime: false,
-        orgManagement: true,
-        dashboard: true,
-        identityProviders: true,
-        deploymentTokens: true,
-        fleetVisibility: true,
-        cloudTenancy: false,
-        billing: false
-      })
-    };
-  }
   return {
-    id: "openleash-cloud",
-    label: "OpenLeash Cloud",
-    accountScope: "multi-tenant",
+    id: "leash-cloud",
+    label: "Leash Cloud",
+    accountScope: "single-user",
     capabilities: capabilities({
       ...coreCapabilities,
-      singleUserRuntime: false,
-      orgManagement: true,
-      dashboard: true,
-      identityProviders: true,
-      deploymentTokens: true,
-      fleetVisibility: true,
+      ...disabledOrgCapabilities,
+      singleUserRuntime: true,
       cloudTenancy: true,
       billing: true
     })
@@ -102,33 +81,28 @@ export function publicProductMode(mode: OpenLeashProductMode) {
 }
 
 export function isOrganizationManagedAccount(
-  mode: OpenLeashProductMode,
-  audience: string | undefined,
+  _mode: OpenLeashProductMode,
+  _audience: string | undefined,
 ) {
-  return mode.id === "private-cloud" || audience === "organization";
+  return false;
 }
 
 export function pluginExecutionAvailable(
   mode: OpenLeashProductMode,
   executionEnvironment: "any" | "cloud-only" | undefined,
 ) {
-  return executionEnvironment !== "cloud-only" || mode.id === "openleash-cloud";
+  return executionEnvironment !== "cloud-only" || mode.id === "leash-cloud";
 }
 
 export function pluginImageDigestRequired(
-  mode: OpenLeashProductMode,
-  plugin: {
+  _mode: OpenLeashProductMode,
+  _plugin: {
     publisher?: string;
     source?: string;
     packageUrl?: string;
   },
 ) {
-  if (plugin.publisher === "openleash") return false;
-  const localDevelopmentPlugin =
-    mode.id === "individual-open-source" &&
-    plugin.source === "private" &&
-    plugin.packageUrl?.startsWith("file:") === true;
-  return !localDevelopmentPlugin;
+  return false;
 }
 
 function capabilities(partial: Partial<Record<OpenLeashCapability, boolean>>): Record<OpenLeashCapability, boolean> {

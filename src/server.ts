@@ -64,7 +64,11 @@ import { firstPartyPluginManifests } from "./plugins/registry.js";
 import { eventForHookEvent } from "./plugins/events.js";
 import { runEvaluationPipeline, runPromptPipeline } from "./plugins/runtime.js";
 import { createPluginCapabilities } from "./plugins/capabilities.js";
-import { executeContainerPluginEvent, executeContainerPluginTool, transformWithContainerPlugins, verifyContainerPluginRuntime } from "./plugins/container-runtime.js";
+import {
+  transformProviderRequestWithFeatures,
+  verifyBuiltinFeatureRegistry,
+} from "./plugins/feature-runtime.js";
+import { runSkillScanner } from "./plugins/skill-scanner/index.js";
 import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
 import { normalizePluginSettingProfiles, resolvePluginSettingProfiles } from "./plugins/settings-profiles.js";
 import {
@@ -357,13 +361,18 @@ const eventSchema = z.object({
 app.get("/health", (_req, res) =>
   res.json({
     ok: true,
-    service:
-      apiSurface === "dashboard"
-        ? "openleash-dashboard-api"
-        : "openleash-client-api",
+    service: "leash-client-api",
     surface: apiSurface,
     productMode: publicProductMode(productMode),
-    apiContracts: OPENLEASH_API_CONTRACTS,
+    apiContracts: Object.fromEntries(
+      Object.entries(OPENLEASH_API_CONTRACTS).filter(([name]) =>
+        !name.startsWith("admin") &&
+        !name.startsWith("organizations") &&
+        name !== "organizationSsoProviders" &&
+        name !== "authSsoAuthorize" &&
+        name !== "authSsoCallback",
+      ),
+    ),
   }),
 );
 
@@ -825,11 +834,8 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
     const token = tokenFromRequest(req);
     const user = token ? await getUserByToken(token) : undefined;
     if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
-    if (!user.organization_id) {
-      return res.status(409).json({
-        error: "container plugins require an organization-scoped runtime",
-      });
-    }
+    const organizationId =
+      user.organization_id ?? (await ensureDefaultOrganization()).id;
     const requestBody = req.body?.requestBody;
     if (!requestBody || typeof requestBody !== "object" || Array.isArray(requestBody)) {
       return res.status(400).json({ error: "requestBody must be a JSON object" });
@@ -856,23 +862,37 @@ app.post("/v1/plugin-runtime/transform", async (req, res, next) => {
       });
     }
     const catalog = await pluginCatalogForOrganization(
-      user.organization_id,
+      organizationId,
       user.id,
       { agentKind, agentId, projectPath },
     );
-    const result = await transformWithContainerPlugins({
-      plugins: catalog.plugins,
-      organizationId: user.organization_id,
+    const [config, tenantModelKey] = await Promise.all([
+      readPromptTransformConfig(
+        organizationId,
+        user.id,
+        agentKind,
+        agentId,
+        projectPath,
+      ),
+      tenantModelKeyForEvaluation(organizationId),
+    ]);
+    const result = await transformProviderRequestWithFeatures({
+      requestBody: requestBody as Record<string, unknown>,
+      config,
+      plugins: new Map(catalog.plugins.map((feature) => [feature.id, feature.settings])),
+      tenantModelKey,
+      organizationId,
       userId: user.id,
       provider,
       agentKind,
       sessionId,
       projectPath,
-      payload: requestBody,
+      agentId,
     });
     res.json({
       protocol: "openleash-container-plugin.v1",
-      requestBody: result.payload,
+      runtime: "in-process",
+      requestBody: result.requestBody,
       appliedPluginIds: result.appliedPluginIds,
       runs: result.runs,
     });
@@ -892,27 +912,15 @@ app.post("/v1/plugin-runtime/verify", async (req, res, next) => {
       organizationId,
       user.id,
     );
-    const plugins = catalog.plugins.filter((plugin) =>
-      plugin.settings.enabled &&
-      plugin.settings.runtimeAvailable !== false &&
-      plugin.runtime === "container" &&
-      plugin.execution?.type === "container" &&
-      plugin.execution.placement !== "edge"
-    );
-    const results = await Promise.all(
-      plugins.map((plugin) => verifyContainerPluginRuntime({
-        plugin,
-        organizationId,
-        userId: user.id,
-      })),
-    );
+    const plugins = catalog.plugins.filter((feature) => feature.settings.enabled);
+    const results = verifyBuiltinFeatureRegistry(plugins);
     const failed = results.filter((result) => !result.protocolVerified);
     const body = {
       ok: failed.length === 0,
       plugins: results,
       verifiedAt: new Date().toISOString(),
       ...(failed.length > 0 ? {
-        error: `Plugin runtime verification failed for ${failed.map((item) => item.pluginId).join(", ")}.`,
+        error: `Feature runtime verification failed for ${failed.map((item) => item.pluginId).join(", ")}.`,
       } : {}),
     };
     return res.status(failed.length > 0 ? 503 : 200).json(body);
@@ -926,7 +934,8 @@ app.post("/v1/plugin-runtime/tools/execute", async (req, res, next) => {
     const token = tokenFromRequest(req);
     const user = token ? await getUserByToken(token) : undefined;
     if (!user) return res.status(401).json({ error: "invalid OpenLeash token" });
-    if (!user.organization_id) return res.status(409).json({ error: "container plugins require an organization-scoped runtime" });
+    const organizationId =
+      user.organization_id ?? (await ensureDefaultOrganization()).id;
     const pluginId = String(req.body?.pluginId ?? "").trim();
     const tool = String(req.body?.tool ?? "").trim();
     const args = req.body?.arguments;
@@ -941,21 +950,15 @@ app.post("/v1/plugin-runtime/tools/execute", async (req, res, next) => {
     );
     const projectPath = optionalString(req.body?.projectPath);
     const catalog = await pluginCatalogForOrganization(
-      user.organization_id,
+      organizationId,
       user.id,
       { agentKind, agentId, projectPath },
     );
     const plugin = catalog.plugins.find((candidate) => candidate.id === pluginId);
     if (!plugin) return res.status(404).json({ error: "enabled plugin not found" });
-    const result = await executeContainerPluginTool({
-      plugin,
-      organizationId: user.organization_id,
-      userId: user.id,
-      sessionId: String(req.body?.sessionId ?? "proxy"),
-      tool,
-      arguments: args as Record<string, unknown>,
+    return res.status(404).json({
+      error: `The built-in Feature ${plugin.name} does not expose the legacy runtime tool ${tool}.`,
     });
-    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -2819,7 +2822,7 @@ app.get("/auth/google/callback", (req, res) => {
     return res
       .status(400)
       .send(
-        "OpenLeash sign-in could not continue because the return URL is invalid.",
+        "Leash sign-in could not continue because the return URL is invalid.",
       );
   }
 
@@ -2843,7 +2846,7 @@ app.get("/auth/microsoft/callback", (req, res) => {
     return res
       .status(400)
       .send(
-        "OpenLeash sign-in could not continue because the return URL is invalid.",
+        "Leash sign-in could not continue because the return URL is invalid.",
       );
   }
 
@@ -3144,7 +3147,7 @@ app.get("/v1/mobile/dev-auth/callback", (req, res) => {
     return res
       .status(400)
       .send(
-        "OpenLeash sign-in could not continue because the return URL is invalid.",
+        "Leash sign-in could not continue because the return URL is invalid.",
       );
   }
   const redirect = new URL(redirectUri);
@@ -3167,7 +3170,7 @@ app.get("/v1/auth/google/callback", (req, res) => {
     return res
       .status(400)
       .send(
-        "OpenLeash sign-in could not continue because the return URL is invalid.",
+        "Leash sign-in could not continue because the return URL is invalid.",
       );
   }
 
@@ -3193,7 +3196,7 @@ app.get("/v1/auth/microsoft/callback", (req, res) => {
     return res
       .status(400)
       .send(
-        "OpenLeash sign-in could not continue because the return URL is invalid.",
+        "Leash sign-in could not continue because the return URL is invalid.",
       );
   }
 
@@ -3219,7 +3222,7 @@ app.get("/v1/auth/github/callback", (req, res) => {
     return res
       .status(400)
       .send(
-        "OpenLeash sign-in could not continue because the return URL is invalid.",
+        "Leash sign-in could not continue because the return URL is invalid.",
       );
   }
 
@@ -4941,18 +4944,7 @@ app.post("/v1/skills/observations", async (req, res, next) => {
     );
     const skillScannerSettings = runtimePlugins.get("openleash.skill-scanner");
     const skillScan = shouldScanSkill && skillScannerManifest && skillScannerSettings
-      ? await executeContainerPluginEvent<{
-          status: "observed" | "suspicious";
-          riskScore: number;
-          reasons: Array<{ reason: string; quote?: string }>;
-          findings: PluginFinding[];
-          run?: PluginRunRecord;
-        }>({
-          plugin: { ...skillScannerManifest, settings: skillScannerSettings },
-          organizationId,
-          userId: user.id,
-          event: pipelineSkillEvent,
-          payload: {
+      ? await runSkillScanner({
             event: pipelineSkillEvent,
             agentKind,
             agentName,
@@ -4963,16 +4955,14 @@ app.post("/v1/skills/observations", async (req, res, next) => {
             status: body.status,
             riskScore: body.riskScore,
             reasons,
-          },
-          capabilities: createPluginCapabilities({
+          }, createPluginCapabilities({
             organizationId,
             pluginId: "openleash.skill-scanner",
             userId: user.id,
             tenantModelKey,
             request: skillScanRequest,
             permissions: skillScannerManifest.permissions,
-          }),
-        })
+          }))
       : {
           status:
             skillEventType === "removed"
@@ -5090,8 +5080,8 @@ app.post("/v1/skills/observations", async (req, res, next) => {
           [
             event.rows[0].id,
             user.id,
-            "OpenLeash detected a possibly malicious agent skill.",
-            "OpenLeash detected a possibly malicious agent skill. Delete this skill or approve it?",
+            "Leash detected a possibly malicious agent skill.",
+            "Leash detected a possibly malicious agent skill. Delete this skill or approve it?",
           ],
         );
         evaluationId = evaluation.rows[0].id;
@@ -5596,6 +5586,27 @@ app.get("/v1/plugins", async (req, res, next) => {
   }
 });
 
+// Compatibility tombstone: Leash ships a closed set of built-in Features.
+// These former marketplace and upload endpoints remain explicit so old clients
+// receive a deterministic migration response instead of finding a shadow API.
+app.all([
+  "/v1/plugin-marketplace",
+  "/public/plugins",
+  "/public/plugins/:slug",
+  "/admin/plugin-marketplace",
+  "/admin/plugin-marketplace/policy",
+  "/admin/plugin-releases",
+  "/admin/plugin-releases/:id/approve",
+  "/admin/plugin-releases/:id/reject",
+  "/admin/plugin-releases/:id/yank",
+  "/v1/plugin-submissions",
+  "/v1/plugin-releases",
+], (_req, res) => {
+  res.status(410).json({
+    error: "Leash Features are built in. The plugin marketplace and third-party upload API have been retired.",
+  });
+});
+
 app.get("/v1/plugin-marketplace", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(
@@ -5794,15 +5805,16 @@ app.post("/v1/plugins/:pluginId/install", async (req, res, next) => {
     );
     if (!session)
       return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await installMarketplacePluginForUser(
+    const result = await savePluginSettingsForUser(
       session.organization.id,
       session.user.id,
       req.params.pluginId,
+      { enabled: true },
     );
     if (!result)
       return res
         .status(404)
-        .json({ error: "plugin not found or not installable" });
+        .json({ error: "Feature not found" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -5816,15 +5828,15 @@ app.post("/v1/plugins/:pluginId/update", async (req, res, next) => {
     );
     if (!session)
       return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await updateMarketplacePluginForUser(
+    const catalog = await pluginCatalogForOrganization(
       session.organization.id,
       session.user.id,
-      req.params.pluginId,
     );
+    const result = catalog.plugins.find((feature) => feature.id === req.params.pluginId);
     if (!result)
       return res
         .status(404)
-        .json({ error: "plugin not found or not installed" });
+        .json({ error: "Feature not found" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -5838,13 +5850,14 @@ app.post("/v1/plugins/:pluginId/uninstall", async (req, res, next) => {
     );
     if (!session)
       return res.status(401).json({ error: "invalid OpenLeash session" });
-    const result = await uninstallMarketplacePluginForUser(
+    const result = await savePluginSettingsForUser(
       session.organization.id,
       session.user.id,
       req.params.pluginId,
+      { enabled: false },
     );
     if (!result)
-      return res.status(404).json({ error: "plugin not found or mandatory" });
+      return res.status(404).json({ error: "Feature not found" });
     res.json(result);
   } catch (error) {
     next(error);
@@ -5998,7 +6011,7 @@ async function handlePromptOnlyHook(
       : (blockingResult?.explanation ??
         reviewResult?.explanation ??
         promptResult?.summary ??
-        "OpenLeash logged this prompt intent.");
+        "Leash logged this prompt intent.");
   const question =
     reviewResult?.question ??
     (decision === "ask"
@@ -6058,7 +6071,7 @@ async function handlePromptOnlyHook(
     });
   } else if (decision === "deny") {
     notifyMobileEvent(user.id, {
-      title: "OpenLeash blocked an agent action",
+      title: "Leash blocked an agent action",
       body: summary,
       data: { decisionId: evaluation.rows[0].id, kind: "blocked" },
     }).catch((error) => {
@@ -6194,54 +6207,27 @@ async function pluginCatalogForOrganization(
   options: { agentKind?: string; agentId?: string; projectPath?: string } = {},
 ): Promise<{
   plugins: PluginCatalogItem[];
-  marketplacePolicy: MarketplacePolicyRecord;
 }> {
-  const [settings, userSettings, approvedReleaseRows] = await Promise.all([
+  const [settings, userSettings] = await Promise.all([
     readPluginSettings(organizationId),
     userId
       ? readUserPluginSettings(organizationId, userId)
       : Promise.resolve(new Map<string, PluginSettingRecord>()),
-    pool.query(
-      `select * from plugin_releases where review_status = 'approved'`,
-    ),
   ]);
-  const approvedReleases = new Map<string, OpenLeashPluginManifest>(
-    approvedReleaseRows.rows.map((row) => {
-      const release = pluginReleaseFromRow(row);
-      return [`${release.pluginId}@${release.version}`, pluginManifestFromRelease(release)];
-    }),
-  );
-  const policy = await readOrganizationPluginPolicy(organizationId);
-  const marketplacePolicy =
-    await readOrganizationMarketplacePolicy(organizationId);
-  const marketplace = await readMarketplaceListings("");
-  const marketplaceById = new Map(marketplace.map((item) => [item.id, item]));
-  const manifestsById = new Map(
-    firstPartyPluginManifests.map((manifest) => [manifest.id, manifest]),
-  );
-  const ids = new Set([...marketplaceById.keys(), ...manifestsById.keys()]);
   return {
-    marketplacePolicy,
-    plugins: [...ids]
-      .map((pluginId) => {
-        const listing = marketplaceById.get(pluginId);
-        const manifest = manifestsById.get(pluginId) ?? listing;
-        if (!manifest) return undefined;
-        return pluginCatalogItem(
-          manifest,
-          settings.get(pluginId),
-          userSettings.get(pluginId),
-          listing,
-          policy.get(pluginId),
-          marketplacePolicy,
-          approvedReleases,
-          options.agentKind,
-          options.agentId,
-          options.projectPath,
-          Boolean(userId),
-        );
-      })
-      .filter((item): item is PluginCatalogItem => Boolean(item)),
+    plugins: firstPartyPluginManifests.map((manifest) => pluginCatalogItem(
+      manifest,
+      settings.get(manifest.id),
+      userSettings.get(manifest.id),
+      undefined,
+      undefined,
+      undefined,
+      new Map(),
+      options.agentKind,
+      options.agentId,
+      options.projectPath,
+      Boolean(userId),
+    )),
   };
 }
 
@@ -6258,31 +6244,21 @@ function pluginCatalogItem(
   projectPath?: string,
   userScoped = false,
 ): PluginCatalogItem {
-  const baseEnabled = pluginEnabledForUser({
-    policy,
-    organizationSettings,
-    userSettings,
-  });
-  const configLocked = Boolean(policy?.configLocked);
-  const availableVersion = marketplace?.version ?? manifest.version;
+  const baseEnabled =
+    userSettings?.enabled ??
+    organizationSettings?.enabled ??
+    Boolean(manifest.defaultConfig?.enabled);
+  const configLocked = false;
+  const availableVersion = manifest.version;
   const installedVersion =
     userSettings?.installedVersion ??
       organizationSettings?.installedVersion ??
     (baseEnabled ? availableVersion : undefined);
-  const selectedRelease = installedVersion && installedVersion !== manifest.version
-    ? approvedReleases.get(`${manifest.id}@${installedVersion}`)
-    : undefined;
-  const executableRelease = selectedRelease?.runtime === "container" &&
-    selectedRelease.execution?.type === "container"
-    ? selectedRelease
-    : undefined;
-  const selectedManifest = executableRelease ?? manifest;
-  const releaseAvailable = (!installedVersion || installedVersion === manifest.version)
-    ? validContainerManifest(
-        manifest,
-        pluginImageDigestRequired(productMode, marketplace ?? manifest),
-      )
-    : Boolean(executableRelease && validContainerManifest(executableRelease, true));
+  const selectedManifest = manifest;
+  const releaseAvailable =
+    manifest.runtime === "builtin" &&
+    manifest.execution?.type === "in-process" &&
+    manifest.entrypoint === "client-api";
   const environmentAvailable = pluginExecutionAvailable(productMode, selectedManifest.executionEnvironment);
   const runtimeAvailable = releaseAvailable && environmentAvailable;
   const baseConfig = {
@@ -6318,8 +6294,8 @@ function pluginCatalogItem(
       runtimeAvailable,
       ...(runtimeAvailable ? {} : {
         runtimeError: environmentAvailable
-          ? `Installed plugin version ${installedVersion} has no approved executable release.`
-          : `${selectedManifest.name} runs only in OpenLeash Cloud and is unavailable in ${productMode.label}.`,
+          ? `${selectedManifest.name} has no registered built-in Feature handler.`
+          : `${selectedManifest.name} runs only in Leash Cloud and is unavailable in ${productMode.label}.`,
       }),
       orderingPriority:
         userSettings?.orderingPriority ??
@@ -6334,17 +6310,6 @@ function pluginCatalogItem(
         organizationSettings?.updatePolicy ??
         "manual",
       updatedAt: userSettings?.updatedAt ?? organizationSettings?.updatedAt,
-    },
-    organizationPolicy: {
-      mandatory: Boolean(policy?.mandatory),
-      defaultEnabled: Boolean(policy?.defaultEnabled ?? false),
-      userInstallAllowed: Boolean(
-        (manifest.publisher === "openleash" || marketplacePolicy?.allowUserCommunityPlugins !== false) &&
-        (policy?.userInstallAllowed ??
-          marketplacePolicy?.allowUserMarketplaceInstalls ??
-          true),
-      ),
-      configLocked,
     },
   };
 }
@@ -6376,26 +6341,17 @@ function assertPluginExecutionAvailable(
   manifest: OpenLeashPluginManifest,
   marketplace?: unknown,
 ) {
-  const pluginDescriptor =
-    marketplace && typeof marketplace === "object"
-      ? (marketplace as {
-          publisher?: string;
-          source?: string;
-          packageUrl?: string;
-        })
-      : manifest;
   if (
-    !validContainerManifest(
-      manifest,
-      pluginImageDigestRequired(productMode, pluginDescriptor),
-    )
+    manifest.runtime !== "builtin" ||
+    manifest.execution?.type !== "in-process" ||
+    manifest.entrypoint !== "client-api"
   ) {
-    throw new HttpError(409, `${manifest.name} has no approved container runtime.`);
+    throw new HttpError(409, `${manifest.name} has no registered built-in Feature handler.`);
   }
   if (pluginExecutionAvailable(productMode, manifest.executionEnvironment)) return;
   throw new HttpError(
     409,
-    `${manifest.name} runs only in OpenLeash Cloud and is unavailable in ${productMode.label}.`,
+    `${manifest.name} runs only in Leash Cloud and is unavailable in ${productMode.label}.`,
   );
 }
 
@@ -6488,70 +6444,30 @@ async function savePluginSettingsForUser(
   pluginId: string,
   body: Record<string, unknown>,
 ) {
-  const manifest = await manifestForPluginId(pluginId, body.marketplace);
+  const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
-  const [policy, marketplacePolicy, organizationSettings, currentUserSettings] = await Promise.all([
-    readOrganizationPluginPolicy(organizationId),
-    readOrganizationMarketplacePolicy(organizationId),
+  const [organizationSettings, currentUserSettings] = await Promise.all([
     readPluginSettings(organizationId),
     readUserPluginSettings(organizationId, userId),
   ]);
-  const pluginPolicy = policy.get(manifest.id);
   const organizationSetting = organizationSettings.get(manifest.id);
   const currentUserSetting = currentUserSettings.get(manifest.id);
   const requestedProfiles = Array.isArray(body.profiles)
     ? normalizePluginSettingProfiles(body.profiles)
     : undefined;
-  const currentlyEnabled = pluginEnabledForUser({
-    policy: pluginPolicy,
-    organizationSettings: organizationSetting,
-    userSettings: currentUserSetting,
-  });
-  const enabled = pluginPolicy?.mandatory
-    ? true
-    : typeof body.enabled === "boolean"
-      ? body.enabled
-      : currentlyEnabled;
-  const installing = !currentlyEnabled && enabled;
-  const uninstalling = currentlyEnabled && !enabled;
-  const configuring = body.config !== undefined || body.profiles !== undefined || body.orderingPriority !== undefined;
-  if (installing || requestedProfiles?.some((profile) => profile.enabled === true)) {
+  const currentlyEnabled = currentUserSetting?.enabled ??
+    organizationSetting?.enabled ??
+    Boolean(manifest.defaultConfig?.enabled);
+  const enabled = typeof body.enabled === "boolean" ? body.enabled : currentlyEnabled;
+  if ((!currentlyEnabled && enabled) || requestedProfiles?.some((profile) => profile.enabled === true)) {
     assertPluginExecutionAvailable(manifest, body.marketplace);
   }
-  const providedByOrganization = pluginProvidedByOrganization({
-    policy: pluginPolicy,
-    organizationSettings: organizationSetting,
-  });
-  if (installing && !canUserInstallPlugin({
-    policy: pluginPolicy,
-    allowUserMarketplaceInstalls: marketplacePolicy.allowUserMarketplaceInstalls,
-    allowUserCommunityPlugins: marketplacePolicy.allowUserCommunityPlugins,
-    firstParty: manifest.publisher === "openleash",
-    providedByOrganization,
-  })) {
-    throw new HttpError(403, "Your organization does not allow installing this plugin.");
-  }
-  if (uninstalling && !canUserUninstallPlugin(pluginPolicy)) {
-    throw new HttpError(403, "This plugin is required by your organization.");
-  }
-  if (configuring && !installing && !uninstalling && !canUserConfigurePlugin({ enabled: currentlyEnabled, policy: pluginPolicy })) {
-    throw new HttpError(
-      403,
-      pluginPolicy?.configLocked
-        ? "Plugin settings are managed by your organization."
-        : "Install this plugin before changing its settings.",
-    );
-  }
-  const config = pluginPolicy?.configLocked
-    ? (currentUserSetting?.config ?? {})
-    : body.config &&
+  const config = body.config &&
         typeof body.config === "object" &&
         !Array.isArray(body.config)
       ? (body.config as Record<string, unknown>)
       : (currentUserSetting?.config ?? {});
-  const orderingPriority = pluginPolicy?.configLocked
-    ? (currentUserSetting?.orderingPriority ?? organizationSetting?.orderingPriority ?? manifest.ordering?.priority ?? null)
-    : Number.isFinite(Number(body.orderingPriority))
+  const orderingPriority = Number.isFinite(Number(body.orderingPriority))
       ? Number(body.orderingPriority)
       : (currentUserSetting?.orderingPriority ?? organizationSetting?.orderingPriority ??
         manifest.ordering?.priority ??
@@ -6559,9 +6475,7 @@ async function savePluginSettingsForUser(
   const requestedInstalledVersion = optionalString(body.installedVersion);
   const availableVersion = manifest.version;
   const updatePolicy = pluginUpdatePolicy(body.updatePolicy);
-  const profiles = pluginPolicy?.configLocked
-    ? (currentUserSetting?.profiles ?? [])
-    : requestedProfiles
+  const profiles = requestedProfiles
     ? requestedProfiles
     : (currentUserSetting?.profiles ?? []);
   const result = await pool.query<{
@@ -6617,8 +6531,8 @@ async function savePluginSettingsForUser(
         updatedAt: stored.updated_at,
       },
       undefined,
-      pluginPolicy,
-      marketplacePolicy,
+      undefined,
+      undefined,
       new Map(),
       undefined,
       undefined,
@@ -6803,24 +6717,11 @@ function normalizedPluginRepositoryUrl(
 
 async function manifestForPluginId(
   pluginId: string,
-  marketplaceInput?: unknown,
+  _marketplaceInput?: unknown,
 ): Promise<OpenLeashPluginManifest | undefined> {
-  const firstParty = firstPartyPluginManifests.find(
+  return firstPartyPluginManifests.find(
     (plugin) => plugin.id === pluginId,
   );
-  if (firstParty) return firstParty;
-  const rows = await pool.query(
-    "select * from plugin_marketplace where plugin_id = $1 and review_status = 'approved'",
-    [pluginId],
-  );
-  const listing = rows.rows[0]
-    ? marketplaceListingFromRow(rows.rows[0])
-    : undefined;
-  if (listing) return listing;
-  const imported = marketplaceListingFromInput(pluginId, marketplaceInput);
-  if (!imported) return undefined;
-  await upsertLocalMarketplaceListing(imported);
-  return imported;
 }
 
 async function installMarketplacePluginForUser(
@@ -6828,26 +6729,8 @@ async function installMarketplacePluginForUser(
   userId: string,
   pluginId: string,
 ) {
-  const [policy, organizationPolicies, organizationSettings] = await Promise.all([
-    readOrganizationMarketplacePolicy(organizationId),
-    readOrganizationPluginPolicy(organizationId),
-    readPluginSettings(organizationId),
-  ]);
-  const pluginPolicy = organizationPolicies.get(pluginId);
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
-  if (!canUserInstallPlugin({
-    policy: pluginPolicy,
-    allowUserMarketplaceInstalls: policy.allowUserMarketplaceInstalls,
-    allowUserCommunityPlugins: policy.allowUserCommunityPlugins,
-    firstParty: manifest.publisher === "openleash",
-    providedByOrganization: pluginProvidedByOrganization({
-      policy: pluginPolicy,
-      organizationSettings: organizationSettings.get(pluginId),
-    }),
-  })) {
-    throw new HttpError(403, "Your organization manages installs for this plugin.");
-  }
   return savePluginSettingsForUser(organizationId, userId, pluginId, {
     enabled: true,
     config: {
@@ -6872,7 +6755,7 @@ function marketplaceListingFromInput(
   const description =
     optionalString(value.description) ||
     optionalString(value.shortDescription) ||
-    "OpenLeash plugin.";
+    "Leash plugin.";
   const version = optionalString(value.version) || "0.0.0";
   const publisher = optionalString(value.publisher) || "openleash";
   const runtime = optionalString(value.runtime) as
@@ -6885,7 +6768,7 @@ function marketplaceListingFromInput(
   );
   const developerName =
     optionalString(value.developerName) ||
-    (publisher === "openleash" ? "OpenLeash" : titleize(publisher));
+    (publisher === "openleash" ? "Leash" : titleize(publisher));
   return {
     id,
     slug,
@@ -7047,11 +6930,6 @@ async function uninstallMarketplacePluginForUser(
   userId: string,
   pluginId: string,
 ) {
-  const pluginPolicy = (await readOrganizationPluginPolicy(organizationId)).get(
-    pluginId,
-  );
-  if (pluginPolicy?.mandatory)
-    throw new HttpError(403, "Required organization plugins cannot be removed.");
   const manifest = await manifestForPluginId(pluginId);
   if (!manifest) return undefined;
   return savePluginSettingsForUser(organizationId, userId, pluginId, {
@@ -7585,7 +7463,7 @@ function pluginReleaseFieldsFromManifest(
     );
   }
   if (manifest.runtime !== "container") {
-    throw new HttpError(400, "OpenLeash plugins must use the container runtime.");
+    throw new HttpError(400, "Leash plugins must use the container runtime.");
   }
   const runtime: OpenLeashPluginManifest["runtime"] = "container";
   const executionEnvironment = manifest.executionEnvironment === "cloud-only" ? "cloud-only" : "any";
@@ -8001,7 +7879,7 @@ async function recordContainerRuntimeRuns(input: {
     const manifest = await manifestForPluginId(pluginId);
     if (
       !manifest ||
-      manifest.execution?.type !== "container" ||
+      manifest.execution?.type !== "in-process" ||
       runtimeSettings.get(pluginId)?.enabled !== true
     ) continue;
     const sourceStatus = String(run.status ?? "failed");
@@ -8012,9 +7890,9 @@ async function recordContainerRuntimeRuns(input: {
         : sourceStatus === "skipped"
           ? "skipped"
           : "passed";
-    const summary = String(run.summary ?? `Container plugin ${sourceStatus}.`).slice(0, 2_000);
+    const summary = String(run.summary ?? `Feature ${sourceStatus}.`).slice(0, 2_000);
     const metadata = {
-      runtime: "container",
+      runtime: "in-process",
       metrics: run.metrics && typeof run.metrics === "object" ? run.metrics : undefined,
       ccrHashes: Array.isArray(run.ccrHashes) ? run.ccrHashes.slice(0, 32) : undefined,
     };
@@ -8029,7 +7907,7 @@ async function recordContainerRuntimeRuns(input: {
     await pool.query(
       `insert into plugin_log_events
        (organization_id, plugin_id, conversation_event_id, user_id, computer_id, agent_runtime_id, level, category, code, message, data)
-       values ($1, $2, $3, $4, $5, $6, $7, 'plugin', 'container-runtime', $8, $9::jsonb)`,
+       values ($1, $2, $3, $4, $5, $6, $7, 'plugin', 'feature-runtime', $8, $9::jsonb)`,
       [
         input.organizationId,
         pluginId,
@@ -8316,7 +8194,7 @@ async function evaluateAndRecord(
     : nativeInteraction?.summary
       ? nativeInteraction.summary
     : (results.find((r) => r.status === "needs_question")?.explanation ??
-      "OpenLeash needs a human decision before continuing.");
+      "Leash needs a human decision before continuing.");
   const question = blockingResult
     ? `${approvalSummary} Allow this action once?`
     : nativeInteraction?.question
@@ -8450,7 +8328,7 @@ async function evaluateAndRecord(
     });
   } else if (decision === "deny") {
     notifyMobileEvent(user.id, {
-      title: "OpenLeash blocked an agent action",
+      title: "Leash blocked an agent action",
       body: summary,
       data: { decisionId: evaluation.rows[0].id, kind: "blocked" },
     }).catch((error) => {
@@ -8627,7 +8505,7 @@ function applyConfiguredRuleActions(
       status: "needs_question",
       question:
         result.question ??
-        "OpenLeash found a rule match. Allow this action once?",
+        "Leash found a rule match. Allow this action once?",
     };
   });
 }
@@ -8954,7 +8832,7 @@ async function waitForHookDecision(
         decision: row.resolution,
         summary:
           row.resolution === "allow"
-            ? "OpenLeash approved this action."
+            ? "Leash approved this action."
             : (row.summary ?? decision.summary),
         resolutionGuidance:
           row.resolution === "deny"
@@ -8972,7 +8850,7 @@ async function waitForHookDecision(
   return {
     ...decision,
     decision: "deny",
-    summary: "OpenLeash timed out waiting for approval.",
+    summary: "Leash timed out waiting for approval.",
     question: undefined,
   };
 }
@@ -9632,7 +9510,7 @@ async function ensureManagedMobileOrganization() {
      on conflict (slug) do update set updated_at = now()
      returning id, name, slug, region, setup_completed, current_step, deployment_mode`,
     [
-      process.env.OPENLEASH_MANAGED_MOBILE_ORG_NAME ?? "OpenLeash Managed Dev",
+      process.env.OPENLEASH_MANAGED_MOBILE_ORG_NAME ?? "Leash Managed Dev",
       slug,
       process.env.OPENLEASH_ORG_REGION ?? null,
       deploymentMode,
@@ -10302,7 +10180,7 @@ async function createDashboardSessionFromProfile({
     [firstName, lastName].filter(Boolean).join(" ") ||
     profile.name ||
     profile.email.split("@")[0] ||
-    "OpenLeash user";
+    "Leash user";
   const userEmail = profile.email.toLowerCase();
   const userResult = provisionUser
     ? await pool.query<{
@@ -11105,7 +10983,7 @@ async function notifyMobileApprovers(
         ? "An agent has a question"
         : kind === "plan_review"
           ? "An agent plan is ready"
-          : summary || "OpenLeash approval needed",
+          : summary || "Leash approval needed",
     body:
       [purposeSummary, question].filter(Boolean).join("\n") ||
       (kind === "question"
@@ -11350,7 +11228,7 @@ async function fetchGithubProfile(tokenSet: { access_token?: string }) {
   const headers = {
     authorization: `Bearer ${tokenSet.access_token}`,
     accept: "application/vnd.github+json",
-    "user-agent": "OpenLeash",
+    "user-agent": "Leash",
   };
   const [userResponse, emailResponse] = await Promise.all([
     fetch("https://api.github.com/user", { headers }),
@@ -12319,10 +12197,10 @@ function slug(value: string) {
 }
 
 function apiSurfaceFromEnv(): ApiSurface {
-  const value = String(
-    process.env.OPENLEASH_API_SURFACE ?? "client",
-  ).toLowerCase();
-  return value === "dashboard" || value === "all" ? value : "client";
+  // The public Leash service is permanently client-facing. Keep the exported
+  // union and option shape for source compatibility with older embedders, but
+  // never allow an environment variable to revive the retired dashboard API.
+  return "client";
 }
 
 function surfaceForRequest(
@@ -12815,7 +12693,7 @@ app.use(
     if (res.headersSent) return next(error);
     const statusCode = statusCodeForError(error);
     const message =
-      error instanceof Error ? error.message : "OpenLeash API error";
+      error instanceof Error ? error.message : "Leash API error";
     res.status(statusCode).json({ success: false, error: message, message });
   },
 );
@@ -12825,6 +12703,9 @@ export async function prepareOpenLeashApi(
 ) {
   const runningApp = options.app ?? app;
   const surface = options.surface ?? apiSurface;
+  if (surface !== "client") {
+    throw new Error("Leash no longer exposes a dashboard API surface");
+  }
   await ensureDevToken();
   for (const extension of options.extensions ?? []) {
     await extension({ app: runningApp, surface });
@@ -12837,19 +12718,9 @@ export async function startOpenLeashApi(
 ) {
   const runningApp = await prepareOpenLeashApi(options);
   const surface = options.surface ?? apiSurface;
-  const port = Number(
-    options.port ??
-      process.env.OPENLEASH_API_PORT ??
-      (surface === "dashboard"
-        ? (process.env.OPENLEASH_DASHBOARD_API_PORT ?? 9319)
-        : 9318),
-  );
+  const port = Number(options.port ?? process.env.OPENLEASH_API_PORT ?? 9318);
   return runningApp.listen(port, () => {
-    const label =
-      surface === "dashboard"
-        ? "OpenLeash dashboard API"
-        : "OpenLeash client API";
-    console.log(`${label} listening on http://localhost:${port}`);
+    console.log(`Leash client API listening on http://localhost:${port}`);
   });
 }
 

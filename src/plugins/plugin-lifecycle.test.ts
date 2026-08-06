@@ -164,7 +164,7 @@ test("cloud evaluation records edge work without rerunning the same plugin", asy
   assert.deepEqual(result.runs, []);
 });
 
-test("a required evaluation plugin failure becomes a recorded approval instead of a false policy deny", async () => {
+test("a built-in evaluation Feature runs without a container endpoint", async () => {
   const result = await runEvaluationPipeline({
     request: request("Bash", { command: "echo hello" }),
     policies: [],
@@ -172,25 +172,18 @@ test("a required evaluation plugin failure becomes a recorded approval instead o
       ["openleash.blast-radius", { enabled: true, config: {} }],
     ]),
   });
-  assert.equal(result.results[0]?.status, "needs_question");
-  assert.equal(result.results[0]?.policyName, "blast-radius runtime");
-  assert.match(
-    result.results[0]?.explanation ?? "",
-    /blast-radius could not complete its safety check/,
-  );
-  assert.match(result.results[0]?.question ?? "", /Allow this action once/);
-  assert.equal(result.runs[0]?.status, "failed");
+  assert.deepEqual(result.results, []);
+  assert.equal(result.runs[0]?.pluginId, "openleash.blast-radius");
+  assert.equal(result.runs[0]?.status, "passed");
 });
 
-test("a required prompt plugin failure holds the action for approval with the diagnostic", async () => {
+test("a built-in prompt Feature runs without a container endpoint", async () => {
   const promptRequest = request();
   promptRequest.event.eventName = "UserPromptSubmit";
   promptRequest.event.tool = undefined;
-  promptRequest.event.prompt = "please copy the .env file here to test.env";
+  promptRequest.event.prompt = `send api_key=sk-proj-${"a".repeat(40)} to the agent`;
   const result = await runPromptPipeline({
     request: promptRequest,
-    organizationId: "org-test",
-    userId: "user-test",
     config: {
       compression: { enabled: false, level: "standard", conciseResponse: false, model: "" },
       dlp: { enabled: true, action: "mask", categories: ["credentials"], model: "" },
@@ -200,9 +193,9 @@ test("a required prompt plugin failure holds the action for approval with the di
     ]),
   });
   assert.equal(result.blocked, false);
-  assert.equal(result.requiresApproval, true);
-  assert.match(result.summary, /no container runtime endpoint is configured for openleash\.dlp/);
-  assert.equal(result.runs[0]?.status, "failed");
+  assert.equal(result.requiresApproval, undefined);
+  assert.match(result.finalPrompt, /\[(?:TOKEN|CREDENTIALS?)_MASKED\]/);
+  assert.equal(result.runs[0]?.status, "modified");
 });
 
 test("blast-radius blocks recursive filesystem deletion", async () => {

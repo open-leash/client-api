@@ -14,26 +14,26 @@ test("individual open source is user-managed and cannot run cloud-only plugins",
   assert.equal(pluginExecutionAvailable(mode, "cloud-only"), false);
 });
 
-test("personal OpenLeash Cloud is user-managed and supports cloud-only plugins", () => {
+test("Leash Cloud is personal and supports hosted-only Features", () => {
   const mode = openLeashProductModeFromEnv({ OPENLEASH_PRODUCT_MODE: "openleash-cloud" });
+  assert.equal(mode.id, "leash-cloud");
+  assert.equal(mode.accountScope, "single-user");
   assert.equal(isOrganizationManagedAccount(mode, "individual"), false);
   assert.equal(pluginExecutionAvailable(mode, "cloud-only"), true);
 });
 
-test("organization Cloud and Private Cloud clients are organization-managed", () => {
-  const cloud = openLeashProductModeFromEnv({ OPENLEASH_PRODUCT_MODE: "openleash-cloud" });
-  const privateCloud = openLeashProductModeFromEnv({ OPENLEASH_PRODUCT_MODE: "private-cloud" });
-  assert.equal(isOrganizationManagedAccount(cloud, "organization"), true);
-  assert.equal(isOrganizationManagedAccount(privateCloud, "individual"), true);
-  assert.equal(pluginExecutionAvailable(privateCloud, "cloud-only"), false);
+test("retired organization mode names cannot enable organization capabilities", () => {
+  const mode = openLeashProductModeFromEnv({ OPENLEASH_PRODUCT_MODE: "private-cloud" });
+  assert.equal(mode.id, "leash-cloud");
+  assert.equal(isOrganizationManagedAccount(mode, "organization"), false);
+  assert.equal(mode.capabilities.dashboard, false);
+  assert.equal(mode.capabilities.identityProviders, false);
+  assert.equal(mode.capabilities.deploymentTokens, false);
 });
 
-test("only private file plugins in Individual Open Source may omit an image digest", () => {
+test("in-process Features never require container image digests", () => {
   const individual = openLeashProductModeFromEnv({
     OPENLEASH_PRODUCT_MODE: "individual-open-source",
-  });
-  const privateCloud = openLeashProductModeFromEnv({
-    OPENLEASH_PRODUCT_MODE: "private-cloud",
   });
   const localPlugin = {
     publisher: "acme",
@@ -42,19 +42,18 @@ test("only private file plugins in Individual Open Source may omit an image dige
   };
 
   assert.equal(pluginImageDigestRequired(individual, localPlugin), false);
-  assert.equal(pluginImageDigestRequired(privateCloud, localPlugin), true);
   assert.equal(
     pluginImageDigestRequired(individual, {
       ...localPlugin,
       source: "community",
     }),
-    true,
+    false,
   );
   assert.equal(
     pluginImageDigestRequired(individual, {
       ...localPlugin,
       packageUrl: "npm:@acme/history-aware",
     }),
-    true,
+    false,
   );
 });

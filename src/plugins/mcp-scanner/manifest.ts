@@ -1,4 +1,4 @@
-import { firstPartyEventContainer, type OpenLeashPluginManifest } from "@openleash/shared";
+import { firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const mcpScannerManifest: OpenLeashPluginManifest = {
   id: "openleash.mcp-scanner",
@@ -7,9 +7,9 @@ export const mcpScannerManifest: OpenLeashPluginManifest = {
   repositoryUrl: "https://github.com/open-leash/plugin-mcp-scanner",
   version: "1.0.0",
   publisher: "openleash",
-  runtime: "container",
-  execution: firstPartyEventContainer("mcp-scanner", "1.0.0"),
-  entrypoint: "container",
+  runtime: "builtin",
+  execution: firstPartyFeature("mcp-scanner", "1.0.0"),
+  entrypoint: "client-api",
   events: ["tool.beforeUse", "tool.afterUse"],
   permissions: ["event:read", "tool:read", "audit:write", "signal:write"],
   effects: ["observe", "inventory"],

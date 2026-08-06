@@ -1,4 +1,4 @@
-import { firstPartyEventContainer, type AgentKind, type OpenLeashPluginManifest } from "@openleash/shared";
+import { firstPartyFeature, type AgentKind, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const CODE_SCANNER_AGENT_KINDS: AgentKind[] = [
   "claude-code",
@@ -27,9 +27,9 @@ export const codeScannerManifest: OpenLeashPluginManifest & {
   repositoryUrl: "https://github.com/open-leash/plugin-code-scanner",
   version: "1.0.0",
   publisher: "openleash",
-  runtime: "container",
-  execution: firstPartyEventContainer("code-scanner", "1.0.0"),
-  entrypoint: "container",
+  runtime: "builtin",
+  execution: firstPartyFeature("code-scanner", "1.0.0"),
+  entrypoint: "client-api",
   events: ["agent.response", "tool.beforeUse"],
   agentKinds: CODE_SCANNER_AGENT_KINDS,
   permissions: [

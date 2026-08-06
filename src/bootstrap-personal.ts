@@ -5,30 +5,27 @@ import { Pool } from "pg";
 type ParsedArgs = Record<string, string | boolean | string[]> & { _: string[] };
 
 const args = parseArgs(process.argv.slice(2));
-const name = String(args.name ?? args._[0] ?? "").trim();
-const slug = slugify(String(args.slug ?? args._[1] ?? name));
-const region = String(args.region ?? "").trim() || null;
-const deploymentMode = normalizeDeploymentMode(String(args.deploymentMode ?? args.mode ?? "cloud"));
-const setupCompleted = args.setupCompleted !== false;
-const currentStep = Number(args.currentStep ?? (setupCompleted ? 6 : 1));
+const name = String(args.name ?? args._[0] ?? "Personal Leash").trim();
+const slug = slugify(String(args.slug ?? args._[1] ?? "personal"));
+const deploymentMode = String(args.mode ?? "private") === "cloud" ? "cloud" : "private";
 
-if (!name || !slug) throw new Error("--name and --slug are required");
 const pool = new Pool({ connectionString: databaseUrl() });
 try {
+  // The organizations table name is retained only as a database compatibility
+  // boundary. Every public Leash install bootstraps exactly one personal owner.
   const result = await pool.query(
     `insert into organizations (name, slug, region, setup_completed, current_step, deployment_mode, infrastructure_config)
-     values ($1, $2, $3, $4, $5, $6, '{}'::jsonb)
+     values ($1, $2, null, true, 6, $3, '{}'::jsonb)
      on conflict (slug) do update set
        name = excluded.name,
-       region = excluded.region,
-       setup_completed = excluded.setup_completed,
-       current_step = excluded.current_step,
+       setup_completed = true,
+       current_step = 6,
        deployment_mode = excluded.deployment_mode,
        updated_at = now()
-     returning id, name, slug, region, setup_completed, current_step, deployment_mode, created_at, updated_at`,
-    [name, slug, region, setupCompleted, currentStep, deploymentMode],
+     returning id, name, slug, deployment_mode, created_at, updated_at`,
+    [name, slug, deploymentMode],
   );
-  console.log(JSON.stringify({ ok: true, organization: result.rows[0] }, null, 2));
+  console.log(JSON.stringify({ ok: true, personalProfile: result.rows[0] }, null, 2));
 } finally {
   await pool.end();
 }
@@ -72,9 +69,4 @@ function parseValue(value: string): string | boolean {
 
 function slugify(value: string) {
   return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
-}
-
-function normalizeDeploymentMode(value: string) {
-  const normalized = value.trim().toLowerCase();
-  return normalized === "private" || normalized === "self-hosted" || normalized === "cloud" ? normalized : "cloud";
 }

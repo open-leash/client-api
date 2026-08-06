@@ -14,7 +14,7 @@ export function buildAttentionEvents(input: {
     kind: "blocked" as const,
     state: "resolved" as const,
     title: `${row.agent_name ?? "Agent"} was blocked`,
-    body: row.summary ?? "OpenLeash blocked an agent action.",
+    body: row.summary ?? "Leash blocked an agent action.",
     createdAt: isoValue(row.created_at),
     agent: attentionAgent(row),
     session: attentionSession(row),

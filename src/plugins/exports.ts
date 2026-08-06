@@ -2,14 +2,12 @@ import type {
   EvaluationRequest,
   PipelineEvent,
   PluginLogRecord,
-  PluginCapabilities,
-  PluginCatalogItem,
   PluginRunRecord,
   PluginSettingState,
   PolicyDecision
 } from "@openleash/shared";
 import { pluginsForEvent, orderPlugins } from "./registry.js";
-import { executeContainerPluginEvent } from "./container-runtime.js";
+import { runSiemExporter, runSiemLogExporter } from "./siem-exporter/index.js";
 
 export type PluginExportContext = {
   request: EvaluationRequest;
@@ -41,7 +39,11 @@ export async function runExportPlugins(input: PluginExportContext): Promise<Plug
   const runs: PluginRunRecord[] = [];
   for (const plugin of enabledExportPlugins(input.event, input.plugins)) {
     const config = pluginConfig(plugin.id, input.plugins);
-    runs.push(await runContainerExporter(plugin, config, input.event, { ...input, config }));
+    if (plugin.id === "openleash.siem-exporter") {
+      runs.push(await runSiemExporter({ ...input, config }));
+    } else {
+      runs.push(skippedUnknownFeature(plugin.id, input.event));
+    }
   }
   return runs;
 }
@@ -50,7 +52,11 @@ export async function runLogExportPlugins(input: PluginLogExportContext): Promis
   const runs: PluginRunRecord[] = [];
   for (const plugin of enabledExportPlugins("log.emitted", input.plugins)) {
     const config = pluginConfig(plugin.id, input.plugins);
-    runs.push(await runContainerExporter(plugin, config, "log.emitted", { ...input, config }));
+    if (plugin.id === "openleash.siem-exporter") {
+      runs.push(await runSiemLogExporter({ ...input, config }));
+    } else {
+      runs.push(skippedUnknownFeature(plugin.id, "log.emitted"));
+    }
   }
   return runs;
 }
@@ -82,38 +88,12 @@ function pluginConfig(pluginId: string, settings?: Map<string, PluginSettingStat
   };
 }
 
-async function runContainerExporter(
-  plugin: ReturnType<typeof enabledExportPlugins>[number],
-  config: Record<string, unknown>,
-  event: PipelineEvent,
-  payload: (PluginExportContext | PluginLogExportContext) & { config: Record<string, unknown> },
-): Promise<PluginRunRecord> {
-  const organizationId = payload.organization.id;
-  const userId = "user" in payload && payload.user?.id ? payload.user.id : "system";
-  const settings = { enabled: true, config, ...(payload.plugins?.get(plugin.id) ?? {}) };
-  const catalogPlugin: PluginCatalogItem = { ...plugin, settings };
-  try {
-    const output = await executeContainerPluginEvent<{ run?: PluginRunRecord }>({
-      plugin: catalogPlugin,
-      organizationId,
-      userId,
-      event,
-      payload,
-      capabilities: {} as PluginCapabilities,
-    });
-    return output.run ?? {
-      pluginId: plugin.id,
-      event,
-      status: "failed",
-      summary: "Container plugin returned no run record.",
-    };
-  } catch (error) {
-    if ((plugin.execution?.failureMode ?? "closed") === "closed") throw error;
-    return {
-      pluginId: plugin.id,
-      event,
-      status: "failed",
-      summary: error instanceof Error ? error.message : String(error),
-    };
-  }
+function skippedUnknownFeature(pluginId: string, event: PipelineEvent): PluginRunRecord {
+  return {
+    pluginId,
+    event,
+    status: "skipped",
+    summary: "No in-process handler is registered for this Feature.",
+    durationMs: 0,
+  };
 }

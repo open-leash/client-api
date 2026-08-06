@@ -83,11 +83,11 @@ export function nativeHookDecision(
 }
 
 function humanDecisionReason(decision: EvaluationResponse) {
-  if (decision.decision === "allow") return "OpenLeash approved this action.";
+  if (decision.decision === "allow") return "Leash approved this action.";
   if (decision.decision === "deny" && decision.resolutionGuidance) {
-    return `OpenLeash denied this action. User guidance: ${decision.resolutionGuidance}`;
+    return `Leash denied this action. User guidance: ${decision.resolutionGuidance}`;
   }
   if (decision.decision === "deny")
-    return decision.summary || "OpenLeash denied this action.";
+    return decision.summary || "Leash denied this action.";
   return decision.question ?? decision.summary;
 }
