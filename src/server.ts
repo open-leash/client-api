@@ -3836,6 +3836,35 @@ app.get("/v1/mobile/state", async (req, res, next) => {
   }
 });
 
+app.get("/v1/client/overview", async (req, res, next) => {
+  try {
+    res.set("Cache-Control", "private, max-age=5, stale-while-revalidate=25");
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const [agents, pluginCatalog, pluginOutcomes] = await Promise.all([
+      clientOverviewAgents(session.organization.id, session.user.id),
+      pluginCatalogForOrganization(session.organization.id, session.user.id),
+      userPluginOutcomes(session.organization.id, session.user.id, { limit: 40 }),
+    ]);
+    const summary = outcomeSummary(pluginOutcomes.outcomes);
+    res.json({
+      agents: agents.rows,
+      plugins: pluginCatalog.plugins,
+      outcomes: pluginOutcomes.outcomes,
+      viewModel: buildOpenLeashClientViewModel({
+        plugins: pluginCatalog.plugins,
+        outcomes: pluginOutcomes.outcomes,
+        summary,
+      }),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/v1/mobile/decisions/:id/resolve", async (req, res, next) => {
   try {
     const session = await getClientOrDashboardSession(
@@ -10738,6 +10767,29 @@ async function mobileAgents(organizationId: string, userId: string) {
   };
 }
 
+function clientOverviewAgents(organizationId: string, userId: string) {
+  return pool.query(
+    `select distinct on (ar.kind)
+            ar.id, ar.kind, ar.display_name, ar.version, ar.installed, ar.protected,
+            coalesce(ams.monitored, ar.protected) as desired_monitored,
+            ar.detail, ar.last_seen_at, c.hostname, c.platform
+     from conversation_events ce
+     join agent_runtimes ar on ar.id = ce.agent_runtime_id
+     join computers c on c.id = ce.computer_id
+     left join agent_monitoring_settings ams on ams.user_id = c.user_id
+      and ams.organization_id = $1
+      and ams.kind = ar.kind
+     where ce.event_name <> 'Stop'
+       and c.user_id = $2
+       and exists (
+         select 1 from users u
+         where u.id = c.user_id and u.organization_id = $1
+       )
+     order by ar.kind, ce.created_at desc`,
+    [organizationId, userId],
+  );
+}
+
 async function mobileAgentSessions(organizationId: string, userId: string) {
   const result = await pool.query(
     `with session_groups as (
@@ -12490,6 +12542,8 @@ function apiFunctionForRequest(
     return "mobileDeviceRegister";
   if (verb === "GET" && requestPath === "/v1/mobile/state")
     return "mobileState";
+  if (verb === "GET" && requestPath === "/v1/client/overview")
+    return "clientOverview";
   if (
     verb === "POST" &&
     /^\/v1\/mobile\/decisions\/[^/]+\/resolve$/.test(requestPath)
