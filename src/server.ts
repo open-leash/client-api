@@ -10773,19 +10773,17 @@ function clientOverviewAgents(organizationId: string, userId: string) {
             ar.id, ar.kind, ar.display_name, ar.version, ar.installed, ar.protected,
             coalesce(ams.monitored, ar.protected) as desired_monitored,
             ar.detail, ar.last_seen_at, c.hostname, c.platform
-     from conversation_events ce
-     join agent_runtimes ar on ar.id = ce.agent_runtime_id
-     join computers c on c.id = ce.computer_id
+     from agent_runtimes ar
+     join computers c on c.id = ar.computer_id
      left join agent_monitoring_settings ams on ams.user_id = c.user_id
       and ams.organization_id = $1
       and ams.kind = ar.kind
-     where ce.event_name <> 'Stop'
-       and c.user_id = $2
+     where c.user_id = $2
        and exists (
          select 1 from users u
          where u.id = c.user_id and u.organization_id = $1
        )
-     order by ar.kind, ce.created_at desc`,
+     order by ar.kind, ar.last_seen_at desc`,
     [organizationId, userId],
   );
 }
