@@ -1701,9 +1701,25 @@ app.get("/v1/outcomes", async (req, res, next) => {
     const days = Math.max(1, Math.min(365, Number(req.query.days ?? 30) || 30));
     const limit = Math.max(
       1,
-      Math.min(100, Number(req.query.limit ?? 40) || 40),
+      Math.min(50, Number(req.query.limit ?? 20) || 20),
     );
+    const page = Math.max(1, Math.floor(Number(req.query.page ?? 1) || 1));
+    const agentKind = optionalString(req.query.agentKind);
     const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const params: unknown[] = [session.organization.id, session.user.id, start];
+    const filters = [
+      "ps.organization_id = $1",
+      "ps.user_id = $2",
+      "ps.created_at >= $3",
+    ];
+    if (agentKind) {
+      params.push(agentKind);
+      filters.push(`ar.kind = $${params.length}`);
+    }
+    params.push(limit + 1);
+    const limitIndex = params.length;
+    params.push((page - 1) * limit);
+    const offsetIndex = params.length;
     const rows = await pool.query(
       `select ps.id, ps.organization_id, ps.plugin_id, ps.kind, ps.severity, ps.title, ps.summary,
               ps.decision, ps.status, ps.target, ps.evidence, ps.details, ps.correlation_keys,
@@ -1720,24 +1736,30 @@ app.get("/v1/outcomes", async (req, res, next) => {
        left join agent_runtimes ar on ar.id = ps.agent_runtime_id
        left join conversation_events ce on ce.id = ps.conversation_event_id
        left join evaluations e on e.conversation_event_id = ce.id
-       where ps.organization_id = $1
-         and ps.user_id = $2
-         and ps.created_at >= $3
-       order by ps.created_at desc
-       limit $4`,
-      [session.organization.id, session.user.id, start, limit],
+       where ${filters.join(" and ")}
+       order by ps.created_at desc, ps.id desc
+       limit $${limitIndex}
+       offset $${offsetIndex}`,
+      params,
     );
-    const outcomes = rows.rows.map(signalRowToOutcome);
+    const hasMore = rows.rows.length > limit;
+    const outcomes = rows.rows.slice(0, limit).map(signalRowToOutcome);
     const summary = outcomeSummary(outcomes);
-    const { plugins } = await pluginCatalogForOrganization(
-      session.organization.id,
-      session.user.id,
-    );
+    const includeViewModel = String(req.query.viewModel ?? "1") !== "0";
+    const plugins = includeViewModel
+      ? (await pluginCatalogForOrganization(session.organization.id, session.user.id)).plugins
+      : [];
     res.json({
       range: { days, since: start.toISOString() },
+      pagination: {
+        page,
+        limit,
+        hasMore,
+        nextPage: hasMore ? page + 1 : null,
+      },
       summary,
       outcomes,
-      viewModel: buildOpenLeashClientViewModel({ plugins, outcomes, summary }),
+      ...(includeViewModel ? { viewModel: buildOpenLeashClientViewModel({ plugins, outcomes, summary }) } : {}),
     });
   } catch (error) {
     next(error);
@@ -3773,7 +3795,10 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       browserBlockedNotifications(session.organization.id, session.user.id),
       mobileAgents(session.organization.id, session.user.id),
-      mobileRecentActivity(session.organization.id, session.user.id),
+      mobileRecentActivity(session.organization.id, session.user.id, {
+        limit: 11,
+        pageSize: 10,
+      }),
       mobileSessionMetrics(session.organization.id, session.user.id),
       pool.query(
         `select id, name, description, severity, natural_language_rule, enabled, locked
@@ -3807,7 +3832,13 @@ app.get("/v1/mobile/state", async (req, res, next) => {
         activity: history.rows,
       }),
       agents: agents.rows,
-      recentActivity: history.rows,
+      recentActivity: history.rows.slice(0, 10),
+      historyPagination: {
+        page: 1,
+        limit: 10,
+        hasMore: history.rows.length > 10,
+        nextPage: history.rows.length > 10 ? 2 : null,
+      },
       sessionMetrics: sessionMetrics.rows[0],
       policies: policies.rows,
       plugins: pluginCatalog.plugins,
@@ -3847,7 +3878,7 @@ app.get("/v1/client/overview", async (req, res, next) => {
     const [agents, pluginCatalog, pluginOutcomes] = await Promise.all([
       clientOverviewAgents(session.organization.id, session.user.id),
       pluginCatalogForOrganization(session.organization.id, session.user.id),
-      userPluginOutcomes(session.organization.id, session.user.id, { limit: 40 }),
+      userPluginOutcomes(session.organization.id, session.user.id, { limit: 12 }),
     ]);
     const summary = outcomeSummary(pluginOutcomes.outcomes);
     res.json({
@@ -3859,6 +3890,43 @@ app.get("/v1/client/overview", async (req, res, next) => {
         outcomes: pluginOutcomes.outcomes,
         summary,
       }),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/v1/client/history", async (req, res, next) => {
+  try {
+    res.set("Cache-Control", "private, max-age=5");
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid OpenLeash session" });
+    const limit = Math.max(
+      1,
+      Math.min(50, Math.floor(Number(req.query.limit ?? 12) || 12)),
+    );
+    const page = Math.max(
+      1,
+      Math.floor(Number(req.query.page ?? 1) || 1),
+    );
+    const agentKind = optionalString(req.query.agentKind);
+    const history = await mobileRecentActivity(
+      session.organization.id,
+      session.user.id,
+      { limit: limit + 1, page, pageSize: limit, agentKind },
+    );
+    const hasMore = history.rows.length > limit;
+    res.json({
+      history: history.rows.slice(0, limit),
+      pagination: {
+        page,
+        limit,
+        hasMore,
+        nextPage: hasMore ? page + 1 : null,
+      },
     });
   } catch (error) {
     next(error);
@@ -3901,7 +3969,9 @@ app.get("/v1/client/notifications", async (req, res, next) => {
     const [pending, blocked, activity, pluginCatalog] = await Promise.all([
       mobilePendingApprovals(session.user.id, session.organization.id, false),
       browserBlockedNotifications(session.organization.id, session.user.id),
-      mobileRecentActivity(session.organization.id, session.user.id),
+      mobileRecentActivity(session.organization.id, session.user.id, {
+        limit: 12,
+      }),
       pluginCatalogForOrganization(session.organization.id, session.user.id),
     ]);
     const islandContributions = await activeIslandContributions(
@@ -10942,7 +11012,25 @@ function mobileSessionMetrics(organizationId: string, userId: string) {
   );
 }
 
-function mobileRecentActivity(organizationId: string, userId: string) {
+function mobileRecentActivity(
+  organizationId: string,
+  userId: string,
+  options: {
+    limit?: number;
+    page?: number;
+    pageSize?: number;
+    agentKind?: string;
+  } = {},
+) {
+  const limit = Math.max(1, Math.min(121, options.limit ?? 120));
+  const page = Math.max(1, Math.floor(options.page ?? 1));
+  const pageSize = Math.max(1, Math.min(120, options.pageSize ?? limit));
+  const params: unknown[] = [organizationId, userId];
+  const agentFilter = options.agentKind
+    ? `and ar.kind = $${params.push(options.agentKind)}`
+    : "";
+  const limitIndex = params.push(limit);
+  const offsetIndex = params.push((page - 1) * pageSize);
   return pool.query(
     `select e.id, e.decision, e.resolution, e.summary, e.question, e.created_at,
             ce.event_name, ce.tool_name, ce.project_path, ce.prompt, ce.payload,
@@ -10973,9 +11061,11 @@ function mobileRecentActivity(organizationId: string, userId: string) {
        where u.id = e.user_id and u.organization_id = $1
      )
        and e.user_id = $2
-     order by e.created_at desc
-     limit 120`,
-    [organizationId, userId],
+       ${agentFilter}
+     order by e.created_at desc, e.id desc
+     limit $${limitIndex}
+     offset $${offsetIndex}`,
+    params,
   );
 }
 
@@ -12542,6 +12632,8 @@ function apiFunctionForRequest(
     return "mobileState";
   if (verb === "GET" && requestPath === "/v1/client/overview")
     return "clientOverview";
+  if (verb === "GET" && requestPath === "/v1/client/history")
+    return "mobileState";
   if (
     verb === "POST" &&
     /^\/v1\/mobile\/decisions\/[^/]+\/resolve$/.test(requestPath)
