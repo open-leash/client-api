@@ -10,6 +10,7 @@ export type TenantModelKey = {
   masked: string;
   fingerprint: string;
   updatedAt: string;
+  managedFallback?: boolean;
 };
 
 type StoredTenantModelKey = Omit<TenantModelKey, "apiKey"> & {
@@ -77,6 +78,35 @@ export async function readTenantModelKey(organizationId: string): Promise<Tenant
     fingerprint: stored.fingerprint,
     updatedAt: stored.updatedAt
   };
+}
+
+export async function tenantModelKeySummary(organizationId: string) {
+  const result = await pool.query(
+    `select infrastructure_config from organizations where id = $1 limit 1`,
+    [organizationId]
+  );
+  const config = result.rows[0]?.infrastructure_config ?? {};
+  const provider = normalizeTenantModelProvider(config.modelProvider);
+  const masked = typeof config.modelKeyMasked === "string" ? config.modelKeyMasked : undefined;
+  const updatedAt = typeof config.modelKeyUpdatedAt === "string" ? config.modelKeyUpdatedAt : undefined;
+  return provider && masked ? { connected: true, provider, masked, updatedAt } : { connected: false };
+}
+
+export async function deleteTenantModelKey(organizationId: string) {
+  await pool.query(
+    `update organizations
+     set infrastructure_config = coalesce(infrastructure_config, '{}'::jsonb)
+       - 'tenantModelKey'
+       - 'modelProvider'
+       - 'modelKeyFingerprint'
+       - 'modelKeyMasked'
+       - 'modelKeyUpdatedAt'
+       || jsonb_build_object('evaluationMode', 'openleash-managed'),
+         updated_at = now()
+     where id = $1`,
+    [organizationId]
+  );
+  return { ok: true };
 }
 
 function maskApiKey(apiKey: string) {

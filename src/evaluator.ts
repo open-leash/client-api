@@ -183,6 +183,7 @@ export function modelConfigFor(
     }
     return { provider: tenantModelKey.provider, apiKey: tenantModelKey.apiKey, source: "tenant-byok" };
   }
+  if (tenantModelKey?.managedFallback === false) return undefined;
   // The coding agent may have OPENAI_API_KEY in its inherited shell. That key
   // is not authorization for OpenLeash evaluations or summaries.
   const managedKey = env.OPENLEASH_OPENAI_API_KEY;

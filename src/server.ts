@@ -99,8 +99,10 @@ import {
   validateProviderConnection,
 } from "./provider-usage.js";
 import {
+  deleteTenantModelKey,
   normalizeTenantModelProvider,
   readTenantModelKey,
+  tenantModelKeySummary,
   upsertTenantModelKey,
 } from "./model-keys.js";
 import {
@@ -2900,16 +2902,75 @@ app.get("/auth/session", async (req, res, next) => {
        limit 1`,
       [session.user.id],
     );
+    const evaluationProvider = await tenantModelKeySummary(
+      session.organization.id,
+    );
     res.json({
       authenticated: true,
       user: session.user,
       organization: session.organization,
       account: session.account,
+      evaluationProvider,
       desktop: {
         connected: Boolean(desktop.rows[0]),
         computer: desktop.rows[0] ?? null,
       },
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/auth/account/package", async (req, res, next) => {
+  try {
+    const session = await getDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid Leash session" });
+    if (session.account.audience !== "individual") {
+      return res.status(403).json({
+        error: "Business package changes are managed in Leash Cloud.",
+      });
+    }
+    const packageId = normalizeAccountPackage(
+      req.body?.packageId ?? req.body?.plan,
+    );
+    if (packageId !== "personal-byok" && packageId !== "personal-managed") {
+      return res.status(400).json({
+        error: "packageId must be personal-byok or personal-managed",
+      });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      await client.query(
+        `update users
+         set metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
+           'accountPackage', $2::text,
+           'accountPackageSelectedAt', now()
+         )
+         where id = $1`,
+        [session.user.id, packageId],
+      );
+      await client.query(
+        `update organizations
+         set infrastructure_config = coalesce(infrastructure_config, '{}'::jsonb) || jsonb_build_object(
+           'accountPackage', $2::text,
+           'accountPackageSelectedAt', now()
+         ),
+         updated_at = now()
+         where id = $1`,
+        [session.organization.id, packageId],
+      );
+      await client.query("commit");
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+    res.json({ ok: true, packageId });
   } catch (error) {
     next(error);
   }
@@ -3484,11 +3545,16 @@ app.post("/v1/mobile/auth/exchange", async (req, res, next) => {
 
 app.post("/v1/mobile/model-key", async (req, res, next) => {
   try {
-    const session = await getDashboardSession(
+    const session = await getClientOrDashboardSession(
       req.header("authorization") ?? "",
     );
     if (!session)
       return res.status(401).json({ error: "invalid OpenLeash session" });
+    if (await organizationUsesManagedEvaluation(session.organization.id)) {
+      return res.status(409).json({
+        error: "Switch to your own AI provider before connecting a key.",
+      });
+    }
     const provider = normalizeTenantModelProvider(
       req.body.provider ?? req.body.apiProvider,
     );
@@ -3504,6 +3570,24 @@ app.post("/v1/mobile/model-key", async (req, res, next) => {
       apiKey,
     });
     res.json({ ok: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/v1/mobile/model-key", async (req, res, next) => {
+  try {
+    const session = await getClientOrDashboardSession(
+      req.header("authorization") ?? "",
+    );
+    if (!session)
+      return res.status(401).json({ error: "invalid Leash session" });
+    if (!(await organizationUsesManagedEvaluation(session.organization.id))) {
+      return res.status(409).json({
+        error: "Switch to Leash AI before removing your provider key.",
+      });
+    }
+    res.json(await deleteTenantModelKey(session.organization.id));
   } catch (error) {
     next(error);
   }
@@ -8632,13 +8716,30 @@ function stableRuleId(rule: string, index: number) {
 
 async function tenantModelKeyForEvaluation(organizationId: string) {
   try {
-    return await readTenantModelKey(organizationId);
+    if (await organizationUsesManagedEvaluation(organizationId)) {
+      return undefined;
+    }
+    return (await readTenantModelKey(organizationId)) ?? {
+      provider: "openai" as const,
+      apiKey: "",
+      masked: "",
+      fingerprint: "",
+      updatedAt: "",
+      managedFallback: false,
+    };
   } catch (error) {
     console.warn(
       "tenant model key unavailable; falling back to managed or heuristic evaluation",
       error,
     );
-    return undefined;
+    return {
+      provider: "openai" as const,
+      apiKey: "",
+      masked: "",
+      fingerprint: "",
+      updatedAt: "",
+      managedFallback: false,
+    };
   }
 }
 
@@ -9910,7 +10011,7 @@ function accountPackageForNewSession(
     process.env.OPENLEASH_DEV_ACCOUNT_PACKAGE,
   );
   if (audience === "individual") {
-    return configured?.startsWith("personal-") ? configured : null;
+    return configured?.startsWith("personal-") ? configured : "personal-byok";
   }
   return configured?.startsWith("work-") ? configured : "work-managed";
 }
@@ -10385,6 +10486,7 @@ async function createDashboardSessionFromProfile({
       audience: accountAudience,
       packageId: accountPackage,
     },
+    evaluationProvider: await tenantModelKeySummary(organizationId),
   };
 }
 

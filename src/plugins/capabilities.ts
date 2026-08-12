@@ -500,6 +500,7 @@ export function pluginModelConfig(
     }
     return { provider: tenantModelKey.provider, apiKey: tenantModelKey.apiKey, source: "tenant-byok" };
   }
+  if (tenantModelKey?.managedFallback === false) return undefined;
   // OPENAI_API_KEY commonly belongs to the coding agent or shell that
   // launched OpenLeash. Treating that ambient credential as the OpenLeash
   // evaluation key can unexpectedly consume the user's provider allowance and turns a
