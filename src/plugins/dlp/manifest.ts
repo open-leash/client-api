@@ -22,7 +22,7 @@ export const dlpManifest: OpenLeashPluginManifest = {
     additionalProperties: false,
     properties: {
       enabled: { type: "boolean" },
-      action: { enum: ["mask", "block"] },
+      action: { enum: ["allow", "ask", "block"] },
       categories: {
         type: "array",
         items: { enum: ["pii", "phi", "tokens", "keys", "credentials"] }
@@ -32,7 +32,7 @@ export const dlpManifest: OpenLeashPluginManifest = {
   },
   defaultConfig: {
     enabled: false,
-    action: "mask",
+    action: "ask",
     categories: ["pii", "phi", "tokens", "keys", "credentials"]
   },
   tags: ["security", "privacy", "prompt"]

@@ -8528,10 +8528,10 @@ function pluginsWithPolicyEngine(
 
 function normalizeRuleConfigs(
   value: unknown,
-): Array<{ text: string; action: "ask" | "block" }> {
+): Array<{ text: string; action: "allow" | "ask" | "block" }> {
   if (Array.isArray(value)) {
     const seen = new Set<string>();
-    const rules: Array<{ text: string; action: "ask" | "block" }> = [];
+    const rules: Array<{ text: string; action: "allow" | "ask" | "block" }> = [];
     for (const item of value) {
       const normalized = normalizeRuleConfig(item);
       if (!normalized || seen.has(normalized.text)) continue;
@@ -8554,7 +8554,7 @@ function normalizeRuleConfigs(
 
 function normalizeRuleConfig(
   value: unknown,
-): { text: string; action: "ask" | "block" } | undefined {
+): { text: string; action: "allow" | "ask" | "block" } | undefined {
   if (typeof value === "string") {
     const text = value.trim();
     return text ? { text, action: "ask" } : undefined;
@@ -8567,7 +8567,7 @@ function normalizeRuleConfig(
   if (!text) return undefined;
   return {
     text,
-    action: record.action === "block" ? "block" : "ask",
+    action: record.action === "allow" ? "allow" : record.action === "block" ? "block" : "ask",
   };
 }
 
@@ -8592,6 +8592,14 @@ function applyConfiguredRuleActions(
       policyActions.get(result.policyId) ??
       policyActions.get(policyIdForPolicyName(result.policyName, policies));
     if (!action) return result;
+    if (action === "allow") {
+      return {
+        ...result,
+        status: "passed",
+        explanation: `${result.explanation} Leash recorded it and let the agent continue.`,
+        question: undefined,
+      };
+    }
     if (action === "block") {
       return {
         ...result,

@@ -11,7 +11,7 @@ type Match = {
   severity: PolicyDecision["severity"];
   explanation: string;
   evidence: string[];
-  action: "ask" | "block";
+  action: "allow" | "ask" | "block";
 };
 
 export async function runBlastRadius(input: EvaluationPipelineInput, capabilities: PluginCapabilities) {
@@ -19,7 +19,8 @@ export async function runBlastRadius(input: EvaluationPipelineInput, capabilitie
   const text = eventText(input);
   const config = pluginConfig(input.plugins?.get(manifest.id)?.config);
   const matches = detectBlastRadius(text, config);
-  const results: PolicyDecision[] = matches.map((match) => ({
+  const enforcedMatches = matches.filter((match) => match.action !== "allow");
+  const results: PolicyDecision[] = enforcedMatches.map((match) => ({
     policyId: match.policyId,
     policyName: match.policyName,
     status: match.action === "block" ? "failed" : "needs_question",
@@ -42,6 +43,23 @@ export async function runBlastRadius(input: EvaluationPipelineInput, capabilitie
       details: { pluginId: manifest.id },
       correlationKeys: ["blast-radius", `tool:${input.request.event.tool?.name ?? "unknown"}`]
     });
+  }
+  if (matches.length > 0) {
+    const primaryMatch = matches[0];
+    if (primaryMatch.action === "allow") {
+      await capabilities.signals.emit({
+        kind: "security.finding",
+        severity: primaryMatch.severity,
+        title: primaryMatch.policyName,
+        summary: `${primaryMatch.explanation} Leash recorded it and let the agent continue.`,
+        decision: "allow",
+        status: "observed",
+        target: { type: "tool_call", name: input.request.event.tool?.name ?? input.request.event.eventName },
+        evidence: primaryMatch.evidence,
+        details: { pluginId: manifest.id, configuredAction: "allow" },
+        correlationKeys: ["blast-radius", `tool:${input.request.event.tool?.name ?? "unknown"}`]
+      });
+    }
   }
   if (results.length > 0) {
     const primary = results[0];
@@ -70,7 +88,11 @@ export async function runBlastRadius(input: EvaluationPipelineInput, capabilitie
       pluginId: manifest.id,
       event: eventForHookEvent(input.request.event.eventName),
       status: results.some((result) => result.status === "failed") ? "blocked" : results.length ? "needs_question" : "passed",
-      summary: results.length ? `${results.length} high-blast-radius pattern${results.length === 1 ? "" : "s"} detected.` : "No destructive tool use detected.",
+      summary: results.length
+        ? `${results.length} high-blast-radius pattern${results.length === 1 ? "" : "s"} detected.`
+        : matches.length
+          ? "A destructive pattern was recorded and allowed by your setting."
+          : "No destructive tool use detected.",
       startedAt,
       findings: results.map((result) => ({
         title: result.policyName,
@@ -150,11 +172,11 @@ function eventText(input: EvaluationPipelineInput) {
 }
 
 function pluginConfig(config: Record<string, unknown> | undefined) {
-  const action = (value: unknown, fallback: "ask" | "block") => value === "ask" || value === "block" ? value : fallback;
+  const action = (value: unknown, fallback: "allow" | "ask" | "block") => value === "allow" || value === "ask" || value === "block" ? value : fallback;
   return {
-    destructiveAction: action(config?.destructiveAction, "block"),
+    destructiveAction: action(config?.destructiveAction, "ask"),
     databaseMutationAction: action(config?.databaseMutationAction, "ask"),
-    broadFilesystemAction: action(config?.broadFilesystemAction, "block")
+    broadFilesystemAction: action(config?.broadFilesystemAction, "ask")
   };
 }
 

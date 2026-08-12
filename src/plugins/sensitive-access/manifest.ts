@@ -23,15 +23,15 @@ export const sensitiveAccessManifest: OpenLeashPluginManifest = {
     additionalProperties: false,
     properties: {
       enabled: { type: "boolean" },
-      secretFileAction: { enum: ["ask", "block"] },
-      envDumpAction: { enum: ["ask", "block"] },
-      exfiltrationAction: { enum: ["ask", "block"] }
+      secretFileAction: { enum: ["allow", "ask", "block"] },
+      envDumpAction: { enum: ["allow", "ask", "block"] },
+      exfiltrationAction: { enum: ["allow", "ask", "block"] }
     }
   },
   defaultConfig: {
     enabled: true,
     secretFileAction: "ask",
-    envDumpAction: "block",
+    envDumpAction: "ask",
     exfiltrationAction: "block"
   },
   tags: ["security", "secrets", "credentials", "privacy"]

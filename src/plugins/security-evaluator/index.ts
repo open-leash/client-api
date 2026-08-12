@@ -219,7 +219,7 @@ function heuristicEvaluation(input: EvaluationPipelineInput): PolicyDecision[] {
       return {
         policyId: policy.id,
         policyName: policy.name,
-        status: action === "ask" ? "needs_question" : "failed",
+        status: action === "allow" ? "passed" : action === "ask" ? "needs_question" : "failed",
         severity: policy.severity,
         explanation: "The agent event appears to access, display, copy, or send protected credential material.",
         evidence: [evidence],

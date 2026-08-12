@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 export type CompressionLevel = "light" | "standard" | "maximum";
 export type DlpCategory = "pii" | "phi" | "tokens" | "keys" | "credentials";
-export type DlpAction = "block" | "mask";
+export type DlpAction = "allow" | "ask" | "block" | "mask";
 
 export type PromptTransformConfig = {
   compression: {
@@ -21,6 +21,7 @@ export type PromptTransformConfig = {
 export type PromptTransformResult = {
   finalPrompt: string;
   blocked: boolean;
+  requiresApproval?: boolean;
   summary: string;
   model: string;
   compression?: {
@@ -48,7 +49,7 @@ export const defaultPromptTransformConfig: PromptTransformConfig = {
   },
   dlp: {
     enabled: false,
-    action: "mask",
+    action: "ask",
     categories: ["pii", "phi", "tokens", "keys", "credentials"],
     model: process.env.OPENLEASH_PROMPT_TRANSFORM_MODEL ?? "gpt-4.1-nano"
   }
@@ -67,7 +68,7 @@ export function normalizePromptTransformConfig(value: unknown): PromptTransformC
     },
     dlp: {
       enabled: Boolean(dlp.enabled),
-      action: dlp.action === "block" ? "block" : "mask",
+      action: isDlpAction(dlp.action) ? dlp.action : defaultPromptTransformConfig.dlp.action,
       categories: Array.isArray(dlp.categories) ? dlp.categories.filter(isDlpCategory) : defaultPromptTransformConfig.dlp.categories,
       model: cleanModel(dlp.model) ?? defaultPromptTransformConfig.dlp.model
     }
@@ -123,6 +124,17 @@ export async function transformPrompt({
         finalPrompt: current,
         blocked: true,
         summary: `DLP blocked prompt submission: ${checked.categories.join(", ") || "sensitive data"}.`,
+        model: [...models].join(", ") || "heuristic",
+        compression,
+        dlp
+      };
+    }
+    if (checked.requiresApproval) {
+      return {
+        finalPrompt: current,
+        blocked: false,
+        requiresApproval: true,
+        summary: `Leash is asking before sharing ${checked.categories.join(", ") || "sensitive data"}.`,
         model: [...models].join(", ") || "heuristic",
         compression,
         dlp
@@ -187,7 +199,9 @@ async function checkDlp({ prompt, config, apiKey }: { prompt: string; config: Pr
             "You are OpenLeash DLP. Inspect text for only the configured categories.",
             config.dlp.action === "block"
               ? "If any configured sensitive data is present, return blocked true."
-              : "If configured sensitive data is present, mask it and return the masked text.",
+              : config.dlp.action === "mask"
+                ? "If configured sensitive data is present, mask it and return the masked text."
+                : "Detect configured sensitive data and leave the text unchanged.",
             "Return concise JSON only."
           ].join("\n")
         },
@@ -236,6 +250,7 @@ async function checkDlp({ prompt, config, apiKey }: { prompt: string; config: Pr
     return {
       matched: parsed.matched,
       blocked: config.dlp.action === "block" && parsed.matched,
+      requiresApproval: config.dlp.action === "ask" && parsed.matched,
       masked: config.dlp.action === "mask" && parsed.matched && parsed.maskedText !== prompt,
       text: config.dlp.action === "mask" ? parsed.maskedText || prompt : prompt,
       categories: parsed.categories.filter(isDlpCategory),
@@ -277,6 +292,7 @@ function heuristicDlp(prompt: string, config: PromptTransformConfig) {
   return {
     matched,
     blocked: config.dlp.action === "block" && matched,
+    requiresApproval: config.dlp.action === "ask" && matched,
     masked: config.dlp.action === "mask" && text !== prompt,
     text: config.dlp.action === "mask" ? text : prompt,
     categories,
@@ -303,6 +319,10 @@ function isCompressionLevel(value: unknown): value is CompressionLevel {
 
 function isDlpCategory(value: unknown): value is DlpCategory {
   return value === "pii" || value === "phi" || value === "tokens" || value === "keys" || value === "credentials";
+}
+
+function isDlpAction(value: unknown): value is DlpAction {
+  return value === "allow" || value === "ask" || value === "block" || value === "mask";
 }
 
 function cleanModel(value: unknown) {

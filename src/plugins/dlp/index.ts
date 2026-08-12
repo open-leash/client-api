@@ -8,6 +8,7 @@ type DlpFinding = { category: PluginDlpCategory; quote: string; reason: string }
 type DlpInspection = {
   prompt: string;
   blocked: boolean;
+  requiresApproval: boolean;
   matched: boolean;
   masked: boolean;
   model: string;
@@ -64,8 +65,8 @@ export async function runDlp({
       severity: inspected.blocked ? "high" : "medium",
       title: inspected.blocked ? "Sensitive data blocked" : "Sensitive data detected",
       summary,
-      decision: inspected.blocked ? "blocked" : inspected.masked ? "observed" : "allow",
-      status: inspected.masked ? "masked" : inspected.blocked ? "blocked" : "detected",
+      decision: inspected.blocked ? "blocked" : inspected.requiresApproval ? "ask" : inspected.masked ? "observed" : "allow",
+      status: inspected.masked ? "masked" : inspected.blocked ? "blocked" : inspected.requiresApproval ? "needs_question" : "observed",
       target: { type: "prompt", name: "agent prompt" },
       evidence: inspected.findings.map((finding) => ({
         category: finding.category,
@@ -83,6 +84,7 @@ export async function runDlp({
   const result = {
     finalPrompt: inspected.prompt,
     blocked: inspected.blocked,
+    requiresApproval: inspected.requiresApproval,
     summary,
     model: inspected.model,
     dlp
@@ -94,7 +96,7 @@ export async function runDlp({
     run: pluginRun({
       pluginId: manifest.id,
       event: "prompt.beforeSubmit",
-      status: inspected.blocked ? "blocked" : inspected.masked ? "modified" : "passed",
+      status: inspected.blocked ? "blocked" : inspected.requiresApproval ? "needs_question" : inspected.masked ? "modified" : "passed",
       summary,
       startedAt,
       findings: inspected.findings.map((finding) => ({
@@ -155,6 +157,7 @@ async function inspectPrompt(prompt: string, config: PluginDlpConfig, capabiliti
   const categories = [...new Set(findings.map((finding) => finding.category))];
   const matched = heuristic.matched || Boolean(llm?.json?.matched) || findings.length > 0;
   const blocked = config.action === "block" && matched;
+  const requiresApproval = config.action === "ask" && matched;
   const llmMasked = typeof llm?.json?.maskedText === "string" && llm.json.maskedText.trim() ? llm.json.maskedText : "";
   const maskedText = config.action === "mask"
     ? usefulMaskedText(prompt, llmMasked) ? llmMasked : maskWithFindings(heuristic.prompt, findings)
@@ -163,6 +166,7 @@ async function inspectPrompt(prompt: string, config: PluginDlpConfig, capabiliti
   return {
     prompt: masked ? maskedText : prompt,
     blocked,
+    requiresApproval,
     matched,
     masked,
     model: llm?.model ?? heuristic.model,
@@ -206,6 +210,7 @@ function heuristicDlp(prompt: string, config: PluginDlpConfig): DlpInspection {
   return {
     prompt: config.action === "mask" ? text : prompt,
     blocked: config.action === "block" && matched,
+    requiresApproval: config.action === "ask" && matched,
     matched,
     masked: config.action === "mask" && text !== prompt,
     model: "dlp-heuristic",
@@ -261,6 +266,7 @@ function dlpSummary(dlp: NonNullable<PromptPipelineResult["dlp"]>, blocked: bool
   if (!dlp.matched) return "DLP checked with no sensitive data detected.";
   const categories = dlp.categories.join(", ") || "sensitive data";
   if (blocked) return `DLP blocked prompt submission: ${categories}.`;
+  if (dlp.action === "ask") return `DLP paused the prompt for your approval: ${categories}.`;
   if (dlp.masked) return `DLP masked ${categories}.`;
   return `DLP detected ${categories}.`;
 }

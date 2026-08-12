@@ -89,6 +89,18 @@ export async function runPromptPipeline(
             runs,
           };
         }
+        if (step.result?.requiresApproval) {
+          return {
+            finalPrompt: current,
+            blocked: false,
+            requiresApproval: true,
+            summary: step.result.summary,
+            model: [...models].join(", ") || "none",
+            compression,
+            dlp,
+            runs,
+          };
+        }
       }
     } catch (error) {
       const failure = pluginFailureRun(plugin, "prompt.beforeSubmit", error);

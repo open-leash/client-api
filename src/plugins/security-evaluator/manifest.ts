@@ -29,7 +29,7 @@ export const securityEvaluatorManifest: OpenLeashPluginManifest = {
           additionalProperties: false,
           properties: {
             text: { type: "string" },
-            action: { type: "string", enum: ["ask", "block"] }
+            action: { type: "string", enum: ["allow", "ask", "block"] }
           }
         }
       }

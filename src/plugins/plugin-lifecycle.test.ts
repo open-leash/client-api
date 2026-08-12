@@ -198,11 +198,11 @@ test("a built-in prompt Feature runs without a container endpoint", async () => 
   assert.equal(result.runs[0]?.status, "modified");
 });
 
-test("blast-radius blocks recursive filesystem deletion", async () => {
+test("blast-radius asks before recursive filesystem deletion by default", async () => {
   const { cap, emitted } = capabilities();
   const result = await runBlastRadius(pipelineInput(request("Bash", { command: "rm -rf /" })), cap);
-  assert.ok(result.results.some((item) => item.status === "failed"));
-  assert.equal(result.run.status, "blocked");
+  assert.ok(result.results.some((item) => item.status === "needs_question"));
+  assert.equal(result.run.status, "needs_question");
   assert.equal(emitted.island.length, 1);
 });
 
@@ -214,8 +214,20 @@ test("blast-radius owns a natural-language request to empty a folder", async () 
   promptRequest.event.prompt = "ok there's a test123 folder in here please completely delete all its files";
   const result = await runBlastRadius(pipelineInput(promptRequest), cap);
   assert.equal(result.run.pluginId, "openleash.blast-radius");
-  assert.equal(result.run.status, "blocked");
+  assert.equal(result.run.status, "needs_question");
   assert.equal(result.results[0]?.policyId, "blast-radius.filesystem-destructive");
+});
+
+test("blast-radius Ignore records danger without interrupting the agent", async () => {
+  const { cap, emitted } = capabilities();
+  const plugins = new Map<string, PluginSettingState>([["openleash.blast-radius", {
+    enabled: true,
+    config: { destructiveAction: "allow", databaseMutationAction: "allow", broadFilesystemAction: "allow" },
+  }]]);
+  const result = await runBlastRadius(pipelineInput(request("Bash", { command: "rm -rf /" }), plugins), cap);
+  assert.equal(result.run.status, "passed");
+  assert.equal(result.results.length, 0);
+  assert.ok(emitted.signals.some((signal) => (signal as { decision?: string }).decision === "allow"));
 });
 
 test("blast-radius owns a natural-language request to drop every SQL table", async () => {

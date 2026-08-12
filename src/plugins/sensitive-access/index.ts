@@ -11,7 +11,7 @@ type Match = {
   severity: PolicyDecision["severity"];
   explanation: string;
   evidence: string[];
-  action: "ask" | "block";
+  action: "allow" | "ask" | "block";
   source?: "heuristic" | "llm";
 };
 
@@ -52,7 +52,8 @@ export async function runSensitiveAccess(input: EvaluationPipelineInput, capabil
       if (!matches.some((item) => item.policyId === match.policyId)) matches.push(match);
     }
   }
-  const results: PolicyDecision[] = matches.map((match) => ({
+  const enforcedMatches = matches.filter((match) => match.action !== "allow");
+  const results: PolicyDecision[] = enforcedMatches.map((match) => ({
     policyId: match.policyId,
     policyName: match.policyName,
     status: match.action === "block" ? "failed" : "needs_question",
@@ -76,6 +77,20 @@ export async function runSensitiveAccess(input: EvaluationPipelineInput, capabil
       correlationKeys: ["sensitive-access", `session:${input.request.event.sessionId}`]
     });
   }
+  for (const match of matches.filter((item) => item.action === "allow")) {
+    await capabilities.signals.emit({
+      kind: "security.finding",
+      severity: match.severity,
+      title: match.policyName,
+      summary: `${match.explanation} Leash recorded it and let the agent continue.`,
+      decision: "allow",
+      status: "observed",
+      target: { type: input.request.event.tool?.name ? "tool_call" : "agent_event", name: input.request.event.tool?.name ?? input.request.event.eventName },
+      evidence: match.evidence,
+      details: { pluginId: manifest.id, configuredAction: "allow" },
+      correlationKeys: ["sensitive-access", `session:${input.request.event.sessionId}`]
+    });
+  }
   if (results.length > 0) {
     await capabilities.log.emit({
       level: results.some((result) => result.status === "failed") ? "security" : "warn",
@@ -92,7 +107,11 @@ export async function runSensitiveAccess(input: EvaluationPipelineInput, capabil
       pluginId: manifest.id,
       event: eventForHookEvent(input.request.event.eventName),
       status: results.some((result) => result.status === "failed") ? "blocked" : results.length ? "needs_question" : "passed",
-      summary: results.length ? `${results.length} sensitive access pattern${results.length === 1 ? "" : "s"} detected.` : "No sensitive access detected.",
+      summary: results.length
+        ? `${results.length} sensitive access pattern${results.length === 1 ? "" : "s"} detected.`
+        : matches.length
+          ? "Sensitive access was recorded and allowed by your setting."
+          : "No sensitive access detected.",
       startedAt,
       findings: results.map((result) => ({
         title: result.policyName,
@@ -310,10 +329,10 @@ function compactUnknown(value: unknown, max: number): unknown {
 }
 
 function pluginConfig(config: Record<string, unknown> | undefined) {
-  const action = (value: unknown, fallback: "ask" | "block") => value === "ask" || value === "block" ? value : fallback;
+  const action = (value: unknown, fallback: "allow" | "ask" | "block") => value === "allow" || value === "ask" || value === "block" ? value : fallback;
   return {
     secretFileAction: action(config?.secretFileAction, "ask"),
-    envDumpAction: action(config?.envDumpAction, "block"),
+    envDumpAction: action(config?.envDumpAction, "ask"),
     exfiltrationAction: action(config?.exfiltrationAction, "block")
   };
 }

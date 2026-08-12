@@ -23,16 +23,16 @@ export const blastRadiusManifest: OpenLeashPluginManifest = {
     additionalProperties: false,
     properties: {
       enabled: { type: "boolean" },
-      destructiveAction: { enum: ["ask", "block"] },
-      databaseMutationAction: { enum: ["ask", "block"] },
-      broadFilesystemAction: { enum: ["ask", "block"] }
+      destructiveAction: { enum: ["allow", "ask", "block"] },
+      databaseMutationAction: { enum: ["allow", "ask", "block"] },
+      broadFilesystemAction: { enum: ["allow", "ask", "block"] }
     }
   },
   defaultConfig: {
     enabled: true,
-    destructiveAction: "block",
+    destructiveAction: "ask",
     databaseMutationAction: "ask",
-    broadFilesystemAction: "block"
+    broadFilesystemAction: "ask"
   },
   tags: ["security", "destructive", "database", "tools"]
 };
