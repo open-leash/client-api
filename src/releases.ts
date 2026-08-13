@@ -58,6 +58,30 @@ type ReleaseRow = {
   published_at: string;
 };
 
+type GithubReleaseAsset = {
+  name?: unknown;
+  browser_download_url?: unknown;
+  digest?: unknown;
+  size?: unknown;
+};
+
+type GithubRelease = {
+  tag_name?: unknown;
+  html_url?: unknown;
+  body?: unknown;
+  draft?: unknown;
+  prerelease?: unknown;
+  published_at?: unknown;
+  assets?: unknown;
+};
+
+const defaultGithubReleaseRepository = "open-leash/desktop-client";
+const defaultGithubReleaseCacheMs = 5 * 60 * 1000;
+let githubReleaseCache:
+  | { expiresAt: number; release: GithubRelease }
+  | undefined;
+let githubReleaseRequest: Promise<GithubRelease> | undefined;
+
 let pool: Pool | undefined;
 let migrated = false;
 let migrationPromise: Promise<void> | undefined;
@@ -169,6 +193,16 @@ export function clientUpdatesEnabled(
 }
 
 async function latestRelease(request: ClientUpdateRequest) {
+  const githubRelease = await latestGithubRelease(request).catch((error) => {
+    console.warn(
+      `Could not read the latest Leash desktop release from GitHub: ${
+        error instanceof Error ? error.message : "unknown error"
+      }`,
+    );
+    return undefined;
+  });
+  if (githubRelease) return githubRelease;
+
   const database = releaseDb();
   if (!database) return envRelease(request);
   const result = await database.query<ReleaseRow>(
@@ -185,6 +219,150 @@ async function latestRelease(request: ClientUpdateRequest) {
     [request.app, request.channel, request.platform, request.arch]
   );
   return result.rows[0] ?? envRelease(request);
+}
+
+async function latestGithubRelease(
+  request: ClientUpdateRequest,
+): Promise<ReleaseRow | undefined> {
+  if (!githubReleaseUpdatesEnabled()) return undefined;
+  if (request.app !== "openleash-personal" || request.channel !== "stable")
+    return undefined;
+
+  const release = await fetchLatestGithubRelease();
+  if (release.draft === true || release.prerelease === true) return undefined;
+  const version = String(release.tag_name ?? "").replace(/^v/i, "");
+  if (!/^\d+\.\d+\.\d+$/.test(version)) return undefined;
+
+  const filename = releaseAssetName(version, request.platform, request.arch);
+  if (!filename) return undefined;
+  const assets = Array.isArray(release.assets)
+    ? (release.assets as GithubReleaseAsset[])
+    : [];
+  const installer = assets.find((asset) => asset.name === filename);
+  const downloadUrl = String(installer?.browser_download_url ?? "");
+  const sizeBytes = Number(installer?.size);
+  if (
+    !installer ||
+    !downloadUrl ||
+    !Number.isSafeInteger(sizeBytes) ||
+    sizeBytes <= 0
+  )
+    return undefined;
+
+  const sha256 = await githubAssetSha256(
+    installer,
+    assets,
+    filename,
+    request.platform,
+  );
+  if (!sha256) return undefined;
+
+  return {
+    version,
+    channel: request.channel,
+    platform: request.platform,
+    arch: request.arch,
+    dmg_url: downloadUrl,
+    sha256,
+    size_bytes: sizeBytes,
+    notes_url: String(release.html_url ?? "") || null,
+    release_notes: String(release.body ?? "").trim() || null,
+    min_supported_version: null,
+    rollout_percent: 100,
+    published_at:
+      String(release.published_at ?? "") || new Date().toISOString(),
+  };
+}
+
+function githubReleaseUpdatesEnabled(
+  value = process.env.OPENLEASH_GITHUB_RELEASE_UPDATES,
+) {
+  return !["0", "false", "off"].includes(
+    String(value ?? "true").toLowerCase(),
+  );
+}
+
+async function fetchLatestGithubRelease(): Promise<GithubRelease> {
+  const now = Date.now();
+  if (githubReleaseCache && githubReleaseCache.expiresAt > now)
+    return githubReleaseCache.release;
+  if (githubReleaseRequest) return githubReleaseRequest;
+
+  const repository =
+    process.env.OPENLEASH_DESKTOP_RELEASE_REPOSITORY ??
+    defaultGithubReleaseRepository;
+  githubReleaseRequest = fetch(
+    `https://api.github.com/repos/${repository}/releases/latest`,
+    {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "Leash-update-service",
+        "x-github-api-version": "2022-11-28",
+      },
+      signal: AbortSignal.timeout(5_000),
+    },
+  )
+    .then(async (response) => {
+      if (!response.ok)
+        throw new Error(`GitHub returned ${response.status}`);
+      const release = (await response.json()) as GithubRelease;
+      const cacheMs = Number(
+        process.env.OPENLEASH_GITHUB_RELEASE_CACHE_MS ??
+          defaultGithubReleaseCacheMs,
+      );
+      githubReleaseCache = {
+        expiresAt: Date.now() +
+          (Number.isFinite(cacheMs) && cacheMs >= 0
+            ? cacheMs
+            : defaultGithubReleaseCacheMs),
+        release,
+      };
+      return release;
+    })
+    .finally(() => {
+      githubReleaseRequest = undefined;
+    });
+  return githubReleaseRequest;
+}
+
+function releaseAssetName(version: string, platform: string, arch: string) {
+  if (platform === "darwin" && arch === "arm64")
+    return `Leash-${version}-arm64.dmg`;
+  if (platform === "win32" && arch === "x64")
+    return `Leash-${version}-x64-Setup.exe`;
+  return undefined;
+}
+
+async function githubAssetSha256(
+  installer: GithubReleaseAsset,
+  assets: GithubReleaseAsset[],
+  filename: string,
+  platform: string,
+) {
+  const digest = String(installer.digest ?? "");
+  const digestMatch = /^sha256:([a-f0-9]{64})$/i.exec(digest);
+  if (digestMatch) return digestMatch[1].toLowerCase();
+
+  const checksumName =
+    platform === "win32" ? "SHA256SUMS-WINDOWS" : "SHA256SUMS";
+  const checksumAsset = assets.find((asset) => asset.name === checksumName);
+  const checksumUrl = String(checksumAsset?.browser_download_url ?? "");
+  if (!checksumUrl) return undefined;
+  const response = await fetch(checksumUrl, {
+    headers: { "user-agent": "Leash-update-service" },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) return undefined;
+  for (const line of (await response.text()).split(/\r?\n/)) {
+    const match = /^([a-f0-9]{64})\s+\*?(.+)$/.exec(line.trim());
+    if (match?.[2] === filename) return match[1].toLowerCase();
+  }
+  return undefined;
+}
+
+export function resetGithubReleaseCacheForTests() {
+  githubReleaseCache = undefined;
+  githubReleaseRequest = undefined;
 }
 
 function envRelease(request: ClientUpdateRequest): ReleaseRow | undefined {
