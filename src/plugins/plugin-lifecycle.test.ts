@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import http from "node:http";
 import test from "node:test";
 import type { EvaluationRequest, PluginCapabilities, PluginSettingState, Policy } from "@openleash/shared";
 import { runBlastRadius } from "./blast-radius/index.js";
@@ -9,7 +8,6 @@ import { runMcpScanner } from "./mcp-scanner/index.js";
 import { runPromptCompression } from "./prompt-compression/index.js";
 import { runSecurityEvaluator } from "./security-evaluator/index.js";
 import { runSensitiveAccess } from "./sensitive-access/index.js";
-import { runSiemExporter } from "./siem-exporter/index.js";
 import { runSkillScanner } from "./skill-scanner/index.js";
 import { pluginsForEvent } from "./registry.js";
 import { runEvaluationPipeline, runPromptPipeline } from "./runtime.js";
@@ -390,28 +388,4 @@ test("code scanner reports an actual generated-code finding", async () => {
   const result = await runCodeScanner(value, "tool.afterUse", cap, { minimumCodeCharacters: 40 });
   assert.equal(result.status, "passed");
   assert.ok(emitted.signals.length > 0);
-});
-
-test("SIEM exporter sends the normalized outcome to the configured endpoint", async () => {
-  let received = "";
-  const server = http.createServer((req, res) => {
-    req.setEncoding("utf8");
-    req.on("data", (chunk) => { received += chunk; });
-    req.on("end", () => { res.writeHead(204); res.end(); });
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  try {
-    const address = server.address();
-    assert.ok(address && typeof address === "object");
-    const result = await runSiemExporter({
-      request: request(), event: "tool.beforeUse", decision: "deny", summary: "Blocked destructive action",
-      conversationEventId: "event-test", organization: { id: "org-test", name: "Test" }, user: { id: "user-test" },
-      policyResults: [{ policyId: "p", policyName: "Policy", status: "failed", severity: "high", explanation: "blocked" }],
-      config: { enabled: true, protocol: "generic-webhook", endpointUrl: `http://127.0.0.1:${address.port}`, minSeverity: "info" },
-    });
-    assert.equal(result.status, "passed");
-    assert.match(received, /Blocked destructive action/);
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
 });

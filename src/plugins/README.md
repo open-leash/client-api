@@ -14,7 +14,6 @@ Current first-party plugins:
 - `rules-enforcer` evaluates active policies for prompts, agent responses, and tool actions.
 - `mcp-scanner` observes MCP tool calls and records inventory.
 - `skill-scanner` observes skill changes and can create a review finding.
-- `siem-exporter` sends events and plugin logs to configured SIEM targets.
 
 ## Ordering
 
@@ -247,7 +246,7 @@ await capabilities.island.annotateSession({
 });
 ```
 
-If a plugin needs a new privileged operation, add a narrow capability to the shared plugin contract first, declare the matching permission in the manifest, and let the OpenLeash runtime adapt that capability to internal providers. Do not add broad domain capabilities such as `dlp.inspect`, `prompt.compress`, or `security.evaluatePolicies`; those make plugins thin wrappers over OpenLeash internals and prevent third-party developers from shipping real plugin logic. This keeps external plugins contained while still allowing OpenLeash to share configured model access, deterministic fallbacks, audit sinks, plugin-scoped storage, plugin/system logs, SIEM export, security signals, usage records, or other approved services.
+If a Feature needs a new privileged operation, add a narrow capability to the shared contract first, declare the matching permission in the manifest, and let the Leash runtime adapt that capability to internal providers. Broad domain capabilities make Features thin wrappers over core internals. SIEM is deliberately outside this system: organization runtimes consume the dedicated audit-export provider contract, while personal runtimes use its disabled implementation.
 
 The Live Sessions island follows the same boundary. Plugins publish typed annotations, activity, progress, or ambient status through `capabilities.island`; OpenLeash owns the renderer and only exposes a small allowlist of safe navigation actions. Plugins never send HTML, CSS, JavaScript, arbitrary URLs, or custom IPC. See `docs/PLUGIN_ISLAND.md` for the complete developer contract and container emission shape.
 
@@ -487,11 +486,11 @@ if (!previous) {
 }
 ```
 
-That returned finding/`needs_question` is what OpenLeash core turns into the actual approval flow. The plugin does not directly pop a desktop window; OpenLeash core owns desktop, mobile, dashboard, audit, notification policy, SIEM export, and native hook response delivery.
+That returned finding/`needs_question` is what Leash core turns into the actual approval flow. A Feature does not directly pop a desktop window; Leash core owns desktop, mobile, audit, notification policy, organization audit export, and native hook response delivery.
 
 ## Security Signals And CISO Reporting
 
-Logs are useful for operators and SIEM export, but CISO dashboards need normalized records. Plugins should report incidents, findings, discoveries, policy decisions, and inventory observations with `capabilities.signals.emit`.
+Logs are useful for operators and organization audit export, while higher-level reporting needs normalized records. Features should report incidents, findings, discoveries, policy decisions, and inventory observations with `capabilities.signals.emit`.
 
 OpenLeash injects trusted context into every signal:
 
@@ -566,7 +565,7 @@ await capabilities.log.emit({
 });
 ```
 
-OpenLeash core can write its own `openleash.core` system log records for product events such as held approvals or backend failures. The SIEM exporter subscribes to both streams as `log.emitted`, so SOC tools can receive OpenLeash system messages and plugin messages without giving plugins direct network or database access.
+Leash core can write its own `openleash.core` system log records for product events such as held approvals or backend failures. Organization audit-export providers receive both core and Feature logs through the typed audit-export contract, without giving Feature code direct network or database access. Personal runtimes do not register an audit-export provider.
 
 Notification capabilities follow the same rule: a plugin can request or dedupe a notification-shaped event, but OpenLeash core owns whether it is sent, suppressed, silenced, rate-limited, or routed elsewhere.
 

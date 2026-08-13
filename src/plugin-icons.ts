@@ -5,7 +5,6 @@ export const FIRST_PARTY_PLUGIN_ICONS: Readonly<Record<string, string>> = {
   "mcp-scanner": "📡",
   "rules-enforcer": "📏",
   "sensitive-access": "🔐",
-  "siem-exporter": "📤",
   "skill-scanner": "🕵️",
   "code-scanner": "☣️",
 };

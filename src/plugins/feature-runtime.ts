@@ -13,7 +13,6 @@ import { runPromptCompression } from "./prompt-compression/index.js";
 import { firstPartyPluginManifests } from "./registry.js";
 import { runSecurityEvaluator } from "./security-evaluator/index.js";
 import { runSensitiveAccess } from "./sensitive-access/index.js";
-import { runSiemExporter, runSiemLogExporter } from "./siem-exporter/index.js";
 import { runSkillScanner } from "./skill-scanner/index.js";
 import { runPromptPipeline } from "./runtime.js";
 
@@ -31,7 +30,6 @@ export const BUILTIN_FEATURE_HANDLERS = {
   "openleash.mcp-scanner": runMcpScanner,
   "openleash.code-scanner": runCodeScanner,
   "openleash.skill-scanner": runSkillScanner,
-  "openleash.siem-exporter": { event: runSiemExporter, log: runSiemLogExporter },
 } as const;
 
 export type BuiltinFeatureId = keyof typeof BUILTIN_FEATURE_HANDLERS;
