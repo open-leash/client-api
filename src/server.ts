@@ -69,7 +69,25 @@ import {
   verifyBuiltinFeatureRegistry,
 } from "./plugins/feature-runtime.js";
 import { runSkillScanner } from "./plugins/skill-scanner/index.js";
-import { runExportPlugins, runLogExportPlugins } from "./plugins/exports.js";
+import {
+  configureAuditExportProvider,
+  exportAuditDecision,
+  exportAuditLog,
+  type AuditExportProvider,
+} from "./audit-export.js";
+export {
+  activeAuditExportProviderId,
+  configureAuditExportProvider,
+  exportAuditDecision,
+  exportAuditLog,
+} from "./audit-export.js";
+export type {
+  AuditDecisionExport,
+  AuditExportProvider,
+  AuditExportResult,
+  AuditExportSeverity,
+  AuditLogExport,
+} from "./audit-export.js";
 import { normalizePluginSettingProfiles, resolvePluginSettingProfiles } from "./plugins/settings-profiles.js";
 import {
   canUserConfigurePlugin,
@@ -178,10 +196,11 @@ export type StartOpenLeashApiOptions = {
   surface?: ApiSurface;
   port?: number;
   extensions?: OpenLeashApiExtension[];
+  auditExportProvider?: AuditExportProvider;
 };
 export type PrepareOpenLeashApiOptions = Pick<
   StartOpenLeashApiOptions,
-  "app" | "surface" | "extensions"
+  "app" | "surface" | "extensions" | "auditExportProvider"
 >;
 
 export const app = express();
@@ -1514,7 +1533,8 @@ app.get("/admin/security", async (req, res, next) => {
                 ps.target, ps.details, ps.correlation_keys, ps.occurred_at, ps.created_at,
                 u.id as user_id, u.email as user_email, u.display_name as user_name,
                 c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
-                ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+                ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id,
+                e.resolution as evaluation_resolution
          from plugin_signals ps
          left join users u on u.id = ps.user_id
          left join computers c on c.id = ps.computer_id
@@ -1653,7 +1673,8 @@ app.get("/admin/outcomes", async (req, res, next) => {
               o.slug as organization_slug,
               u.email as user_email, u.display_name as user_name,
               c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
-              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id,
+              e.resolution as evaluation_resolution
        from plugin_signals ps
        left join organizations o on o.id = ps.organization_id
        left join users u on u.id = ps.user_id
@@ -1730,7 +1751,8 @@ app.get("/v1/outcomes", async (req, res, next) => {
               o.slug as organization_slug,
               u.email as user_email, u.display_name as user_name,
               c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
-              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id,
+              e.resolution as evaluation_resolution
        from plugin_signals ps
        left join organizations o on o.id = ps.organization_id
        left join users u on u.id = ps.user_id
@@ -1770,14 +1792,18 @@ app.get("/v1/outcomes", async (req, res, next) => {
 
 function signalRowToOutcome(row: any): OpenLeashOutcomeRecord {
   const domain = outcomeDomainForSignal(row.kind, row.plugin_id);
+  const finalDecision = outcomeDecisionForSignal(
+    row.evaluation_resolution,
+    row.decision,
+  );
   return {
     id: String(row.id),
     domain,
     title: String(row.title ?? outcomeDomainLabel(domain)),
     summary: row.summary ?? null,
     severity: normalizeSignalSeverity(row.severity),
-    status: outcomeStatusForSignal(row.status, row.decision, row.kind),
-    decision: row.decision ?? null,
+    status: outcomeStatusForSignal(row.status, finalDecision, row.kind),
+    decision: finalDecision,
     occurredAt: new Date(
       row.occurred_at ?? row.created_at ?? Date.now(),
     ).toISOString(),
@@ -1853,7 +1879,8 @@ async function userPluginOutcomes(
             o.slug as organization_slug,
             u.email as user_email, u.display_name as user_name,
             c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
-            ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+            ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id,
+            e.resolution as evaluation_resolution
      from plugin_signals ps
      left join organizations o on o.id = ps.organization_id
      left join users u on u.id = ps.user_id
@@ -1956,15 +1983,35 @@ function outcomeStatusForSignal(
   if (
     statusText === "blocked" ||
     decisionText === "blocked" ||
-    decisionText === "deny"
+    decisionText === "deny" ||
+    decisionText === "rejected"
   )
     return "blocked";
+  if (decisionText === "approved") return "passed";
   if (statusText === "failed") return "failed";
   if (statusText === "needs_question" || decisionText === "ask")
     return "needs_review";
   if (statusText === "modified") return "modified";
   if (kind === "policy.decision" && !statusText) return "passed";
   return "observed";
+}
+
+function outcomeDecisionForSignal(
+  resolution: unknown,
+  decision: unknown,
+): OpenLeashOutcomeRecord["decision"] {
+  const resolved = String(resolution ?? "").toLowerCase();
+  if (resolved === "allow") return "approved";
+  if (resolved === "deny") return "rejected";
+  const initial = String(decision ?? "").toLowerCase();
+  if (
+    ["allow", "ask", "deny", "blocked", "approved", "rejected", "observed"].includes(
+      initial,
+    )
+  ) {
+    return initial as OpenLeashOutcomeRecord["decision"];
+  }
+  return null;
 }
 
 function normalizeOutcomeSubject(value: unknown) {
@@ -2997,7 +3044,8 @@ app.get("/auth/account/outcomes", async (req, res, next) => {
               o.slug as organization_slug,
               u.email as user_email, u.display_name as user_name,
               c.hostname, ar.kind as agent_kind, ar.display_name as agent_name,
-              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id
+              ce.event_name, ce.tool_name, ce.project_path, e.id as evaluation_id,
+              e.resolution as evaluation_resolution
        from plugin_signals ps
        left join organizations o on o.id = ps.organization_id
        left join users u on u.id = ps.user_id
@@ -8272,29 +8320,22 @@ async function exportPluginLogs({
   user,
   request,
   conversationEventId,
-  plugins,
 }: {
   logs: PluginLogRecord[];
   organization: { id: string; name?: string; slug?: string | null };
   user: { id: string; email?: string; displayName?: string };
   request: EvaluationRequest;
   conversationEventId: string;
-  plugins: Map<string, PluginSettingState>;
 }) {
-  const runs: PluginRunRecord[] = [];
   for (const log of logs) {
-    runs.push(
-      ...(await runLogExportPlugins({
-        log,
-        organization,
-        user,
-        request,
-        conversationEventId,
-        plugins,
-      })),
-    );
+    await exportAuditLog({
+      log,
+      organization,
+      user,
+      request,
+      conversationEventId,
+    });
   }
-  return runs;
 }
 
 async function evaluateAndRecord(
@@ -8447,7 +8488,7 @@ async function evaluateAndRecord(
   }
   const organization = await organizationSummary(organizationId);
   const pluginLogs = await readPluginLogsForConversation(conversationEventId);
-  const logExportRuns = await exportPluginLogs({
+  await exportPluginLogs({
     logs: pluginLogs,
     organization,
     user: {
@@ -8457,9 +8498,8 @@ async function evaluateAndRecord(
     },
     request,
     conversationEventId,
-    plugins: runtimePlugins,
   });
-  const exportRuns = await runExportPlugins({
+  await exportAuditDecision({
     request,
     event: eventForRequest(request),
     decision,
@@ -8475,15 +8515,12 @@ async function evaluateAndRecord(
     computerId,
     runtimeId,
     policyResults: results,
-    pluginRuns: pipeline.runs,
-    pluginLogs,
-    plugins: runtimePlugins,
+    featureRuns: pipeline.runs,
+    featureLogs: pluginLogs,
   });
   await recordPluginRuns(conversationEventId, [
     ...containerRuns,
     ...pipeline.runs,
-    ...logExportRuns,
-    ...exportRuns,
   ]);
   let purposeSummary: string | undefined;
   if (decision === "ask") {
@@ -12960,6 +12997,7 @@ export async function prepareOpenLeashApi(
   if (surface !== "client") {
     throw new Error("Leash no longer exposes a dashboard API surface");
   }
+  configureAuditExportProvider(options.auditExportProvider);
   await ensureDevToken();
   for (const extension of options.extensions ?? []) {
     await extension({ app: runningApp, surface });
