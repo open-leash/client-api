@@ -45,6 +45,12 @@ import {
   type Policy,
   type PolicyDecision,
 } from "@openleash/shared";
+import {
+  acceptsLegacyHookContract,
+  negotiateApiContractVersion,
+  OPENLEASH_API_COMPATIBILITY_HEADER,
+  OPENLEASH_API_NEGOTIATED_VERSION_HEADER,
+} from "./api-versioning.js";
 import { z } from "zod";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
 import { summarizeActionPurpose } from "./evaluator.js";
@@ -248,6 +254,12 @@ app.use(
       OPENLEASH_API_FUNCTION_HEADER,
       OPENLEASH_API_VERSION_HEADER,
     ],
+    exposedHeaders: [
+      OPENLEASH_API_FUNCTION_HEADER,
+      OPENLEASH_API_VERSION_HEADER,
+      OPENLEASH_API_NEGOTIATED_VERSION_HEADER,
+      OPENLEASH_API_COMPATIBILITY_HEADER,
+    ],
   }),
 );
 app.use(express.json({ limit: process.env.OPENLEASH_API_JSON_LIMIT ?? "20mb" }));
@@ -291,20 +303,32 @@ app.use((req, res, next) => {
     OPENLEASH_API_CONTRACTS[functionName],
   );
   const requestedVersion = req.header(OPENLEASH_API_VERSION_HEADER);
-  const acceptsLegacyLocalHookVersion =
-    functionName === "tenantHookEvaluate" &&
-    /^\/v1\/hooks\/[^/]+\/[^/]+$/.test(req.path) &&
-    requestedVersion === OPENLEASH_API_CONTRACTS.localHookEvaluate;
-  if (
-    requestedVersion &&
-    requestedVersion !== OPENLEASH_API_CONTRACTS[functionName] &&
-    !acceptsLegacyLocalHookVersion
-  ) {
+  const negotiation = negotiateApiContractVersion(
+    functionName,
+    requestedVersion,
+  );
+  const acceptsLegacyLocalHookVersion = acceptsLegacyHookContract(
+    functionName,
+    req.path,
+    requestedVersion,
+  );
+  res.setHeader(
+    OPENLEASH_API_NEGOTIATED_VERSION_HEADER,
+    acceptsLegacyLocalHookVersion
+      ? requestedVersion ?? negotiation.negotiatedVersion
+      : negotiation.negotiatedVersion,
+  );
+  res.setHeader(
+    OPENLEASH_API_COMPATIBILITY_HEADER,
+    acceptsLegacyLocalHookVersion ? "backward-compatible" : negotiation.mode,
+  );
+  if (!negotiation.compatible && !acceptsLegacyLocalHookVersion) {
     return res.status(426).json({
       error: "unsupported OpenLeash API contract version",
       function: functionName,
-      expectedVersion: OPENLEASH_API_CONTRACTS[functionName],
+      expectedVersion: negotiation.currentVersion,
       receivedVersion: requestedVersion,
+      compatibility: "Use the same contract name and major version, or update Leash.",
     });
   }
   return next();
