@@ -238,6 +238,15 @@ async function latestGithubRelease(
   const assets = Array.isArray(release.assets)
     ? (release.assets as GithubReleaseAsset[])
     : [];
+  const verificationAsset = releaseVerificationAssetName(
+    request.platform,
+    request.arch,
+  );
+  if (
+    !verificationAsset ||
+    !assets.some((asset) => asset.name === verificationAsset)
+  )
+    return undefined;
   const installer = assets.find((asset) => asset.name === filename);
   const downloadUrl = String(installer?.browser_download_url ?? "");
   const sizeBytes = Number(installer?.size);
@@ -330,6 +339,14 @@ function releaseAssetName(version: string, platform: string, arch: string) {
     return `Leash-${version}-arm64.dmg`;
   if (platform === "win32" && arch === "x64")
     return `Leash-${version}-x64-Setup.exe`;
+  return undefined;
+}
+
+function releaseVerificationAssetName(platform: string, arch: string) {
+  if (platform === "darwin" && arch === "arm64")
+    return "MACOS-NOTARIZATION-VERIFIED";
+  if (platform === "win32" && arch === "x64")
+    return "WINDOWS-SIGNATURE-VERIFIED";
   return undefined;
 }
 

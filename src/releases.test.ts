@@ -80,6 +80,14 @@ test("current desktop version does not receive an update prompt", async () => {
   });
 });
 
+test("an unverified GitHub desktop artifact is never offered as an update", async () => {
+  await withGithubRelease(async () => {
+    const response = await checkForClientUpdate(updateRequest("darwin", "arm64"));
+    assert.equal(response.updateAvailable, false);
+    assert.equal(response.downloadUrl, undefined);
+  }, { verified: false });
+});
+
 function updateRequest(platform: string, arch: string) {
   return {
     app: "openleash-personal",
@@ -92,7 +100,10 @@ function updateRequest(platform: string, arch: string) {
   };
 }
 
-async function withGithubRelease(run: () => Promise<void>) {
+async function withGithubRelease(
+  run: () => Promise<void>,
+  options: { verified?: boolean } = {},
+) {
   const previousFetch = globalThis.fetch;
   const previousDatabaseUrl = process.env.DATABASE_URL;
   const previousReleaseDatabaseUrl = process.env.OPENLEASH_RELEASE_DATABASE_URL;
@@ -121,6 +132,10 @@ async function withGithubRelease(run: () => Promise<void>) {
             digest: `sha256:${"b".repeat(64)}`,
             size: 115_550_425,
           },
+          ...(options.verified === false ? [] : [
+            { name: "MACOS-NOTARIZATION-VERIFIED", size: 1 },
+            { name: "WINDOWS-SIGNATURE-VERIFIED", size: 1 },
+          ]),
         ],
       }),
       { status: 200, headers: { "content-type": "application/json" } },
