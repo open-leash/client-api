@@ -283,8 +283,22 @@ function pluginFailureApprovalExplanation(
   plugin: OpenLeashPluginManifest,
   error: unknown,
 ) {
-  const diagnostic = error instanceof Error ? error.message : String(error);
+  const diagnostic = safePluginFailureDiagnostic(error);
   return `${pluginSlug(plugin)} could not complete its safety check: ${diagnostic}. Leash is holding the action for your approval.`;
+}
+
+export function safePluginFailureDiagnostic(error: unknown) {
+  const diagnostic = (error instanceof Error ? error.message : String(error))
+    .replace(/\b(?:sk|key|token|secret)-[A-Za-z0-9_-]{4,}\b/gi, "[redacted credential]")
+    .replace(/\b(?:api[_ -]?key|token|secret|password)\s*(?:is|=|:|provided:?)\s*[^\s.,;]+/gi, "[redacted credential]")
+    .trim();
+  if (/\b401\b|incorrect api key|invalid api key|unauthori[sz]ed|authentication/i.test(diagnostic))
+    return "the configured evaluator credentials were rejected";
+  if (/timed? out|timeout|abort(?:ed)?/i.test(diagnostic))
+    return "the evaluator timed out";
+  return diagnostic.length > 180
+    ? `${diagnostic.slice(0, 177)}...`
+    : diagnostic || "the evaluator returned an unknown error";
 }
 
 function pluginFailureRun(

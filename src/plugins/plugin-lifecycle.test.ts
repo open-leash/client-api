@@ -10,7 +10,7 @@ import { runSecurityEvaluator } from "./security-evaluator/index.js";
 import { runSensitiveAccess } from "./sensitive-access/index.js";
 import { runSkillScanner } from "./skill-scanner/index.js";
 import { pluginsForEvent } from "./registry.js";
-import { runEvaluationPipeline, runPromptPipeline } from "./runtime.js";
+import { runEvaluationPipeline, runPromptPipeline, safePluginFailureDiagnostic } from "./runtime.js";
 
 function request(toolName = "Bash", input: unknown = { command: "echo ok" }): EvaluationRequest {
   return {
@@ -76,6 +76,14 @@ test("DLP masks credentials and emits an auditable signal", async () => {
   assert.equal(result.run.status, "modified");
   assert.ok(!result.prompt.includes(credential));
   assert.ok(emitted.signals.length > 0);
+});
+
+test("plugin failures never expose rejected credentials in user-facing diagnostics", () => {
+  const diagnostic = safePluginFailureDiagnostic(
+    new Error("401 Incorrect API key provided: sk-test-should-never-appear"),
+  );
+  assert.equal(diagnostic, "the configured evaluator credentials were rejected");
+  assert.doesNotMatch(diagnostic, /sk-test|api key provided/i);
 });
 
 test("token-saver publishes its latest percentage saving to the island", async () => {
@@ -204,6 +212,54 @@ test("blast-radius asks before recursive filesystem deletion by default", async 
   assert.equal(emitted.island.length, 1);
 });
 
+test("blast-radius catches common recursive deletion and overwrite bypasses", async () => {
+  const commands = [
+    "rm -r nested/valuable",
+    "find nested/valuable -depth -delete",
+    `python3 -c "import shutil; shutil.rmtree('nested/valuable')"`,
+    `node -e "require('fs').rmSync('nested/valuable',{recursive:true,force:true})"`,
+    `ruby -e "require 'fileutils'; FileUtils.rm_rf('nested/valuable')"`,
+    "Remove-Item nested/valuable -Recurse -Force",
+    "truncate -s 0 important-customer-export.csv",
+    "dd if=/dev/zero of=important-customer-export.csv bs=1 count=1",
+  ];
+  for (const command of commands) {
+    const { cap } = capabilities();
+    const result = await runBlastRadius(
+      pipelineInput(request("Bash", { command })),
+      cap,
+    );
+    assert.equal(
+      result.results[0]?.policyId,
+      "blast-radius.filesystem-destructive",
+      command,
+    );
+    assert.equal(result.run.status, "needs_question", command);
+  }
+});
+
+test("blast-radius catches destructive Git cleanup variants", async () => {
+  const commands = [
+    "git clean -fdx",
+    "git reset --hard HEAD~1",
+    "git checkout -- .",
+    "git restore .",
+  ];
+  for (const command of commands) {
+    const { cap } = capabilities();
+    const result = await runBlastRadius(
+      pipelineInput(request("Bash", { command })),
+      cap,
+    );
+    assert.equal(
+      result.results[0]?.policyId,
+      "blast-radius.workspace-destructive",
+      command,
+    );
+    assert.equal(result.run.status, "needs_question", command);
+  }
+});
+
 test("blast-radius owns a natural-language request to empty a folder", async () => {
   const { cap } = capabilities();
   const promptRequest = request();
@@ -214,6 +270,7 @@ test("blast-radius owns a natural-language request to empty a folder", async () 
   assert.equal(result.run.pluginId, "openleash.blast-radius");
   assert.equal(result.run.status, "needs_question");
   assert.equal(result.results[0]?.policyId, "blast-radius.filesystem-destructive");
+
 });
 
 test("blast-radius Ignore records danger without interrupting the agent", async () => {

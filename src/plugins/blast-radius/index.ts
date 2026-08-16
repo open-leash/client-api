@@ -109,13 +109,13 @@ function detectBlastRadius(text: string, config: ReturnType<typeof pluginConfig>
   const add = (match: Match) => {
     if (!matches.some((item) => item.policyId === match.policyId)) matches.push(match);
   };
-  if (/\brm\s+(-[a-z]*r[a-z]*f|-rf|-fr)\b|\brm\s+.*\s(\/|\*|~|\$HOME)\b|\bfind\b.+\b-delete\b/i.test(text)) {
+  if (/\brm\s+-[a-z]*r[a-z]*\b|\brm\s+.*\s(\/|\*|~|\$HOME)\b|\bfind\b.+(?:^|\s)-delete\b|\bshutil\.rmtree\s*\(|\b(?:fs\.)?(?:rmSync|rm)\s*\([^)]*recursive\s*:\s*true|\bFileUtils\.rm_rf\b|\bRemove-Item\b[^\n;&|]*(?:^|\s)-Recurse\b|\btruncate\s+(?:-[^\s]+\s+)*0\s+[^\n;&|]+|\bdd\b[^\n;&|]*\bif=\/dev\/zero\b[^\n;&|]*\bof=\S+/im.test(text)) {
     add({
       policyId: "blast-radius.filesystem-destructive",
       policyName: "Destructive filesystem operation",
       severity: "critical",
       explanation: "The agent is trying to delete files recursively or with broad wildcards.",
-      evidence: snippets(text, [/rm\s+[^\n;&|]+/i, /find\s+[^\n;&|]+-delete[^\n;&|]*/i]),
+      evidence: snippets(text, [/rm\s+[^\n;&|]+/i, /find\s+[^\n;&|]+-delete[^\n;&|]*/i, /(?:shutil\.rmtree|(?:fs\.)?(?:rmSync|rm)|FileUtils\.rm_rf|Remove-Item|truncate|dd)\b[^\n;&|]*/i]),
       action: config.broadFilesystemAction
     });
   }
@@ -149,13 +149,13 @@ function detectBlastRadius(text: string, config: ReturnType<typeof pluginConfig>
       action: config.destructiveAction
     });
   }
-  if (/\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[^\n;&]*f\b|\bchmod\s+-R\s+777\b|\bchown\s+-R\b/i.test(text)) {
+  if (/\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+(?=[^\n;&]*-[a-z]*f)[^\n;&]+|\bgit\s+(?:checkout\s+--|restore)\s+\.(?=$|[\s"';&|])|\bchmod\s+-R\s+777\b|\bchown\s+-R\b/i.test(text)) {
     add({
       policyId: "blast-radius.workspace-destructive",
       policyName: "Destructive workspace operation",
       severity: "high",
       explanation: "The agent is trying to rewrite, purge, or broadly weaken workspace state.",
-      evidence: snippets(text, [/git\s+reset\s+--hard[^\n;&]*/i, /git\s+clean\s+-[^\n;&]*f[^\n;&]*/i, /(chmod|chown)\s+-R[^\n;&]*/i]),
+      evidence: snippets(text, [/git\s+reset\s+--hard[^\n;&]*/i, /git\s+clean\s+[^\n;&]*/i, /git\s+(?:checkout\s+--|restore)\s+\.[^\n;&]*/i, /(chmod|chown)\s+-R[^\n;&]*/i]),
       action: config.destructiveAction
     });
   }

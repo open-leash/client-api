@@ -1,9 +1,9 @@
-import { firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
+import { LEASH_FEATURE_PRESENTATIONS, firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const dlpManifest: OpenLeashPluginManifest = {
   id: "openleash.dlp",
-  name: "data-leakage-prevention",
-  description: "Mask secrets before agents send them.",
+  name: LEASH_FEATURE_PRESENTATIONS["data-leakage-prevention"].name,
+  description: LEASH_FEATURE_PRESENTATIONS["data-leakage-prevention"].description,
   repositoryUrl: "https://github.com/open-leash/plugin-data-leakage-prevention",
   version: "1.0.0",
   publisher: "openleash",
@@ -31,7 +31,7 @@ export const dlpManifest: OpenLeashPluginManifest = {
     }
   },
   defaultConfig: {
-    enabled: false,
+    enabled: true,
     action: "ask",
     categories: ["pii", "phi", "tokens", "keys", "credentials"]
   },

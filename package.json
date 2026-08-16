@@ -1,6 +1,6 @@
 {
   "name": "@openleash/client-api",
-  "version": "0.37.0",
+  "version": "0.37.1",
   "type": "module",
   "main": "dist/server.js",
   "types": "dist/server.d.ts",
@@ -27,7 +27,7 @@
     "db:bootstrap-personal": "tsx src/bootstrap-personal.ts"
   },
   "dependencies": {
-    "@openleash/shared": "0.2.0",
+    "@openleash/shared": "0.2.1",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^4.19.2",

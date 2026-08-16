@@ -1,10 +1,10 @@
-import { firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
+import { LEASH_FEATURE_PRESENTATIONS, firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const sensitiveAccessManifest: OpenLeashPluginManifest = {
   id: "openleash.sensitive-access",
   slug: "sensitive-access",
-  name: "sensitive-access",
-  description: "Catch agents reading secrets, printing env vars, or touching credential files.",
+  name: LEASH_FEATURE_PRESENTATIONS["sensitive-access"].name,
+  description: LEASH_FEATURE_PRESENTATIONS["sensitive-access"].description,
   repositoryUrl: "https://github.com/open-leash/plugin-sensitive-access",
   version: "1.0.0",
   publisher: "openleash",

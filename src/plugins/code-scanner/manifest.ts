@@ -1,4 +1,4 @@
-import { firstPartyFeature, type AgentKind, type OpenLeashPluginManifest } from "@openleash/shared";
+import { LEASH_FEATURE_PRESENTATIONS, firstPartyFeature, type AgentKind, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const CODE_SCANNER_AGENT_KINDS: AgentKind[] = [
   "claude-code",
@@ -21,9 +21,8 @@ export const codeScannerManifest: OpenLeashPluginManifest & {
 } = {
   id: "openleash.code-scanner",
   slug: "code-scanner",
-  name: "code-scanner",
-  description:
-    "Review AI-generated code for exploitable vulnerabilities and notify the developer.",
+  name: LEASH_FEATURE_PRESENTATIONS["code-scanner"].name,
+  description: LEASH_FEATURE_PRESENTATIONS["code-scanner"].description,
   repositoryUrl: "https://github.com/open-leash/plugin-code-scanner",
   version: "1.0.0",
   publisher: "openleash",

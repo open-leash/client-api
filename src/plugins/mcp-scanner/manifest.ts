@@ -1,9 +1,9 @@
-import { firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
+import { LEASH_FEATURE_PRESENTATIONS, firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const mcpScannerManifest: OpenLeashPluginManifest = {
   id: "openleash.mcp-scanner",
-  name: "mcp-scanner",
-  description: "See every MCP server, tool, and call.",
+  name: LEASH_FEATURE_PRESENTATIONS["mcp-scanner"].name,
+  description: LEASH_FEATURE_PRESENTATIONS["mcp-scanner"].description,
   repositoryUrl: "https://github.com/open-leash/plugin-mcp-scanner",
   version: "1.0.0",
   publisher: "openleash",

@@ -42,13 +42,13 @@ export type PromptTransformResult = {
 
 export const defaultPromptTransformConfig: PromptTransformConfig = {
   compression: {
-    enabled: false,
+    enabled: true,
     level: "standard",
     conciseResponse: false,
     model: process.env.OPENLEASH_PROMPT_TRANSFORM_MODEL ?? "gpt-4.1-nano"
   },
   dlp: {
-    enabled: false,
+    enabled: true,
     action: "ask",
     categories: ["pii", "phi", "tokens", "keys", "credentials"],
     model: process.env.OPENLEASH_PROMPT_TRANSFORM_MODEL ?? "gpt-4.1-nano"

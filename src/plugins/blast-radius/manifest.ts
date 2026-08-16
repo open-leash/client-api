@@ -1,10 +1,10 @@
-import { firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
+import { LEASH_FEATURE_PRESENTATIONS, firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const blastRadiusManifest: OpenLeashPluginManifest = {
   id: "openleash.blast-radius",
   slug: "blast-radius",
-  name: "blast-radius",
-  description: "Block destructive tool use before agents damage files, databases, or infrastructure.",
+  name: LEASH_FEATURE_PRESENTATIONS["blast-radius"].name,
+  description: LEASH_FEATURE_PRESENTATIONS["blast-radius"].description,
   repositoryUrl: "https://github.com/open-leash/plugin-blast-radius",
   version: "1.0.2",
   publisher: "openleash",

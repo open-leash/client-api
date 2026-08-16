@@ -1,9 +1,9 @@
-import { firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
+import { LEASH_FEATURE_PRESENTATIONS, firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const securityEvaluatorManifest: OpenLeashPluginManifest = {
   id: "openleash.rules-enforcer",
-  name: "rules-enforcer",
-  description: "Watch agent conversations and pause when configured rules are violated.",
+  name: LEASH_FEATURE_PRESENTATIONS["rules-enforcer"].name,
+  description: LEASH_FEATURE_PRESENTATIONS["rules-enforcer"].description,
   repositoryUrl: "https://github.com/open-leash/plugin-rules-enforcer",
   version: "1.0.0",
   publisher: "openleash",

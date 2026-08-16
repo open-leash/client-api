@@ -18,6 +18,13 @@ test("every shipped Feature has a reviewed in-process handler", () => {
   assert.ok(results.every((result) => result.healthy && result.protocolVerified));
 });
 
+test("every built-in Feature starts enabled for a new user", () => {
+  assert.ok(firstPartyPluginManifests.length > 0);
+  for (const feature of firstPartyPluginManifests) {
+    assert.equal(feature.defaultConfig?.enabled, true, feature.id);
+  }
+});
+
 test("provider prompt helpers support OpenAI and Anthropic request shapes", () => {
   const responses = { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "old" }] }] };
   assert.equal(latestProviderPrompt(responses), "old");

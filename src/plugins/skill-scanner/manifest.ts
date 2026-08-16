@@ -1,9 +1,9 @@
-import { firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
+import { LEASH_FEATURE_PRESENTATIONS, firstPartyFeature, type OpenLeashPluginManifest } from "@openleash/shared";
 
 export const skillScannerManifest: OpenLeashPluginManifest = {
   id: "openleash.skill-scanner",
-  name: "skill-scanner",
-  description: "Catch suspicious instructions before they spread.",
+  name: LEASH_FEATURE_PRESENTATIONS["skill-scanner"].name,
+  description: LEASH_FEATURE_PRESENTATIONS["skill-scanner"].description,
   repositoryUrl: "https://github.com/open-leash/plugin-skill-scanner",
   version: "1.0.2",
   publisher: "openleash",
