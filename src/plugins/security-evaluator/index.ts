@@ -177,7 +177,7 @@ async function evaluateRules(input: EvaluationPipelineInput, capabilities: Plugi
       input.policies.some((policy) => !evaluatedPolicyIds.has(policy.id))
     ) {
       throw new Error(
-        "Rules Enforcer received an incomplete evaluation for the configured rules."
+        "Leash Rules Protection received an incomplete evaluation for the configured rules."
       );
     }
     return {
@@ -187,7 +187,7 @@ async function evaluateRules(input: EvaluationPipelineInput, capabilities: Plugi
   }
   if (fallback.some((result) => result.status === "passed")) {
     throw new Error(
-      "Rules Enforcer cannot evaluate configured natural-language rules because no evaluation model is configured."
+      "Leash Rules Protection cannot evaluate configured natural-language rules because no evaluation model is configured."
     );
   }
   return {
