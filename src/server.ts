@@ -14,6 +14,7 @@ import {
   HOOK_AGENT_METADATA,
   type AgentKind,
   type ConversationTurn,
+  type DashboardActivitySummary,
   type EvaluationRequest,
   type EvaluationResponse,
   type AgentEventSource,
@@ -45,6 +46,12 @@ import {
   type Policy,
   type PolicyDecision,
 } from "@openleash/shared";
+import {
+  configureRuntimePolicyProvider,
+  effectiveRuntimeDecision,
+  runtimePolicyForUser,
+  type RuntimePolicyProvider,
+} from "./runtime-policy.js";
 import {
   acceptsLegacyHookContract,
   negotiateApiContractVersion,
@@ -193,6 +200,17 @@ function statusCodeForError(error: unknown) {
     : 500;
 }
 
+function isEvaluationResponse(value: unknown): value is EvaluationResponse {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      "decision" in value &&
+      "decisionId" in value &&
+      "summary" in value &&
+      "results" in value,
+  );
+}
+
 export type ApiSurface = "client" | "dashboard" | "all";
 export type OpenLeashApiExtension = (
   context: OpenLeashApiContext,
@@ -207,10 +225,11 @@ export type StartOpenLeashApiOptions = {
   port?: number;
   extensions?: OpenLeashApiExtension[];
   auditExportProvider?: AuditExportProvider;
+  runtimePolicyProvider?: RuntimePolicyProvider;
 };
 export type PrepareOpenLeashApiOptions = Pick<
   StartOpenLeashApiOptions,
-  "app" | "surface" | "extensions" | "auditExportProvider"
+  "app" | "surface" | "extensions" | "auditExportProvider" | "runtimePolicyProvider"
 >;
 
 export const app = express();
@@ -729,7 +748,7 @@ app.post("/v1/evaluate", async (req, res, next) => {
     if (await isSessionMonitoringPaused(user, request)) {
       return res.json(sessionMonitoringPausedDecision());
     }
-    res.json(await evaluateAndRecord(request, user));
+    res.json(await effectiveRuntimeDecision(user, await evaluateAndRecord(request, user)));
   } catch (error) {
     next(error);
   }
@@ -806,7 +825,8 @@ app.post("/v1/agent-events", async (req, res, next) => {
         event: envelope.request.event.eventName,
         decision: duplicate.decision,
       });
-      return res.json({ ...duplicate, source, deduplicated: true });
+      const effective = await effectiveRuntimeDecision(user, duplicate);
+      return res.json({ ...effective, source, deduplicated: true });
     }
     const inflightKey = `${user.id}:${envelope.idempotencyKey}`;
     const inflight = inflightNormalizedEvents.get(inflightKey);
@@ -819,7 +839,10 @@ app.post("/v1/agent-events", async (req, res, next) => {
         event: envelope.request.event.eventName,
         decision: "decision" in result ? result.decision : undefined,
       });
-      return res.json({ ...result, source, deduplicated: true });
+      const effective = isEvaluationResponse(result)
+        ? await effectiveRuntimeDecision(user, result)
+        : result;
+      return res.json({ ...effective, source, deduplicated: true });
     }
     envelope.request.event.raw = attachEventEnvelope(
       envelope.request.event.raw,
@@ -868,7 +891,10 @@ app.post("/v1/agent-events", async (req, res, next) => {
             : "intercepted_bytes_not_released",
         result,
       });
-      res.json({ ...result, source, deduplicated: false });
+      const effective = isEvaluationResponse(result)
+        ? await effectiveRuntimeDecision(user, result)
+        : result;
+      res.json({ ...effective, source, deduplicated: false });
     } finally {
       if (inflightNormalizedEvents.get(inflightKey) === evaluation)
         inflightNormalizedEvents.delete(inflightKey);
@@ -1092,7 +1118,8 @@ app.post("/v1/hooks/:agent/:event", async (req, res, next) => {
         event: eventName,
         decision: duplicate.decision,
       });
-      return res.json(nativeHookDecision(agent, eventName, duplicate));
+      const effective = await effectiveRuntimeDecision(user, duplicate);
+      return res.json(nativeHookDecision(agent, eventName, effective));
     }
     request.event.raw = attachEventEnvelope(request.event.raw, hookEnvelope);
     if (isPromptOnlyHook(request)) {
@@ -3979,6 +4006,7 @@ app.get("/v1/mobile/state", async (req, res, next) => {
       session.user.id,
       pluginCatalog.plugins,
     );
+    const runtimePolicy = await runtimePolicyForUser(session.user);
     const summary = outcomeSummary(pluginOutcomes.outcomes);
     res.json({
       user: session.user,
@@ -4015,11 +4043,12 @@ app.get("/v1/mobile/state", async (req, res, next) => {
         summary,
       }),
       clientConfig: {
-        approvalNotifications: true,
+        approvalNotifications: runtimePolicy.notifyEmployees,
         managedByOrganization: isOrganizationManagedAccount(
           productMode,
           session.account?.audience,
         ),
+        runtimePolicy,
       },
     });
   } catch (error) {
@@ -4035,16 +4064,18 @@ app.get("/v1/client/overview", async (req, res, next) => {
     );
     if (!session)
       return res.status(401).json({ error: "invalid OpenLeash session" });
-    const [agents, pluginCatalog, pluginOutcomes] = await Promise.all([
+    const [agents, pluginCatalog, pluginOutcomes, activitySummary] = await Promise.all([
       clientOverviewAgents(session.organization.id, session.user.id),
       pluginCatalogForOrganization(session.organization.id, session.user.id),
       userPluginOutcomes(session.organization.id, session.user.id, { limit: 12 }),
+      personalDashboardActivitySummary(session.organization.id, session.user.id),
     ]);
     const summary = outcomeSummary(pluginOutcomes.outcomes);
     res.json({
       agents: agents.rows,
       plugins: pluginCatalog.plugins,
       outcomes: pluginOutcomes.outcomes,
+      activitySummary,
       viewModel: buildOpenLeashClientViewModel({
         plugins: pluginCatalog.plugins,
         outcomes: pluginOutcomes.outcomes,
@@ -4139,6 +4170,7 @@ app.get("/v1/client/notifications", async (req, res, next) => {
       session.user.id,
       pluginCatalog.plugins,
     );
+    const runtimePolicy = await runtimePolicyForUser(session.user);
     res.json({
       serverTime: new Date().toISOString(),
       pendingApprovals: pending.rows,
@@ -4153,6 +4185,10 @@ app.get("/v1/client/notifications", async (req, res, next) => {
         blocked: blocked.rows,
         activity: activity.rows,
       }),
+      clientConfig: {
+        approvalNotifications: runtimePolicy.notifyEmployees,
+        runtimePolicy,
+      },
     });
   } catch (error) {
     next(error);
@@ -6278,6 +6314,7 @@ async function handlePromptOnlyHook(
         ? `${request.agent.displayName} is waiting because a plugin safety check failed. Allow this action once?`
         : `${request.agent.displayName} wants to proceed with sensitive access. Allow it once?`
       : undefined);
+  const runtimePolicy = await runtimePolicyForUser(user);
   const evaluation = await pool.query<{ id: string }>(
     `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
      values ($1, $2, $3, $4, $5, $6) returning id`,
@@ -6318,21 +6355,33 @@ async function handlePromptOnlyHook(
       request,
       tenantModelKey,
     );
-    notifyMobileApprovers(
-      user.id,
-      evaluation.rows[0].id,
-      summary,
-      question,
-      purposeSummary,
-      attentionKindForTool(request.event.tool?.name ?? ""),
-    ).catch((error) => {
+    const notification = runtimePolicy.enforcementMode === "learning"
+      ? notifyMobileEvent(user.id, {
+          title: "Leash observed an action in learning mode",
+          body: summary,
+          data: { decisionId: evaluation.rows[0].id, kind: "learning_only" },
+        })
+      : notifyMobileApprovers(
+          user.id,
+          evaluation.rows[0].id,
+          summary,
+          question,
+          purposeSummary,
+          attentionKindForTool(request.event.tool?.name ?? ""),
+        );
+    notification.catch((error) => {
       console.warn("mobile approval notification failed", error);
     });
   } else if (decision === "deny") {
     notifyMobileEvent(user.id, {
-      title: "Leash blocked an agent action",
+      title: runtimePolicy.enforcementMode === "learning"
+        ? "Leash observed an action in learning mode"
+        : "Leash blocked an agent action",
       body: summary,
-      data: { decisionId: evaluation.rows[0].id, kind: "blocked" },
+      data: {
+        decisionId: evaluation.rows[0].id,
+        kind: runtimePolicy.enforcementMode === "learning" ? "learning_only" : "blocked",
+      },
     }).catch((error) => {
       console.warn("mobile blocked notification failed", error);
     });
@@ -8457,6 +8506,7 @@ async function evaluateAndRecord(
         : undefined));
   const summary =
     decision === "allow" ? "All active policies passed." : approvalSummary;
+  const runtimePolicy = await runtimePolicyForUser(user);
   const evaluation = await pool.query(
     `insert into evaluations (conversation_event_id, user_id, decision, summary, question, model)
      values ($1, $2, $3, $4, $5, $6) returning id`,
@@ -8499,7 +8549,9 @@ async function evaluateAndRecord(
       computerId,
       runtimeId,
       level: "security",
-      code: "action-held-for-approval",
+      code: runtimePolicy.enforcementMode === "learning"
+        ? "action-observed-learning-only"
+        : "action-held-for-approval",
       message: summary,
       data: {
         evaluationId: evaluation.rows[0].id,
@@ -8564,21 +8616,33 @@ async function evaluateAndRecord(
         JSON.stringify({ openleashPurposeSummary: purposeSummary }),
       ],
     );
-    notifyMobileApprovers(
-      user.id,
-      evaluation.rows[0].id,
-      summary,
-      question,
-      purposeSummary,
-      attentionKindForTool(request.event.tool?.name ?? ""),
-    ).catch((error) => {
+    const notification = runtimePolicy.enforcementMode === "learning"
+      ? notifyMobileEvent(user.id, {
+          title: "Leash observed an action in learning mode",
+          body: summary,
+          data: { decisionId: evaluation.rows[0].id, kind: "learning_only" },
+        })
+      : notifyMobileApprovers(
+          user.id,
+          evaluation.rows[0].id,
+          summary,
+          question,
+          purposeSummary,
+          attentionKindForTool(request.event.tool?.name ?? ""),
+        );
+    notification.catch((error) => {
       console.warn("mobile approval notification failed", error);
     });
   } else if (decision === "deny") {
     notifyMobileEvent(user.id, {
-      title: "Leash blocked an agent action",
+      title: runtimePolicy.enforcementMode === "learning"
+        ? "Leash observed an action in learning mode"
+        : "Leash blocked an agent action",
       body: summary,
-      data: { decisionId: evaluation.rows[0].id, kind: "blocked" },
+      data: {
+        decisionId: evaluation.rows[0].id,
+        kind: runtimePolicy.enforcementMode === "learning" ? "learning_only" : "blocked",
+      },
     }).catch((error) => {
       console.warn("mobile blocked notification failed", error);
     });
@@ -9080,6 +9144,7 @@ async function waitForHookDecision(
   // only resolves the durable evaluation; the resulting native response is
   // returned to that exact desktop, cloud-agent, or SaaS request rather than
   // being broadcast as an executable command to an arbitrary desktop.
+  decision = await effectiveRuntimeDecision(user, decision);
   if (decision.decision !== "ask") return decision;
   const timeoutMs = Number(
     process.env.OPENLEASH_HOOK_APPROVAL_TIMEOUT_MS ?? 600000,
@@ -11027,6 +11092,103 @@ function clientOverviewAgents(organizationId: string, userId: string) {
   );
 }
 
+async function personalDashboardActivitySummary(
+  organizationId: string,
+  userId: string,
+  rangeDays = 30,
+): Promise<DashboardActivitySummary> {
+  const [totals, threats, agentKinds] = await Promise.all([
+    pool.query(
+      `select count(*)::int as checked,
+              count(*) filter (
+                where e.resolution = 'deny'
+                   or (e.decision = 'deny' and coalesce(e.resolved_by, '') <> 'organization-learning-mode')
+              )::int as blocked,
+              count(*) filter (
+                where e.decision = 'allow'
+                   or (e.resolution = 'allow' and e.resolved_by = 'organization-learning-mode')
+              )::int as automatically_approved,
+              count(*) filter (
+                where e.decision = 'ask'
+                  and e.resolution = 'allow'
+                  and coalesce(e.resolved_by, '') <> 'organization-learning-mode'
+              )::int as manually_approved,
+              count(*) filter (where e.decision = 'ask' and e.resolution is null)::int as waiting
+       from evaluations e
+       join users u on u.id = e.user_id
+       where u.organization_id = $1
+         and e.user_id = $2
+         and e.created_at >= now() - make_interval(days => $3)`,
+      [organizationId, userId, rangeDays],
+    ),
+    pool.query(
+      `select coalesce(nullif(p.category, ''), nullif(pr.policy_name, ''), 'Other threats') as name,
+              count(distinct e.id)::int as total,
+              count(distinct e.id) filter (
+                where e.resolution = 'deny'
+                   or (e.decision = 'deny' and coalesce(e.resolved_by, '') <> 'organization-learning-mode')
+              )::int as blocked,
+              count(distinct e.id) filter (
+                where e.resolution = 'allow' and e.resolved_by = 'organization-learning-mode'
+              )::int as automatically_approved,
+              count(distinct e.id) filter (
+                where e.decision = 'ask'
+                  and e.resolution = 'allow'
+                  and coalesce(e.resolved_by, '') <> 'organization-learning-mode'
+              )::int as manually_approved
+       from evaluations e
+       join users u on u.id = e.user_id
+       join policy_results pr on pr.evaluation_id = e.id
+       left join policies p on p.id = pr.policy_id
+       where u.organization_id = $1
+         and e.user_id = $2
+         and e.created_at >= now() - make_interval(days => $3)
+         and pr.status in ('failed', 'needs_question')
+       group by coalesce(nullif(p.category, ''), nullif(pr.policy_name, ''), 'Other threats')
+       order by total desc, name asc
+       limit 8`,
+      [organizationId, userId, rangeDays],
+    ),
+    pool.query(
+      `select ar.kind,
+              max(ar.display_name) as name,
+              count(distinct ar.id)::int as count
+       from agent_runtimes ar
+       join computers c on c.id = ar.computer_id
+       join users u on u.id = c.user_id
+       where u.organization_id = $1
+         and c.user_id = $2
+         and ar.last_seen_at >= now() - interval '90 days'
+       group by ar.kind
+       order by count desc, name asc`,
+      [organizationId, userId],
+    ),
+  ]);
+  const row = totals.rows[0] ?? {};
+  return {
+    rangeDays,
+    totals: {
+      checked: Number(row.checked ?? 0),
+      blocked: Number(row.blocked ?? 0),
+      automaticallyApproved: Number(row.automatically_approved ?? 0),
+      manuallyApproved: Number(row.manually_approved ?? 0),
+      waiting: Number(row.waiting ?? 0),
+    },
+    threats: threats.rows.map((item) => ({
+      name: String(item.name),
+      total: Number(item.total ?? 0),
+      blocked: Number(item.blocked ?? 0),
+      automaticallyApproved: Number(item.automatically_approved ?? 0),
+      manuallyApproved: Number(item.manually_approved ?? 0),
+    })),
+    agentKinds: agentKinds.rows.map((item) => ({
+      kind: String(item.kind),
+      name: String(item.name || item.kind),
+      count: Number(item.count ?? 0),
+    })),
+  };
+}
+
 async function mobileAgentSessions(organizationId: string, userId: string) {
   const result = await pool.query(
     `with session_groups as (
@@ -11336,6 +11498,8 @@ async function notifyMobileEvent(
     data?: Record<string, unknown>;
   },
 ) {
+  const runtimePolicy = await runtimePolicyForUser({ id: userId });
+  if (!runtimePolicy.notifyEmployees) return;
   const devices = await mobilePushDevicesForUser(userId);
   const expoMessages = devices
     .filter((token): token is string =>
@@ -13020,6 +13184,7 @@ export async function prepareOpenLeashApi(
     throw new Error("Leash no longer exposes a dashboard API surface");
   }
   configureAuditExportProvider(options.auditExportProvider);
+  configureRuntimePolicyProvider(options.runtimePolicyProvider);
   await ensureDevToken();
   for (const extension of options.extensions ?? []) {
     await extension({ app: runningApp, surface });
