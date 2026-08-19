@@ -11893,6 +11893,8 @@ async function getDashboardSession(authHeader: string) {
      from users u
      join organizations o on o.id = u.organization_id
      where ds.user_id = u.id
+       and ds.organization_id = u.organization_id
+       and u.status = 'active'
        and ds.token_hash = $1
        and ds.revoked_at is null
        and ds.expires_at > now()
@@ -12094,7 +12096,7 @@ function requirePluginReleaseAdmin(req: express.Request, res: express.Response) 
 }
 
 function isDashboardAccessRole(role: unknown) {
-  return ["owner", "admin", "ciso", "security_admin", "analyst", "responder", "viewer"].includes(
+  return ["owner", "admin", "ciso", "cio", "security_admin"].includes(
     String(role ?? "").toLowerCase(),
   );
 }
