@@ -14,7 +14,7 @@ export function hashToken(token: string) {
 export async function getUserByToken(token: string) {
   const tokenHash = hashToken(token);
   const result = await pool.query(
-    "select id, email, display_name, organization_id from users where token_hash = $1 limit 1",
+    "select id, email, display_name, organization_id from users where token_hash = $1 and status = 'active' limit 1",
     [tokenHash]
   );
   if (result.rows[0]) {
@@ -26,6 +26,8 @@ export async function getUserByToken(token: string) {
      set last_seen_at = now()
      from users u
      where ds.user_id = u.id
+       and ds.organization_id = u.organization_id
+       and u.status = 'active'
        and ds.token_hash = $1
        and ds.revoked_at is null
        and ds.expires_at > now()
