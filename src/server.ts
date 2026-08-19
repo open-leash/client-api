@@ -52,6 +52,10 @@ import {
   OPENLEASH_API_NEGOTIATED_VERSION_HEADER,
 } from "./api-versioning.js";
 import { z } from "zod";
+import {
+  defaultAccountPackage,
+  deploymentUsesManagedEvaluation,
+} from "./account-package.js";
 import { ensureDevToken, getUserByToken, hashToken, pool } from "./db.js";
 import { summarizeActionPurpose } from "./evaluator.js";
 import { nativeHookDecision } from "./hook-decisions.js";
@@ -10072,23 +10076,17 @@ function accountPackageForNewSession(
     process.env.OPENLEASH_DEV_ACCOUNT_PACKAGE,
   );
   if (audience === "individual") {
-    return configured?.startsWith("personal-") ? configured : "personal-byok";
+    if (configured?.startsWith("personal-")) return configured;
+    return defaultAccountPackage(audience, process.env.OPENLEASH_DEPLOYMENT_MODE);
   }
-  return configured?.startsWith("work-") ? configured : "work-managed";
+  return defaultAccountPackage(audience, process.env.OPENLEASH_DEPLOYMENT_MODE);
 }
 
 async function organizationUsesManagedEvaluation(organizationId: string) {
-  if (normalizeDeploymentMode(process.env.OPENLEASH_DEPLOYMENT_MODE) !== "cloud")
-    return false;
-  const result = await pool.query<{ package_id: string | null }>(
-    `select infrastructure_config->>'accountPackage' as package_id
-     from organizations
-     where id = $1
-     limit 1`,
-    [organizationId],
+  void organizationId;
+  return deploymentUsesManagedEvaluation(
+    process.env.OPENLEASH_DEPLOYMENT_MODE,
   );
-  const packageId = normalizeAccountPackage(result.rows[0]?.package_id);
-  return packageId === "personal-managed" || packageId === "work-managed";
 }
 
 async function getOrganizationBySlug(slug: string) {

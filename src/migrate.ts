@@ -19,10 +19,12 @@ const shouldStatus = args.has("--status") || args.has("--pending");
 const shouldBackup = args.has("--backup") || process.env.OPENLEASH_MIGRATION_BACKUP === "1";
 const backupDir = process.env.OPENLEASH_MIGRATION_BACKUP_DIR
   ?? path.resolve(here, "../../../backups/postgres");
+const migrationLogDir = process.env.OPENLEASH_MIGRATION_LOG_DIR;
 
 const databaseUrl =
   process.env.DATABASE_URL ??
   "postgres://openleash:openleash@localhost:9543/openleash";
+let migrationAuditPath: string | undefined;
 
 try {
   if (args.has("--help") || args.has("-h")) {
@@ -30,39 +32,51 @@ try {
     process.exit(0);
   }
 
+  migrationAuditPath = await createMigrationAuditLog("core");
+
   if (shouldBackup) {
     await backupPostgres(databaseUrl, backupDir);
     if (!shouldApply && !shouldList && !shouldStatus) {
       console.log("[db:migrate] backup complete; no migrations applied.");
+      await finishMigrationAudit("SUCCESS");
+      await pool.end();
       process.exit(0);
     }
   }
 
   const migrations = await loadMigrations();
   if (shouldList || shouldStatus) {
-    await printMigrationStatus(migrations);
+    await printMigrationStatus(migrations, "CURRENT STATE");
   } else if (!shouldApply) {
     console.error(
       "[db:migrate] refusing to mutate the database without --apply. " +
       "Use --status to inspect pending migrations or --apply to run them."
     );
+    await finishMigrationAudit("REFUSED");
     process.exitCode = 2;
   } else {
     await withMigrationLock(async () => {
       await ensureMigrationLedger();
-    if (migrations.length === 0) {
-      await applyLegacySchemaFallback();
-    } else {
-      for (const migration of migrations) {
-        await applyMigration(migration);
+      await printMigrationStatus(migrations, "BEFORE");
+      await auditPendingMigrationSql(migrations);
+      if (migrations.length === 0) {
+        await applyLegacySchemaFallback();
+      } else {
+        for (const migration of migrations) {
+          await applyMigration(migration);
+        }
       }
-    }
-    await removeLegacyMockIdentityRows();
-    await ensureDevToken();
+      await removeLegacyMockIdentityRows();
+      await ensureDevToken();
+      await printMigrationStatus(migrations, "AFTER");
     });
   }
 
   if (shouldApply) console.log("Leash database schema is ready.");
+  await finishMigrationAudit("SUCCESS");
+} catch (error) {
+  await finishMigrationAudit("FAILED", error);
+  throw error;
 } finally {
   await pool.end();
 }
@@ -96,13 +110,15 @@ async function loadMigrations(): Promise<Migration[]> {
 }
 
 async function ensureMigrationLedger() {
-  await pool.query(`
+  const sql = `
     create table if not exists schema_migrations (
       id text primary key,
       checksum text not null,
       applied_at timestamptz not null default now()
     )
-  `);
+  `;
+  await auditSql("Ensure migration ledger", sql);
+  await pool.query(sql);
 }
 
 async function applyMigration(migration: Migration) {
@@ -122,38 +138,61 @@ async function applyMigration(migration: Migration) {
   }
 
   console.log(`[db:migrate] applying ${migration.id}`);
+  await audit("executing: BEGIN");
   await pool.query("begin");
   try {
+    await auditSql(`Migration ${migration.id}`, migration.sql, migration.checksum);
     await pool.query(migration.sql);
+    await audit(
+      "executing: insert into schema_migrations (id, checksum) values ($1, $2) " +
+      `[id=${migration.id}, checksum=${migration.checksum}]`
+    );
     await pool.query(
       "insert into schema_migrations (id, checksum) values ($1, $2)",
       [migration.id, migration.checksum]
     );
+    await audit("executing: COMMIT");
     await pool.query("commit");
   } catch (error) {
+    await audit("executing after error: ROLLBACK");
     await pool.query("rollback");
     throw error;
   }
 }
 
-async function printMigrationStatus(migrations: Migration[]) {
+async function printMigrationStatus(migrations: Migration[], label = "CURRENT STATE") {
   const applied = await readMigrationLedger();
   const appliedById = new Map(applied.map((row) => [row.id, row]));
-  console.log(`Database: ${redactDatabaseUrl(databaseUrl)}`);
-  console.log(`Migrations: ${migrations.length}`);
+  await auditSection(label);
+  await report(`Database: ${redactDatabaseUrl(databaseUrl)}`);
+  await report(`Migrations: ${migrations.length}`);
   for (const migration of migrations) {
     const row = appliedById.get(migration.id);
     if (!row) {
-      console.log(`pending  ${migration.id}  ${path.basename(migration.path)}`);
+      await report(`pending  ${migration.id}  ${path.basename(migration.path)}`);
     } else if (row.checksum !== migration.checksum) {
-      console.log(`changed  ${migration.id}  applied=${row.applied_at.toISOString()}`);
+      await report(`changed  ${migration.id}  applied=${row.applied_at.toISOString()}`);
     } else {
-      console.log(`applied  ${migration.id}  ${row.applied_at.toISOString()}`);
+      await report(`applied  ${migration.id}  ${row.applied_at.toISOString()}`);
     }
   }
   const known = new Set(migrations.map((migration) => migration.id));
   for (const row of applied) {
-    if (!known.has(row.id)) console.log(`orphan   ${row.id}  ${row.applied_at.toISOString()}`);
+    if (!known.has(row.id)) await report(`orphan   ${row.id}  ${row.applied_at.toISOString()}`);
+  }
+}
+
+async function auditPendingMigrationSql(migrations: Migration[]) {
+  const applied = await readMigrationLedger();
+  const appliedIds = new Set(applied.map((row) => row.id));
+  await auditSection("SQL SELECTED FOR EXECUTION");
+  const pending = migrations.filter((migration) => !appliedIds.has(migration.id));
+  if (pending.length === 0) {
+    await audit("No pending migration SQL.");
+    return;
+  }
+  for (const migration of pending) {
+    await auditSql(`Migration ${migration.id}`, migration.sql, migration.checksum);
   }
 }
 
@@ -174,6 +213,61 @@ function redactDatabaseUrl(value: string) {
   } catch {
     return value.replace(/:\/\/([^:\s]+):([^@\s]+)@/, "://$1:****@");
   }
+}
+
+async function createMigrationAuditLog(scope: string) {
+  if (!migrationLogDir) return undefined;
+  await fs.mkdir(migrationLogDir, { recursive: true });
+  const stamp = new Date().toISOString().replaceAll(/[:.]/g, "-");
+  const logPath = path.join(migrationLogDir, `migration-${stamp}-${scope}.log`);
+  await fs.writeFile(
+    logPath,
+    [
+      "Leash PostgreSQL migration audit",
+      `started_at: ${new Date().toISOString()}`,
+      `scope: ${scope}`,
+      `database: ${redactDatabaseUrl(databaseUrl)}`,
+      `action: ${shouldApply ? "apply" : shouldBackup ? "backup" : "status"}`,
+      "credentials: redacted; sensitive SQL parameter values are not logged",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  console.log(`[db:migrate] audit log: ${logPath}`);
+  return logPath;
+}
+
+async function audit(message = "") {
+  if (!migrationAuditPath) return;
+  await fs.appendFile(migrationAuditPath, `${message}\n`, "utf8");
+}
+
+async function auditSection(title: string) {
+  await audit();
+  await audit(`===== ${title} =====`);
+}
+
+async function report(message: string) {
+  console.log(message);
+  await audit(message);
+}
+
+async function auditSql(label: string, sql: string, checksum?: string) {
+  const suffix = checksum ? ` sha256=${checksum}` : "";
+  await audit(`----- BEGIN ${label}${suffix} -----`);
+  await audit(sql.trim());
+  await audit(`----- END ${label} -----`);
+}
+
+async function finishMigrationAudit(status: "SUCCESS" | "FAILED" | "REFUSED", error?: unknown) {
+  if (!migrationAuditPath) return;
+  const logPath = migrationAuditPath;
+  await auditSection("OUTCOME");
+  await audit(`status: ${status}`);
+  await audit(`finished_at: ${new Date().toISOString()}`);
+  if (error) await audit(`error: ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
+  console.log(`[db:migrate] audit log: ${logPath}`);
+  migrationAuditPath = undefined;
 }
 
 function printUsage() {
@@ -198,15 +292,18 @@ async function applyLegacySchemaFallback() {
   if (!schemaPath) throw new Error("No Postgres schema or migration directory was found.");
   console.log("[db:migrate] no migration files found; applying legacy schema.sql fallback");
   const sql = await fs.readFile(schemaPath, "utf8");
+  await auditSql("Legacy schema fallback", sql);
   await pool.query(sql);
 }
 
 async function withMigrationLock(fn: () => Promise<void>) {
   const lockId = 873177295;
+  await audit(`executing: select pg_advisory_lock($1) [lock_id=${lockId}]`);
   await pool.query("select pg_advisory_lock($1)", [lockId]);
   try {
     await fn();
   } finally {
+    await audit(`executing: select pg_advisory_unlock($1) [lock_id=${lockId}]`);
     await pool.query("select pg_advisory_unlock($1)", [lockId]);
   }
 }
@@ -228,6 +325,10 @@ async function backupPostgres(connectionString: string, outputDir: string) {
   const stamp = new Date().toISOString().replaceAll(/[:.]/g, "-");
   const outputPath = path.join(outputDir, `openleash-${stamp}.schema.sql`);
   await fs.mkdir(outputDir, { recursive: true });
+  await auditSection("BACKUP");
+  await audit(
+    `executing: ${pgDump} --schema-only --no-owner --no-privileges --file ${outputPath} ${redactDatabaseUrl(connectionString)}`
+  );
   await run(pgDump, [
     "--schema-only",
     "--no-owner",
@@ -257,7 +358,7 @@ function run(command: string, commandArgs: string[]) {
 }
 
 async function removeLegacyMockIdentityRows() {
-  await pool.query(`
+  const statements = [`
     delete from identity_group_members
     where user_id in (
       select id from users
@@ -268,8 +369,7 @@ async function removeLegacyMockIdentityRows() {
       select id from identity_groups
       where idp_group_id in ('grp-security', 'grp-platform', 'grp-product', 'grp-contractors')
     )
-  `);
-  await pool.query(`
+  `, `
     delete from role_assignments
     where user_id in (
       select id from users
@@ -280,17 +380,14 @@ async function removeLegacyMockIdentityRows() {
       select id from identity_groups
       where idp_group_id in ('grp-security', 'grp-platform', 'grp-product', 'grp-contractors')
     )
-  `);
-  await pool.query(`
+  `, `
     delete from users
     where email ilike '%@northwind.example'
        or idp_user_id in ('usr-max', 'usr-margaret', 'usr-jenny', 'usr-floyd', 'usr-kristin', 'usr-robert')
-  `);
-  await pool.query(`
+  `, `
     delete from identity_groups
     where idp_group_id in ('grp-security', 'grp-platform', 'grp-contractors')
-  `);
-  await pool.query(`
+  `, `
     update idp_connections
     set user_count = coalesce(real_users.count, 0),
         group_count = coalesce(real_groups.count, 0),
@@ -324,8 +421,7 @@ async function removeLegacyMockIdentityRows() {
     ) real_groups
     where idp_connections.organization_id = real_users.organization_id
       and idp_connections.organization_id = real_groups.organization_id
-  `);
-  await pool.query(`
+  `, `
     delete from idp_connections
     where user_count = 0
       and group_count = 0
@@ -338,5 +434,11 @@ async function removeLegacyMockIdentityRows() {
           where btrim(coalesce(credential.value, '')) <> ''
         )
       )
-  `);
+  `];
+  await auditSection("POST-MIGRATION MAINTENANCE SQL");
+  for (const sql of statements) {
+    await auditSql("Maintenance statement", sql);
+    await pool.query(sql);
+  }
+  await audit("Dev-token initialization follows when enabled; its application-level operations do not contain schema migration SQL.");
 }
